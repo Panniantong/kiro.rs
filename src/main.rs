@@ -99,8 +99,9 @@ async fn main() {
     // 构建端点注册表
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let ide = Arc::new(IdeEndpoint::new());
+        endpoints.insert(ide.name().to_string(), ide.clone());
+        endpoints.insert("mcp".to_string(), ide);
     }
 
     // 校验默认端点存在
