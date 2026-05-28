@@ -19,6 +19,8 @@ use super::types::{
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+/// 浮点余额接近 0 时视为额度耗尽
+const BALANCE_EXHAUSTED_EPSILON: f64 = 0.000001;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,15 +137,23 @@ impl AdminService {
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         // 先查缓存
-        {
+        let cached_balance = {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
                 let now = Utc::now().timestamp() as f64;
                 if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
                     tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
+                    Some(cached.data.clone())
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        };
+        if let Some(balance) = cached_balance {
+            self.disable_if_quota_exhausted_balance(&balance);
+            return Ok(balance);
         }
 
         // 缓存未命中或已过期，从上游获取
@@ -161,8 +171,47 @@ impl AdminService {
             );
         }
         self.save_balance_cache();
+        self.disable_if_quota_exhausted_balance(&balance);
 
         Ok(balance)
+    }
+
+    fn disable_if_quota_exhausted_balance(&self, balance: &BalanceResponse) {
+        if !Self::is_quota_exhausted_balance(balance) {
+            return;
+        }
+
+        let has_available = self.token_manager.report_quota_exhausted(balance.id);
+        if has_available {
+            tracing::warn!(
+                "凭据 #{} 余额已耗尽（remaining={} usageLimit={}），已自动禁用",
+                balance.id,
+                balance.remaining,
+                balance.usage_limit
+            );
+        } else {
+            tracing::error!(
+                "凭据 #{} 余额已耗尽（remaining={} usageLimit={}），已自动禁用；当前无可用凭据",
+                balance.id,
+                balance.remaining,
+                balance.usage_limit
+            );
+        }
+    }
+
+    fn is_quota_exhausted_balance(balance: &BalanceResponse) -> bool {
+        if balance.usage_limit <= 0.0 || balance.remaining > BALANCE_EXHAUSTED_EPSILON {
+            return false;
+        }
+
+        if let Some(next_reset_at) = balance.next_reset_at {
+            let now = Utc::now().timestamp() as f64;
+            if next_reset_at <= now {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// 从上游获取余额（无缓存）
@@ -448,10 +497,144 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::config::Config;
+
+    fn balance_response(id: u64, usage_limit: f64, remaining: f64) -> BalanceResponse {
+        BalanceResponse {
+            id,
+            subscription_title: Some("KIRO POWER".to_string()),
+            current_usage: (usage_limit - remaining).max(0.0),
+            usage_limit,
+            remaining,
+            usage_percentage: if usage_limit > 0.0 {
+                ((usage_limit - remaining).max(0.0) / usage_limit * 100.0).min(100.0)
+            } else {
+                0.0
+            },
+            next_reset_at: Some((Utc::now() + chrono::Duration::hours(1)).timestamp() as f64),
+        }
+    }
+
+    #[test]
+    fn test_quota_exhausted_balance_detection() {
+        assert!(AdminService::is_quota_exhausted_balance(&balance_response(
+            1, 10000.0, 0.0,
+        )));
+        assert!(AdminService::is_quota_exhausted_balance(&balance_response(
+            1, 10000.0, 0.0000005,
+        )));
+        assert!(!AdminService::is_quota_exhausted_balance(
+            &balance_response(1, 10000.0, 1.0,)
+        ));
+        assert!(!AdminService::is_quota_exhausted_balance(
+            &balance_response(1, 0.0, 0.0,)
+        ));
+
+        let mut expired_reset = balance_response(1, 10000.0, 0.0);
+        expired_reset.next_reset_at =
+            Some((Utc::now() - chrono::Duration::seconds(1)).timestamp() as f64);
+        assert!(!AdminService::is_quota_exhausted_balance(&expired_reset));
+    }
+
+    #[test]
+    fn test_exhausted_balance_disables_and_persists_credential() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-exhausted-balance-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.machine_id = Some("machine-1".to_string());
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.machine_id = Some("machine-2".to_string());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred1.clone(), cred2.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred1, cred2],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service.disable_if_quota_exhausted_balance(&balance_response(1, 10000.0, 0.0));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(snapshot.available, 1);
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
+        assert!(!persisted.iter().find(|c| c.id == Some(2)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_non_exhausted_balance_does_not_disable_credential() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-non-exhausted-balance-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.machine_id = Some("machine-1".to_string());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service.disable_if_quota_exhausted_balance(&balance_response(1, 10000.0, 5.0));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!first.disabled);
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(!persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
     }
 }

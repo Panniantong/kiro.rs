@@ -1369,6 +1369,9 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("额度用尽禁用凭据后持久化失败（不影响本次切换）: {}", e);
+        }
         result
     }
 
@@ -2642,6 +2645,128 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_multi_token_manager_report_quota_exhausted_persists_disabled_state() {
+        let credentials_path =
+            std::env::temp_dir().join(format!("kiro-quota-persist-{}.json", uuid::Uuid::new_v4()));
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.machine_id = Some("machine-1".to_string());
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.machine_id = Some("machine-2".to_string());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred1.clone(), cred2.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.report_quota_exhausted(1));
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
+        assert!(!persisted.iter().find(|c| c.id == Some(2)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_multi_token_manager_rate_limited_credential_is_not_persisted_as_disabled() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-rate-limit-not-disabled-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.machine_id = Some("machine-1".to_string());
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.machine_id = Some("machine-2".to_string());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred1.clone(), cred2.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.report_rate_limited(1, Some(StdDuration::from_secs(30))));
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(!persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
+        assert!(!persisted.iter().find(|c| c.id == Some(2)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_multi_token_manager_too_many_failures_is_not_persisted_as_disabled() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-failure-cooldown-not-disabled-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.machine_id = Some("machine-1".to_string());
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.machine_id = Some("machine-2".to_string());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred1.clone(), cred2.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            assert!(manager.report_failure(1));
+        }
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.disabled_reason.as_deref(), Some("TooManyFailures"));
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(!persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
+        assert!(!persisted.iter().find(|c| c.id == Some(2)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
     }
 
     #[tokio::test]
