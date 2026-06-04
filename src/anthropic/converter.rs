@@ -2,7 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -271,10 +271,11 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
-        validate_tool_pairing(&history, &tool_results);
+        sanitize_tool_pairing(&mut history, &tool_results);
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+    remove_empty_history_user_messages(&mut history);
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -442,9 +443,7 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 fn validate_tool_pairing(
     history: &[Message],
     tool_results: &[ToolResult],
-) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
-    use std::collections::HashSet;
-
+) -> (Vec<ToolResult>, HashSet<String>) {
     // 1. 收集所有历史中的 tool_use_id
     let mut all_tool_use_ids: HashSet<String> = HashSet::new();
     // 2. 收集历史中已经有 tool_result 的 tool_use_id
@@ -512,6 +511,92 @@ fn validate_tool_pairing(
     (filtered_results, unpaired_tool_use_ids)
 }
 
+/// 清理历史和当前消息中的 tool_use/tool_result 配对。
+///
+/// Kiro API 不接受孤立的历史 tool_result。旧逻辑只过滤当前最后一条
+/// user 消息中的孤立 tool_result，历史里累积的坏结果仍会透传上游并触发
+/// 400 "Improperly formed request"。这里先清理历史，再复用同一套配对
+/// 状态验证当前消息。
+fn sanitize_tool_pairing(
+    history: &mut [Message],
+    tool_results: &[ToolResult],
+) -> (Vec<ToolResult>, HashSet<String>) {
+    let mut all_tool_use_ids: HashSet<String> = HashSet::new();
+
+    for msg in history.iter() {
+        if let Message::Assistant(assistant_msg) = msg {
+            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                for tool_use in tool_uses {
+                    all_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                }
+            }
+        }
+    }
+
+    let mut paired_tool_use_ids: HashSet<String> = HashSet::new();
+
+    for msg in history.iter_mut() {
+        if let Message::User(user_msg) = msg {
+            let results = &mut user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+
+            results.retain(|result| {
+                if !all_tool_use_ids.contains(&result.tool_use_id) {
+                    tracing::warn!(
+                        "移除历史孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
+                        result.tool_use_id
+                    );
+                    return false;
+                }
+
+                if !paired_tool_use_ids.insert(result.tool_use_id.clone()) {
+                    tracing::warn!(
+                        "移除历史重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
+                        result.tool_use_id
+                    );
+                    return false;
+                }
+
+                true
+            });
+        }
+    }
+
+    let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
+        .difference(&paired_tool_use_ids)
+        .cloned()
+        .collect();
+    let mut filtered_results = Vec::new();
+
+    for result in tool_results {
+        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
+            filtered_results.push(result.clone());
+            unpaired_tool_use_ids.remove(&result.tool_use_id);
+        } else if all_tool_use_ids.contains(&result.tool_use_id) {
+            tracing::warn!(
+                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
+                result.tool_use_id
+            );
+        } else {
+            tracing::warn!(
+                "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
+                result.tool_use_id
+            );
+        }
+    }
+
+    for orphaned_id in &unpaired_tool_use_ids {
+        tracing::warn!(
+            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
+            orphaned_id
+        );
+    }
+
+    (filtered_results, unpaired_tool_use_ids)
+}
+
 /// 从历史消息中移除孤立的 tool_use
 ///
 /// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
@@ -522,7 +607,7 @@ fn validate_tool_pairing(
 /// * `orphaned_ids` - 需要移除的孤立 tool_use_id 集合
 fn remove_orphaned_tool_uses(
     history: &mut [Message],
-    orphaned_ids: &std::collections::HashSet<String>,
+    orphaned_ids: &HashSet<String>,
 ) {
     if orphaned_ids.is_empty() {
         return;
@@ -546,6 +631,29 @@ fn remove_orphaned_tool_uses(
             }
         }
     }
+}
+
+/// 移除清理 tool_result 后完全空掉的历史 user 消息。
+fn remove_empty_history_user_messages(history: &mut Vec<Message>) {
+    history.retain(|msg| {
+        let Message::User(user_msg) = msg else {
+            return true;
+        };
+
+        let input = &user_msg.user_input_message;
+        let context = &input.user_input_message_context;
+
+        let is_empty = input.content.trim().is_empty()
+            && input.images.is_empty()
+            && context.tool_results.is_empty()
+            && context.tools.is_empty();
+
+        if is_empty {
+            tracing::debug!("移除清理后为空的历史 user 消息");
+        }
+
+        !is_empty
+    });
 }
 
 /// Kiro API 工具名称最大长度限制
@@ -1555,6 +1663,124 @@ mod tests {
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");
+    }
+
+    #[test]
+    fn test_sanitize_tool_pairing_removes_history_orphaned_results() {
+        let mut user_msg_with_orphan = UserMessage::new("", "claude-sonnet-4.6");
+        let mut ctx = UserInputMessageContext::new();
+        ctx = ctx.with_tool_results(vec![ToolResult::success(
+            "tool-orphan-history",
+            "orphan result",
+        )]);
+        user_msg_with_orphan = user_msg_with_orphan.with_context(ctx);
+
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("Hello", "claude-sonnet-4.6")),
+            Message::Assistant(HistoryAssistantMessage::new("Hi")),
+            Message::User(HistoryUserMessage {
+                user_input_message: user_msg_with_orphan,
+            }),
+            Message::Assistant(HistoryAssistantMessage::new("Done")),
+        ];
+
+        let (filtered, orphaned) = sanitize_tool_pairing(&mut history, &[]);
+        remove_empty_history_user_messages(&mut history);
+
+        assert!(filtered.is_empty());
+        assert!(orphaned.is_empty());
+        assert!(
+            history.iter().all(|msg| match msg {
+                Message::User(user_msg) => user_msg
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty(),
+                Message::Assistant(_) => true,
+            }),
+            "历史孤立 tool_result 应该被移除"
+        );
+        assert!(
+            history.iter().all(|msg| match msg {
+                Message::User(user_msg) => !user_msg.user_input_message.content.trim().is_empty()
+                    || !user_msg.user_input_message.images.is_empty()
+                    || !user_msg
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty(),
+                Message::Assistant(_) => true,
+            }),
+            "清理后为空的历史 user 消息应该被移除"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_filters_history_orphaned_tool_result() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hello"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("hi"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-orphan-history", "content": "orphan result"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("noted"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("转换不应因历史孤立 tool_result 失败");
+        let history = result.conversation_state.history;
+
+        for msg in history {
+            if let Message::User(user_msg) = msg {
+                assert!(
+                    user_msg
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter()
+                        .all(|result| result.tool_use_id != "tool-orphan-history"),
+                    "历史孤立 tool_result 不应继续进入 Kiro history"
+                );
+                assert!(
+                    !user_msg.user_input_message.content.trim().is_empty()
+                        || !user_msg.user_input_message.images.is_empty()
+                        || !user_msg
+                            .user_input_message
+                            .user_input_message_context
+                            .tool_results
+                            .is_empty(),
+                    "清理后不应留下完全空的历史 user 消息"
+                );
+            }
+        }
     }
 
     #[test]
