@@ -440,6 +440,7 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 ///
 /// # Returns
 /// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
+#[cfg(test)]
 fn validate_tool_pairing(
     history: &[Message],
     tool_results: &[ToolResult],
