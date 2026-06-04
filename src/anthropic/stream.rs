@@ -364,6 +364,47 @@ impl SseStateManager {
         Some(SseEvent::new("message_start", event))
     }
 
+    fn close_open_blocks_before_start(
+        &mut self,
+        next_index: i32,
+        next_block_type: &str,
+    ) -> Vec<SseEvent> {
+        let mut to_stop: Vec<i32> = self
+            .active_blocks
+            .iter()
+            .filter_map(|(index, block)| {
+                if *index == next_index || !block.started || block.stopped {
+                    return None;
+                }
+
+                let should_stop = match next_block_type {
+                    "tool_use" => block.block_type == "text" || block.block_type == "tool_use",
+                    "text" => block.block_type == "tool_use",
+                    _ => false,
+                };
+
+                should_stop.then_some(*index)
+            })
+            .collect();
+        to_stop.sort_unstable();
+
+        let mut events = Vec::new();
+        for index in to_stop {
+            if let Some(block) = self.active_blocks.get_mut(&index) {
+                block.stopped = true;
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                ));
+            }
+        }
+
+        events
+    }
+
     /// 处理 content_block_start 事件
     pub fn handle_content_block_start(
         &mut self,
@@ -373,22 +414,11 @@ impl SseStateManager {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 如果是 tool_use 块，先关闭之前的文本块
+        events.extend(self.close_open_blocks_before_start(index, block_type));
+
+        // 如果是 tool_use 块，记录工具调用状态
         if block_type == "tool_use" {
             self.has_tool_use = true;
-            for (block_index, block) in self.active_blocks.iter_mut() {
-                if block.block_type == "text" && block.started && !block.stopped {
-                    // 自动发送 content_block_stop 关闭文本块
-                    events.push(SseEvent::new(
-                        "content_block_stop",
-                        json!({
-                            "type": "content_block_stop",
-                            "index": block_index
-                        }),
-                    ));
-                    block.stopped = true;
-                }
-            }
         }
 
         // 检查块是否已存在
@@ -1377,6 +1407,60 @@ mod tests {
                     && e.data["delta"]["text"] == "hello"
             }),
             "should emit text_delta after restarting text block"
+        );
+    }
+
+    #[test]
+    fn test_second_tool_use_closes_previous_tool_block_before_starting() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let first_tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "session_status".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: String::new(),
+            stop: false,
+        });
+
+        let first_tool_index = first_tool_events
+            .iter()
+            .find_map(|e| {
+                if e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                {
+                    e.data["index"].as_i64()
+                } else {
+                    None
+                }
+            })
+            .expect("first tool_use block should start");
+
+        let second_tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "read".to_string(),
+            tool_use_id: "tool_2".to_string(),
+            input: r#"{"file_path":"/tmp/a"}"#.to_string(),
+            stop: false,
+        });
+
+        let pos_first_stop = second_tool_events.iter().position(|e| {
+            e.event == "content_block_stop"
+                && e.data["index"].as_i64() == Some(first_tool_index)
+        });
+        let pos_second_start = second_tool_events.iter().position(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+        });
+
+        assert!(
+            pos_first_stop.is_some(),
+            "starting a second tool_use should close the previous open tool_use block"
+        );
+        assert!(
+            pos_second_start.is_some(),
+            "second tool_use block should start"
+        );
+        assert!(
+            pos_first_stop.unwrap() < pos_second_start.unwrap(),
+            "previous tool_use block must stop before the next tool_use block starts"
         );
     }
 
