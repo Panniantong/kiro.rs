@@ -301,7 +301,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     )?;
 
     if last_is_tool_result_only {
-        tracing::warn!("末尾用户消息仅包含 tool_result：并入历史后用 Continue. 作为当前消息");
+        tracing::debug!("末尾用户消息仅包含 tool_result：并入历史后用 Continue. 作为当前消息");
         text_content = "Continue.".to_string();
         images.clear();
         tool_results.clear();
@@ -500,7 +500,7 @@ fn map_tool_use_id(id: &str) -> String {
     let prefix = truncate_to_char_boundary(&sanitized, prefix_max);
     let mapped = format!("{}_{}", prefix, suffix);
 
-    tracing::warn!("映射不兼容的 tool_use_id：{} -> {}", id, mapped);
+    tracing::debug!("映射不兼容的 tool_use_id：{} -> {}", id, mapped);
     mapped
 }
 
