@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -102,6 +103,14 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if model_lower.contains("sonnet-4") {
+            Some("claude-sonnet-4.6".to_string())
+        } else if model_lower.contains("3-5-sonnet")
+            || model_lower.contains("3.5-sonnet")
+            || model_lower.contains("3-7-sonnet")
+            || model_lower.contains("3-sonnet")
+        {
+            Some("claude-sonnet-4.6".to_string())
         } else {
             None
         }
@@ -114,6 +123,8 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.7".to_string())
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
+        } else if model_lower.contains("opus-4") {
+            Some("claude-opus-4.6".to_string())
         } else {
             None
         }
@@ -284,6 +295,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let last_message = messages.last().unwrap();
     let (mut text_content, mut images, mut tool_results) =
         process_message_content(&last_message.content)?;
+
+    if let Some(instruction) = generate_output_format_instruction(req) {
+        if text_content.trim().is_empty() {
+            text_content = instruction;
+        } else {
+            text_content = format!("{}\n\n{}", text_content, instruction);
+        }
+    }
+
     let last_is_tool_result_only =
         text_content.trim().is_empty() && images.is_empty() && !tool_results.is_empty();
 
@@ -407,6 +427,15 @@ fn process_message_content(
                                 }
                             }
                         }
+                        "document" => {
+                            if let Some(source) = block.source {
+                                if let Some(text) =
+                                    extract_document_text(&source.media_type, &source.data)
+                                {
+                                    text_parts.push(format!("<document>\n{}\n</document>", text));
+                                }
+                            }
+                        }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(&block.content);
@@ -437,6 +466,79 @@ fn process_message_content(
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+fn extract_document_text(media_type: &str, data: &str) -> Option<String> {
+    match media_type {
+        "application/pdf" => {
+            let bytes = BASE64_STANDARD.decode(data).ok()?;
+            let text = extract_pdf_literal_text(&bytes);
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_pdf_literal_text(bytes: &[u8]) -> String {
+    let mut values = Vec::new();
+    let mut current = Vec::new();
+    let mut in_literal = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+
+    for &byte in bytes {
+        if in_literal {
+            if escaped {
+                current.push(match byte {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'b' => 8,
+                    b'f' => 12,
+                    other => other,
+                });
+                escaped = false;
+                continue;
+            }
+
+            match byte {
+                b'\\' => escaped = true,
+                b'(' => {
+                    depth += 1;
+                    current.push(byte);
+                }
+                b')' => {
+                    if depth == 0 {
+                        if !current.is_empty() {
+                            values.push(String::from_utf8_lossy(&current).to_string());
+                        }
+                        current.clear();
+                        in_literal = false;
+                    } else {
+                        depth -= 1;
+                        current.push(byte);
+                    }
+                }
+                other => current.push(other),
+            }
+        } else if byte == b'(' {
+            in_literal = true;
+            escaped = false;
+            depth = 0;
+            current.clear();
+        }
+    }
+
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 从 media_type 获取图片格式
@@ -840,6 +942,24 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+fn generate_output_format_instruction(req: &MessagesRequest) -> Option<String> {
+    let format = req.output_config.as_ref()?.format.as_ref()?;
+    if format.format_type != "json_schema" {
+        return None;
+    }
+
+    let schema = format
+        .schema
+        .as_ref()
+        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "{}".to_string());
+
+    Some(format!(
+        "Output format requirement: respond with only one JSON object that conforms to this JSON Schema. Do not use markdown, code fences, explanations, or extra text.\nJSON Schema: {}",
+        schema
+    ))
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -1109,29 +1229,38 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::types::Message as AnthropicMessage;
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(map_model("claude-sonnet-4-20250514")
-            .unwrap()
-            .contains("sonnet"));
-        assert!(map_model("claude-3-5-sonnet-20241022")
-            .unwrap()
-            .contains("sonnet"));
+        assert!(
+            map_model("claude-sonnet-4-20250514")
+                .unwrap()
+                .contains("sonnet")
+        );
+        assert!(
+            map_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .contains("sonnet")
+        );
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(map_model("claude-opus-4-20250514")
-            .unwrap()
-            .contains("opus"));
+        assert!(
+            map_model("claude-opus-4-20250514")
+                .unwrap()
+                .contains("opus")
+        );
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(map_model("claude-haiku-4-20250514")
-            .unwrap()
-            .contains("haiku"));
+        assert!(
+            map_model("claude-haiku-4-20250514")
+                .unwrap()
+                .contains("haiku")
+        );
     }
 
     #[test]
@@ -1196,6 +1325,109 @@ mod tests {
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
+    }
+
+    fn make_test_pdf_base64(marker: &str) -> String {
+        let stream = format!("BT /F1 14 Tf 10 20 Td ({}) Tj ET", marker);
+        let pdf = format!(
+            "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 150 50] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\nxref\n0 6\n0000000000 65535 f\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n0\n%%EOF",
+            stream.len(),
+            stream
+        );
+        BASE64_STANDARD.encode(pdf.as_bytes())
+    }
+
+    #[test]
+    fn test_document_pdf_block_text_is_forwarded_to_kiro_prompt() {
+        let marker = "hvoytest";
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": make_test_pdf_base64(marker)
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "What text does this PDF contain? 只给我返回文字,不要使用工具"
+                    }
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).unwrap();
+        let content = converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+
+        assert!(content.contains(marker));
+        assert!(content.contains("What text does this PDF contain?"));
+    }
+
+    #[test]
+    fn test_json_schema_output_config_is_forwarded_to_kiro_prompt() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": "计算 37 乘以 76 等于多少"
+                    }
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(super::super::types::OutputConfig {
+                effort: "high".to_string(),
+                format: Some(super::super::types::OutputFormat {
+                    format_type: "json_schema".to_string(),
+                    schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "expression": {"type": "string"},
+                            "result": {"type": "integer"}
+                        },
+                        "required": ["expression", "result"],
+                        "additionalProperties": false
+                    })),
+                }),
+            }),
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).unwrap();
+        let content = converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+
+        assert!(content.contains("respond with only one JSON object"));
+        assert!(content.contains("JSON Schema"));
+        assert!(content.contains("\"result\""));
+        assert!(content.contains("计算 37 乘以 76"));
     }
 
     #[test]
@@ -1593,9 +1825,10 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg =
-            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1624,8 +1857,10 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1687,8 +1922,10 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1731,8 +1968,10 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
-            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -2011,9 +2250,11 @@ mod tests {
         let mapped_tool_result_id = mapped_tool_result_id.expect("应保留 tool_result");
         assert_eq!(mapped_tool_use_id, mapped_tool_result_id);
         assert_ne!(mapped_tool_use_id, "toolu_functions.Write:13");
-        assert!(mapped_tool_use_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert!(
+            mapped_tool_use_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
     }
 
     #[test]
@@ -2128,7 +2369,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
         ]);
 
         let mut history = vec![

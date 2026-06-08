@@ -10,6 +10,8 @@ use crate::kiro::parser::frame::Frame;
 pub enum EventType {
     /// 助手响应事件
     AssistantResponse,
+    /// Reasoning content event
+    ReasoningContent,
     /// 工具使用事件
     ToolUse,
     /// 计费事件
@@ -25,6 +27,7 @@ impl EventType {
     pub fn from_str(s: &str) -> Self {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
+            "reasoningContentEvent" => Self::ReasoningContent,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
@@ -36,6 +39,7 @@ impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
@@ -65,6 +69,8 @@ pub trait EventPayload: Sized {
 pub enum Event {
     /// 助手响应
     AssistantResponse(super::AssistantResponseEvent),
+    /// Reasoning content
+    ReasoningContent(super::ReasoningContentEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
@@ -106,11 +112,16 @@ impl Event {
     fn parse_event(frame: Frame) -> ParseResult<Self> {
         let event_type_str = frame.event_type().unwrap_or("unknown");
         let event_type = EventType::from_str(event_type_str);
+        log_event_payload_schema(event_type_str, &frame);
 
         match event_type {
             EventType::AssistantResponse => {
                 let payload = super::AssistantResponseEvent::from_frame(&frame)?;
                 Ok(Self::AssistantResponse(payload))
+            }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
             }
             EventType::ToolUse => {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
@@ -156,6 +167,66 @@ impl Event {
     }
 }
 
+fn log_event_payload_schema(event_type: &str, frame: &Frame) {
+    if std::env::var_os("KIRO_RS_DEBUG_EVENT_PAYLOAD_SCHEMA").is_none() {
+        return;
+    }
+
+    let payload = match serde_json::from_slice::<serde_json::Value>(&frame.payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::info!(
+                event_type = %event_type,
+                error = %error,
+                "Kiro upstream event payload is not JSON"
+            );
+            return;
+        }
+    };
+
+    let top_level_keys = payload
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut interesting_paths = Vec::new();
+    collect_interesting_key_paths("", &payload, &mut interesting_paths);
+
+    tracing::info!(
+        event_type = %event_type,
+        ?top_level_keys,
+        ?interesting_paths,
+        "Kiro upstream event payload schema"
+    );
+}
+
+fn collect_interesting_key_paths(prefix: &str, value: &serde_json::Value, paths: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                let key_lower = key.to_ascii_lowercase();
+                if key_lower.contains("signature")
+                    || key_lower.contains("model")
+                    || key_lower.contains("field7")
+                {
+                    paths.push(path.clone());
+                }
+                collect_interesting_key_paths(&path, child, paths);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_interesting_key_paths(&format!("{}[{}]", prefix, index), child, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +236,10 @@ mod tests {
         assert_eq!(
             EventType::from_str("assistantResponseEvent"),
             EventType::AssistantResponse
+        );
+        assert_eq!(
+            EventType::from_str("reasoningContentEvent"),
+            EventType::ReasoningContent
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
@@ -180,6 +255,10 @@ mod tests {
         assert_eq!(
             EventType::AssistantResponse.as_str(),
             "assistantResponseEvent"
+        );
+        assert_eq!(
+            EventType::ReasoningContent.as_str(),
+            "reasoningContentEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
     }
