@@ -86,13 +86,6 @@ const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to writ
 /// 追加到 Edit 工具 description 末尾的内容
 const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
 
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
-
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
@@ -942,6 +935,13 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+fn system_acknowledgement(system_content: &str) -> String {
+    format!(
+        "Acknowledged. The active system instructions for this conversation are: {}",
+        system_content
+    )
+}
+
 fn generate_output_format_instruction(req: &MessagesRequest) -> Option<String> {
     let format = req.output_config.as_ref()?.format.as_ref()?;
     if format.format_type != "json_schema" {
@@ -989,8 +989,7 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            let acknowledgement = system_acknowledgement(&system_content);
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -1007,7 +1006,7 @@ fn build_history(
             let user_msg = HistoryUserMessage::new(final_content, model_id);
             history.push(Message::User(user_msg));
 
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+            let assistant_msg = HistoryAssistantMessage::new(acknowledgement);
             history.push(Message::Assistant(assistant_msg));
         }
     } else if let Some(ref prefix) = thinking_prefix {
@@ -1331,6 +1330,119 @@ mod tests {
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
+    }
+
+    #[test]
+    fn test_system_prompt_is_encoded_as_active_history_contract() {
+        use crate::anthropic::types::SystemMessage;
+
+        let system = "You are Claude, made by Anthropic. Never claim to be anyone else.";
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Who are you? Who made you?"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system.to_string(),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("system prompt should convert");
+        let history = result.conversation_state.history;
+        assert_eq!(history.len(), 2);
+
+        match &history[0] {
+            Message::User(user_msg) => {
+                assert_eq!(user_msg.user_input_message.content, system);
+                assert!(
+                    !user_msg
+                        .user_input_message
+                        .content
+                        .contains("Write or Edit tool has content size limits"),
+                    "internal tool policy must not be appended to user system instructions"
+                );
+            }
+            _ => panic!("first system history entry should be a user message"),
+        }
+
+        match &history[1] {
+            Message::Assistant(assistant_msg) => {
+                assert_eq!(
+                    assistant_msg.assistant_response_message.content,
+                    format!(
+                        "Acknowledged. The active system instructions for this conversation are: {}",
+                        system
+                    )
+                );
+            }
+            _ => panic!("second system history entry should be an assistant acknowledgement"),
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_with_thinking_keeps_system_contract_clean() {
+        use crate::anthropic::types::{SystemMessage, Thinking};
+
+        let system = "Only reply with valid JSON.";
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Return answer two."),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system.to_string(),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                display: None,
+                budget_tokens: 1024,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("thinking system prompt should convert");
+        let history = result.conversation_state.history;
+
+        match &history[0] {
+            Message::User(user_msg) => {
+                let content = &user_msg.user_input_message.content;
+                assert!(content.starts_with("<thinking_mode>enabled</thinking_mode>"));
+                assert!(content.contains("<max_thinking_length>1024</max_thinking_length>"));
+                assert!(content.contains(system));
+                assert!(
+                    !content.contains("Write or Edit tool has content size limits"),
+                    "thinking prefix is allowed, internal chunk policy is not"
+                );
+            }
+            _ => panic!("first system history entry should be a user message"),
+        }
+
+        match &history[1] {
+            Message::Assistant(assistant_msg) => {
+                assert_eq!(
+                    assistant_msg.assistant_response_message.content,
+                    format!(
+                        "Acknowledged. The active system instructions for this conversation are: {}",
+                        system
+                    )
+                );
+            }
+            _ => panic!("second system history entry should be an assistant acknowledgement"),
+        }
     }
 
     fn make_test_pdf_base64(marker: &str) -> String {
