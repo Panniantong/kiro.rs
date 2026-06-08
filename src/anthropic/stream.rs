@@ -1607,7 +1607,7 @@ fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
     }
 }
 
-fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String> {
+pub(crate) fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String> {
     let public_model = hvoy_signature_public_model_name(model)?;
 
     let decoded = general_purpose::STANDARD

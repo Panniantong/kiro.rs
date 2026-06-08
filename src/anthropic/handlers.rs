@@ -496,6 +496,69 @@ fn create_sse_stream(
 use super::converter::get_context_window_size;
 
 /// 处理非流式请求
+fn build_non_stream_content_blocks(
+    text_content: String,
+    reasoning_content: String,
+    reasoning_signature: Option<String>,
+    tool_uses: Vec<serde_json::Value>,
+    thinking_enabled: bool,
+    model: &str,
+) -> Vec<serde_json::Value> {
+    let mut content: Vec<serde_json::Value> = Vec::new();
+
+    if thinking_enabled {
+        if !reasoning_content.is_empty() || reasoning_signature.is_some() {
+            let mut thinking_block = json!({
+                "type": "thinking",
+                "thinking": reasoning_content
+            });
+
+            if let Some(signature) = reasoning_signature.filter(|signature| !signature.is_empty()) {
+                let signature = super::stream::normalize_hvoy_signature_model(&signature, model)
+                    .unwrap_or(signature);
+                if let Some(obj) = thinking_block.as_object_mut() {
+                    obj.insert("signature".to_string(), json!(signature));
+                }
+            }
+
+            content.push(thinking_block);
+
+            if !text_content.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": text_content
+                }));
+            }
+        } else {
+            // 从完整文本中提取 thinking 块
+            let (thinking, remaining_text) =
+                super::stream::extract_thinking_from_complete_text(&text_content);
+
+            if let Some(thinking_text) = thinking {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking_text
+                }));
+            }
+
+            if !remaining_text.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": remaining_text
+                }));
+            }
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    }
+
+    content.extend(tool_uses);
+    content
+}
+
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -534,6 +597,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    let mut reasoning_content = String::new();
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -551,6 +616,16 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if thinking_enabled {
+                                if !reasoning.text.is_empty() {
+                                    reasoning_content.push_str(&reasoning.text);
+                                }
+                                if !reasoning.signature.is_empty() {
+                                    reasoning_signature = Some(reasoning.signature);
+                                }
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -627,34 +702,14 @@ async fn handle_non_stream_request(
     }
 
     // 构建响应内容
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
-            content.push(json!({
-                "type": "thinking",
-                "thinking": thinking_text
-            }));
-        }
-
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
-        }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
-    }
-
-    content.extend(tool_uses);
+    let content = build_non_stream_content_blocks(
+        text_content,
+        reasoning_content,
+        reasoning_signature,
+        tool_uses,
+        thinking_enabled,
+        model,
+    );
 
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
@@ -1018,4 +1073,44 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_non_stream_content_includes_upstream_reasoning_signature() {
+        let content = build_non_stream_content_blocks(
+            "final answer".to_string(),
+            "real upstream thinking".to_string(),
+            Some("real-upstream-signature".to_string()),
+            Vec::new(),
+            true,
+            "claude-opus-4-8",
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "real upstream thinking");
+        assert_eq!(content[0]["signature"], "real-upstream-signature");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn test_non_stream_content_does_not_fallback_signature_without_upstream_signature() {
+        let content = build_non_stream_content_blocks(
+            "final answer".to_string(),
+            "real upstream thinking".to_string(),
+            None,
+            Vec::new(),
+            true,
+            "claude-opus-4-8",
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert!(content[0].get("signature").is_none());
+    }
 }
