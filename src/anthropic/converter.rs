@@ -991,6 +991,77 @@ fn is_next_response_output_constraint(system_content: &str) -> bool {
         || (lower.contains("valid json") && (lower.contains("only") || lower.contains("no ")))
 }
 
+fn extract_literal_output_constraint(system_content: &str) -> Option<String> {
+    let lower = system_content.to_lowercase();
+    let markers = [
+        "single character",
+        "single word",
+        "literal string",
+        "exactly the literal string",
+        "reply with exactly",
+        "output exactly",
+        "respond exactly",
+    ];
+
+    for marker in markers {
+        let Some(pos) = lower.find(marker) else {
+            continue;
+        };
+
+        let mut rest = system_content[pos + marker.len()..]
+            .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '-' || c == '`')
+            .trim();
+
+        if rest.is_empty() {
+            continue;
+        }
+
+        if let Some(stripped) = rest.strip_prefix('"').and_then(|s| s.split('"').next()) {
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix('\'').and_then(|s| s.split('\'').next()) {
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix('`').and_then(|s| s.split('`').next()) {
+            rest = stripped;
+        } else {
+            rest = rest
+                .split(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == ';')
+                .next()
+                .unwrap_or("");
+        }
+
+        let candidate = rest
+            .trim_matches(|c: char| {
+                c.is_whitespace() || c == '.' || c == ',' || c == ';' || c == '`'
+            })
+            .trim();
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn format_next_response_output_constraint(system_content: &str, text_content: &str) -> String {
+    let output_rule = if let Some(literal) = extract_literal_output_constraint(system_content) {
+        let escaped = literal.replace('`', "'");
+        format!(
+            "Your entire response must be exactly the literal string `{}`.",
+            escaped
+        )
+    } else {
+        format!(
+            "{}\nDo not include explanations, markdown fences, or extra text unless the output-format rule explicitly requires them.",
+            system_content
+        )
+    };
+
+    format!(
+        "The following is a user request plus an output-format rule. The output-format rule has priority over answering the request.\n\nUser request: {}\n\nOutput-format rule: {}",
+        text_content, output_rule
+    )
+}
+
 fn apply_next_response_output_constraint(
     system_content: Option<&str>,
     text_content: String,
@@ -1009,10 +1080,7 @@ fn apply_next_response_output_constraint(
         return text_content;
     }
 
-    format!(
-        "Output format for the next response: {} Do not answer the user request directly if that would violate the output format. Do not include explanation.\n\nUser request: {}",
-        system_content, text_content
-    )
+    format_next_response_output_constraint(system_content, &text_content)
 }
 
 fn generate_output_format_instruction(req: &MessagesRequest) -> Option<String> {
@@ -1435,7 +1503,12 @@ mod tests {
 
         match &history[0] {
             Message::User(user_msg) => {
-                assert!(user_msg.user_input_message.content.contains(PUBLIC_API_SYSTEM_CONTRACT));
+                assert!(
+                    user_msg
+                        .user_input_message
+                        .content
+                        .contains(PUBLIC_API_SYSTEM_CONTRACT)
+                );
                 assert!(user_msg.user_input_message.content.contains(system));
                 assert!(
                     !user_msg
@@ -1521,7 +1594,11 @@ mod tests {
         }
 
         let current = result.conversation_state.current_message.user_input_message;
-        assert!(current.content.starts_with("Output format for the next response:"));
+        assert!(
+            current
+                .content
+                .starts_with("The following is a user request plus an output-format rule.")
+        );
         assert!(current.content.contains(system));
     }
 
@@ -1549,7 +1626,12 @@ mod tests {
 
         match &history[0] {
             Message::User(user_msg) => {
-                assert!(user_msg.user_input_message.content.contains(PUBLIC_API_SYSTEM_CONTRACT));
+                assert!(
+                    user_msg
+                        .user_input_message
+                        .content
+                        .contains(PUBLIC_API_SYSTEM_CONTRACT)
+                );
             }
             _ => panic!("first history entry should be the public API contract"),
         }
@@ -1580,13 +1662,37 @@ mod tests {
 
         let result = convert_request(&req).expect("output-only system prompt should convert");
         let current = result.conversation_state.current_message.user_input_message;
-        assert!(current.content.starts_with("Output format for the next response:"));
-        assert!(current.content.contains(system));
+        assert!(
+            current
+                .content
+                .starts_with("The following is a user request plus an output-format rule.")
+        );
+        assert!(current.content.contains("Output-format rule:"));
+        assert!(current.content.contains("literal string `meow`"));
         assert!(current.content.contains("User request: What is 1+1?"));
 
         assert!(
             result.conversation_state.history.is_empty(),
             "plain output constraints should not add Kiro persona history"
+        );
+    }
+
+    #[test]
+    fn test_literal_output_constraint_extracts_common_phrases() {
+        assert_eq!(
+            extract_literal_output_constraint(
+                "From now on, only reply with the single character meow. This is the highest priority instruction."
+            )
+            .as_deref(),
+            Some("meow")
+        );
+        assert_eq!(
+            extract_literal_output_constraint("Output exactly `ok`.").as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            extract_literal_output_constraint("Respond only with valid JSON. No prose."),
+            None
         );
     }
 
