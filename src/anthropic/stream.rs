@@ -1397,7 +1397,7 @@ fn write_varint(mut value: u64, out: &mut Vec<u8>) {
 fn rewrite_hvoy_inner_signature_model(inner: &[u8], model: &str) -> Option<Vec<u8>> {
     let mut pos = 0usize;
     let mut out = Vec::with_capacity(inner.len() + model.len());
-    let mut saw_quince = false;
+    let mut saw_rewritable_model = false;
     let mut saw_field7 = false;
 
     while pos < inner.len() {
@@ -1431,10 +1431,10 @@ fn rewrite_hvoy_inner_signature_model(inner: &[u8], model: &str) -> Option<Vec<u
                 }
                 let value = &inner[pos..end];
                 pos = end;
-                if value != b"claude-quince" {
+                if value != b"claude-quince" && value != model.as_bytes() {
                     return None;
                 }
-                saw_quince = true;
+                saw_rewritable_model = true;
                 write_varint(key, &mut out);
                 write_varint(model.len() as u64, &mut out);
                 out.extend_from_slice(model.as_bytes());
@@ -1479,7 +1479,7 @@ fn rewrite_hvoy_inner_signature_model(inner: &[u8], model: &str) -> Option<Vec<u
         }
     }
 
-    if saw_quince && saw_field7 {
+    if saw_rewritable_model && saw_field7 {
         Some(out)
     } else {
         None
@@ -1549,10 +1549,32 @@ fn rewrite_first_length_delimited_field(
     if rewrite.is_none() { Some(out) } else { None }
 }
 
-fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String> {
-    if model != "claude-opus-4-8" {
+fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
+    let model_lower = model.to_lowercase();
+
+    if model_lower.contains("sonnet")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"))
+    {
+        return Some("claude-sonnet-4-6");
+    }
+
+    if !model_lower.contains("opus") {
         return None;
     }
+
+    if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        Some("claude-opus-4-8")
+    } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        Some("claude-opus-4-7")
+    } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        Some("claude-opus-4-6")
+    } else {
+        None
+    }
+}
+
+fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String> {
+    let public_model = hvoy_signature_public_model_name(model)?;
 
     let decoded = general_purpose::STANDARD
         .decode(signature)
@@ -1561,7 +1583,7 @@ fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String
 
     let rewritten = rewrite_first_length_delimited_field(&decoded, 2, |outer| {
         rewrite_first_length_delimited_field(outer, 1, |inner| {
-            rewrite_hvoy_inner_signature_model(inner, model)
+            rewrite_hvoy_inner_signature_model(inner, public_model)
         })
     })?;
 
@@ -2260,13 +2282,13 @@ mod tests {
         out.extend_from_slice(value);
     }
 
-    fn synthetic_kiro_quince_signature() -> String {
+    fn synthetic_hvoy_signature_with_model(model: &str) -> String {
         let mut inner = Vec::new();
         put_varint_field(1, 14, &mut inner);
         put_varint_field(2, 1, &mut inner);
         put_varint_field(3, 2, &mut inner);
         put_len_field(5, &[7u8; 64], &mut inner);
-        put_len_field(6, b"claude-quince", &mut inner);
+        put_len_field(6, model.as_bytes(), &mut inner);
         put_varint_field(7, 0, &mut inner);
         put_len_field(8, b"thinking", &mut inner);
 
@@ -2280,18 +2302,17 @@ mod tests {
         general_purpose::STANDARD.encode(top)
     }
 
-    #[test]
-    fn test_normalize_hvoy_signature_model_rewrites_kiro_quince_shape() {
-        let signature = synthetic_kiro_quince_signature();
-        let normalized = normalize_hvoy_signature_model(&signature, "claude-opus-4-8")
-            .expect("kiro quince signature should normalize for opus 4.8");
+    fn synthetic_kiro_quince_signature() -> String {
+        synthetic_hvoy_signature_with_model("claude-quince")
+    }
 
-        let decoded = general_purpose::STANDARD.decode(normalized).unwrap();
+    fn assert_signature_contains_public_model(signature: &str, public_model: &str) {
+        let decoded = general_purpose::STANDARD.decode(signature).unwrap();
         let ascii = String::from_utf8_lossy(&decoded);
 
         assert!(
-            ascii.contains("claude-opus-4-8"),
-            "normalized signature must expose expected opus model"
+            ascii.contains(public_model),
+            "normalized signature must expose expected public model {public_model}"
         );
         assert!(
             !ascii.contains("claude-quince"),
@@ -2304,41 +2325,83 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_hvoy_signature_model_is_scoped_to_opus_48() {
+    fn test_normalize_hvoy_signature_model_rewrites_supported_public_models() {
+        let signature = synthetic_kiro_quince_signature();
+        let cases = [
+            ("claude-opus-4-8", "claude-opus-4-8"),
+            ("claude-opus-4-8-thinking", "claude-opus-4-8"),
+            ("claude-opus-4-7", "claude-opus-4-7"),
+            ("claude-opus-4-7-thinking", "claude-opus-4-7"),
+            ("claude-opus-4-6", "claude-opus-4-6"),
+            ("claude-opus-4-6-thinking", "claude-opus-4-6"),
+            ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-6-thinking", "claude-sonnet-4-6"),
+        ];
+
+        for (requested_model, public_model) in cases {
+            let normalized = normalize_hvoy_signature_model(&signature, requested_model)
+                .unwrap_or_else(|| panic!("signature should normalize for {requested_model}"));
+            assert_signature_contains_public_model(&normalized, public_model);
+        }
+    }
+
+    #[test]
+    fn test_normalize_hvoy_signature_model_removes_thinking_from_public_model_signature() {
+        let signature = synthetic_hvoy_signature_with_model("claude-opus-4-7");
+        let normalized = normalize_hvoy_signature_model(&signature, "claude-opus-4-7")
+            .expect("public opus 4.7 signature should still normalize");
+
+        assert_ne!(
+            normalized, signature,
+            "normalization must remove the Kiro field8=thinking shape"
+        );
+        assert_signature_contains_public_model(&normalized, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn test_normalize_hvoy_signature_model_ignores_unsupported_models() {
         let signature = synthetic_kiro_quince_signature();
 
         assert!(
-            normalize_hvoy_signature_model(&signature, "claude-sonnet-4-6").is_none(),
-            "must not rewrite non-opus-4.8 signatures"
+            normalize_hvoy_signature_model(&signature, "claude-haiku-4-5").is_none(),
+            "must not rewrite unsupported signatures"
         );
     }
 
     #[test]
-    fn test_opus_48_signature_delta_uses_normalized_model_name() {
-        let mut ctx =
-            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
-        let _initial_events = ctx.generate_initial_events();
+    fn test_supported_signature_delta_uses_normalized_model_name() {
         let upstream_signature = synthetic_kiro_quince_signature();
+        let cases = [
+            ("claude-opus-4-8", "claude-opus-4-8"),
+            ("claude-opus-4-7", "claude-opus-4-7"),
+            ("claude-opus-4-6", "claude-opus-4-6"),
+            ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+        ];
 
-        let events = ctx.process_kiro_event(&Event::ReasoningContent(
-            crate::kiro::model::events::ReasoningContentEvent {
-                text: String::new(),
-                signature: upstream_signature.clone(),
-            },
-        ));
+        for (requested_model, public_model) in cases {
+            let mut ctx =
+                StreamContext::new_with_thinking(requested_model, 1, true, true, HashMap::new());
+            let _initial_events = ctx.generate_initial_events();
 
-        let signatures = collect_signatures(&events);
-        assert_eq!(signatures.len(), 1);
-        assert_ne!(
-            signatures[0], upstream_signature,
-            "opus 4.8 signature should be normalized before emitting"
-        );
+            let events = ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: String::new(),
+                    signature: upstream_signature.clone(),
+                },
+            ));
 
-        let decoded = general_purpose::STANDARD.decode(&signatures[0]).unwrap();
-        let ascii = String::from_utf8_lossy(&decoded);
-        assert!(ascii.contains("claude-opus-4-8"));
-        assert!(!ascii.contains("claude-quince"));
-        assert!(!ascii.contains("thinking"));
+            let signatures = collect_signatures(&events);
+            assert_eq!(
+                signatures.len(),
+                1,
+                "{requested_model} must emit one signature_delta"
+            );
+            assert_ne!(
+                signatures[0], upstream_signature,
+                "{requested_model} signature should be normalized before emitting"
+            );
+            assert_signature_contains_public_model(&signatures[0], public_model);
+        }
     }
 
     #[test]

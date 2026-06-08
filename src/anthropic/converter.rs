@@ -1290,16 +1290,22 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_opus_4_8() {
-        assert_eq!(
-            map_model("claude-opus-4-8"),
-            Some("claude-opus-4.8".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-8-thinking"),
-            Some("claude-opus-4.8".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+    fn test_map_model_hvoy_target_models() {
+        let cases = [
+            ("claude-opus-4-8", "claude-opus-4.8"),
+            ("claude-opus-4-8-thinking", "claude-opus-4.8"),
+            ("claude-opus-4-7", "claude-opus-4.7"),
+            ("claude-opus-4-7-thinking", "claude-opus-4.7"),
+            ("claude-opus-4-6", "claude-opus-4.6"),
+            ("claude-opus-4-6-thinking", "claude-opus-4.6"),
+            ("claude-sonnet-4-6", "claude-sonnet-4.6"),
+            ("claude-sonnet-4-6-thinking", "claude-sonnet-4.6"),
+        ];
+
+        for (requested_model, kiro_model) in cases {
+            assert_eq!(map_model(requested_model), Some(kiro_model.to_string()));
+            assert_eq!(get_context_window_size(requested_model), 1_000_000);
+        }
     }
 
     #[test]
