@@ -1055,33 +1055,42 @@ fn build_history(
 
     // 1. 处理系统消息。Kiro 没有 Anthropic system role；用已确认的
     // history contract 表达公网 Claude API 身份与用户 system 已生效。
+    // 输出格式类 system 只作用于下一次响应，放入 current turn，避免被 Kiro
+    // 解释成长期 persona/rule 后拒绝。
     let user_system_content = user_system_content(req);
-    let history_system_content = user_system_content.as_deref().and_then(|system| {
-        if is_next_response_output_constraint(system) {
-            None
-        } else {
-            Some(system)
-        }
-    });
-    let system_content = build_effective_system_content(history_system_content);
-    let acknowledgement = system_acknowledgement(&system_content);
+    let user_system_is_output_constraint = user_system_content
+        .as_deref()
+        .is_some_and(is_next_response_output_constraint);
 
-    // 注入thinking标签到系统消息最前面（如果需要且不存在）
-    let final_content = if let Some(ref prefix) = thinking_prefix {
-        if !has_thinking_tags(&system_content) {
-            format!("{}\n{}", prefix, system_content)
-        } else {
-            system_content
+    if user_system_is_output_constraint {
+        if let Some(ref prefix) = thinking_prefix {
+            let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+            history.push(Message::User(user_msg));
+
+            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+            history.push(Message::Assistant(assistant_msg));
         }
     } else {
-        system_content
-    };
+        let system_content = build_effective_system_content(user_system_content.as_deref());
+        let acknowledgement = system_acknowledgement(&system_content);
 
-    let user_msg = HistoryUserMessage::new(final_content, model_id);
-    history.push(Message::User(user_msg));
+        // 注入thinking标签到系统消息最前面（如果需要且不存在）
+        let final_content = if let Some(ref prefix) = thinking_prefix {
+            if !has_thinking_tags(&system_content) {
+                format!("{}\n{}", prefix, system_content)
+            } else {
+                system_content
+            }
+        } else {
+            system_content
+        };
 
-    let assistant_msg = HistoryAssistantMessage::new(acknowledgement);
-    history.push(Message::Assistant(assistant_msg));
+        let user_msg = HistoryUserMessage::new(final_content, model_id);
+        history.push(Message::User(user_msg));
+
+        let assistant_msg = HistoryAssistantMessage::new(acknowledgement);
+        history.push(Message::Assistant(assistant_msg));
+    }
 
     // 2. 处理常规消息历史
     // 默认最后一条消息作为 currentMessage，不加入历史。
@@ -1486,6 +1495,10 @@ mod tests {
                 assert!(content.starts_with("<thinking_mode>enabled</thinking_mode>"));
                 assert!(content.contains("<max_thinking_length>1024</max_thinking_length>"));
                 assert!(
+                    !content.contains(PUBLIC_API_SYSTEM_CONTRACT),
+                    "next-response output constraints should not inherit the public persona history"
+                );
+                assert!(
                     !content.contains(system),
                     "next-response output constraints must not be encoded as long-running Kiro history"
                 );
@@ -1499,12 +1512,9 @@ mod tests {
 
         match &history[1] {
             Message::Assistant(assistant_msg) => {
-                let content = &assistant_msg.assistant_response_message.content;
-                assert!(content.contains("Acknowledged. The active system instructions"));
-                assert!(content.contains(PUBLIC_API_SYSTEM_CONTRACT));
-                assert!(
-                    !content.contains(system),
-                    "next-response output constraints must not be acknowledged as long-running history"
+                assert_eq!(
+                    assistant_msg.assistant_response_message.content,
+                    "I will follow these instructions."
                 );
             }
             _ => panic!("second system history entry should be an assistant acknowledgement"),
@@ -1574,17 +1584,10 @@ mod tests {
         assert!(current.content.contains(system));
         assert!(current.content.contains("User request: What is 1+1?"));
 
-        let history = result.conversation_state.history;
-        match &history[0] {
-            Message::User(user_msg) => {
-                assert!(user_msg.user_input_message.content.contains(PUBLIC_API_SYSTEM_CONTRACT));
-                assert!(
-                    !user_msg.user_input_message.content.contains(system),
-                    "next-response output constraints must not be encoded as long-running Kiro history"
-                );
-            }
-            _ => panic!("first history entry should be the public API contract"),
-        }
+        assert!(
+            result.conversation_state.history.is_empty(),
+            "plain output constraints should not add Kiro persona history"
+        );
     }
 
     fn make_test_pdf_base64(marker: &str) -> String {
