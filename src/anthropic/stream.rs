@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -566,6 +567,8 @@ pub struct StreamContext {
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
+    /// 是否已经为当前 thinking 块输出过 signature_delta
+    pub signature_delta_emitted: bool,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -601,6 +604,7 @@ impl StreamContext {
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
+            signature_delta_emitted: false,
             text_block_index: None,
             strip_thinking_leading_newline: false,
         }
@@ -768,12 +772,7 @@ impl StreamContext {
             events.extend(self.ensure_thinking_block_started());
             if let Some(thinking_index) = self.thinking_block_index {
                 events.push(self.create_thinking_delta_event(thinking_index, ""));
-                events.push(
-                    self.create_upstream_signature_delta_event(
-                        thinking_index,
-                        &reasoning.signature,
-                    ),
-                );
+                events.push(self.emit_signature_delta_event(thinking_index, &reasoning.signature));
                 if let Some(stop_event) =
                     self.state_manager.handle_content_block_stop(thinking_index)
                 {
@@ -898,16 +897,9 @@ impl StreamContext {
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
-                    // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
+                    // 发送空的 thinking_delta 事件、可选签名事件，然后关闭 thinking 块
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block_events(thinking_index));
                     }
 
                     // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
@@ -1044,6 +1036,67 @@ impl StreamContext {
         )
     }
 
+    fn emit_signature_delta_event(&mut self, index: i32, signature: &str) -> SseEvent {
+        self.signature_delta_emitted = true;
+        self.create_upstream_signature_delta_event(index, signature)
+    }
+
+    fn create_fallback_hvoy_signature(&self) -> Option<String> {
+        let public_model = hvoy_signature_public_model_name(&self.model)?;
+        let mut proof_bytes = Vec::with_capacity(256);
+        for counter in 0..8u8 {
+            let mut hasher = Sha256::new();
+            hasher.update(self.message_id.as_bytes());
+            hasher.update(public_model.as_bytes());
+            hasher.update([counter]);
+            proof_bytes.extend_from_slice(&hasher.finalize());
+        }
+
+        let mut inner = Vec::new();
+        write_varint(1 << 3, &mut inner);
+        write_varint(12, &mut inner);
+        write_varint(3 << 3, &mut inner);
+        write_varint(2, &mut inner);
+        write_varint((5 << 3) | 2, &mut inner);
+        write_varint(proof_bytes.len() as u64, &mut inner);
+        inner.extend_from_slice(&proof_bytes);
+        write_varint((6 << 3) | 2, &mut inner);
+        write_varint(public_model.len() as u64, &mut inner);
+        inner.extend_from_slice(public_model.as_bytes());
+        write_varint(7 << 3, &mut inner);
+        write_varint(0, &mut inner);
+
+        let mut outer = Vec::new();
+        write_varint((1 << 3) | 2, &mut outer);
+        write_varint(inner.len() as u64, &mut outer);
+        outer.extend_from_slice(&inner);
+
+        let mut top = Vec::new();
+        write_varint((2 << 3) | 2, &mut top);
+        write_varint(outer.len() as u64, &mut top);
+        top.extend_from_slice(&outer);
+        write_varint(3 << 3, &mut top);
+        write_varint(1, &mut top);
+
+        Some(general_purpose::STANDARD.encode(top))
+    }
+
+    fn close_thinking_block_events(&mut self, index: i32) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        events.push(self.create_thinking_delta_event(index, ""));
+
+        if self.signature_compat_enabled && !self.signature_delta_emitted {
+            if let Some(signature) = self.create_fallback_hvoy_signature() {
+                events.push(self.emit_signature_delta_event(index, &signature));
+            }
+        }
+
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
+            events.push(stop_event);
+        }
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -1073,14 +1126,7 @@ impl StreamContext {
                 self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
+                    events.extend(self.close_thinking_block_events(thinking_index));
                 }
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
@@ -1188,14 +1234,9 @@ impl StreamContext {
                         }
                     }
 
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block_events(thinking_index));
                     }
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
@@ -1217,14 +1258,7 @@ impl StreamContext {
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block_events(thinking_index));
                     }
                 }
             } else {
@@ -2480,6 +2514,38 @@ mod tests {
     }
 
     #[test]
+    fn test_upstream_reasoning_signature_does_not_emit_fallback_duplicate() {
+        let upstream_signature = synthetic_kiro_quince_signature();
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-6", 1, true, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: "abc".to_string(),
+                signature: String::new(),
+            },
+        )));
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: upstream_signature,
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        let signatures = collect_signatures(&all_events);
+        assert_eq!(
+            signatures.len(),
+            1,
+            "real upstream signature must not be followed by a fallback duplicate"
+        );
+        assert_signature_contains_public_model(&signatures[0], "claude-opus-4-6");
+    }
+
+    #[test]
     fn test_upstream_reasoning_thinking_block_start_matches_anthropic_shape() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
@@ -2506,23 +2572,64 @@ mod tests {
     }
 
     #[test]
-    fn test_signature_compat_mode_does_not_forge_without_upstream_signature() {
+    fn test_signature_compat_mode_emits_fallback_for_supported_model_without_upstream_signature() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 1, true, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nanswer"));
+        all_events.extend(ctx.generate_final_events());
+
+        let signatures = collect_signatures(&all_events);
+        assert_eq!(
+            signatures.len(),
+            1,
+            "supported HVOY target models should get one fallback signature_delta when upstream omits it"
+        );
+        assert_signature_contains_public_model(&signatures[0], "claude-sonnet-4-6");
+        assert_eq!(collect_thinking_content(&all_events), "abc");
+        assert_eq!(collect_text_content(&all_events), "answer");
+
+        let thinking_index = ctx
+            .thinking_block_index
+            .expect("thinking block index should exist");
+        let signature_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("signature delta should exist");
+        let stop_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(thinking_index as i64)
+            })
+            .expect("thinking stop should exist");
+
+        assert!(
+            signature_pos < stop_pos,
+            "fallback signature_delta must be emitted before thinking content_block_stop"
+        );
+    }
+
+    #[test]
+    fn test_signature_compat_mode_does_not_fallback_for_unsupported_model() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
-        all_events.extend(ctx.process_assistant_response("plain answer without thinking tags"));
+        all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nanswer"));
         all_events.extend(ctx.generate_final_events());
 
         let signatures = collect_signatures(&all_events);
         assert!(
             signatures.is_empty(),
-            "must not synthesize local signature_delta when upstream has no signature"
+            "unsupported models must not get local fallback signature_delta"
         );
-        assert_eq!(
-            collect_text_content(&all_events),
-            "plain answer without thinking tags"
-        );
+        assert_eq!(collect_thinking_content(&all_events), "abc");
+        assert_eq!(collect_text_content(&all_events), "answer");
     }
 
     #[test]
