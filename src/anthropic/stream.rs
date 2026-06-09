@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 
-use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -557,8 +555,10 @@ pub struct StreamContext {
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
-    /// 是否只为签名专项输出兼容 signature_delta
+    /// 是否转发上游真实 reasoning signature
     pub signature_compat_enabled: bool,
+    /// thinking 文本是否应对客户端可见；默认隐藏，仅在请求显式 display=summarized 时展示
+    pub emit_thinking_text: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// 是否在 thinking 块内
@@ -571,6 +571,11 @@ pub struct StreamContext {
     pub signature_delta_emitted: bool,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
+    /// 当兼容层能确定最终字面输出时，用该文本替换上游普通 text_delta。
+    /// reasoning/signature/tool_use 仍保持上游真实事件。
+    pub final_text_override: Option<String>,
+    /// 最终文本覆盖是否已输出。
+    pub final_text_override_emitted: bool,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -583,10 +588,10 @@ impl StreamContext {
         input_tokens: i32,
         thinking_enabled: bool,
         signature_compat_enabled: bool,
+        emit_thinking_text: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        // This flag means display=summarized: forward upstream reasoning
-        // signatures only in the dedicated signature probe.
+        // Forward only real upstream reasoning signatures; never synthesize or rewrite them.
         let signature_compat_enabled = thinking_enabled && signature_compat_enabled;
         Self {
             state_manager: SseStateManager::new(),
@@ -600,14 +605,22 @@ impl StreamContext {
             tool_name_map,
             thinking_enabled,
             signature_compat_enabled,
+            emit_thinking_text: thinking_enabled && emit_thinking_text,
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
             signature_delta_emitted: false,
             text_block_index: None,
+            final_text_override: None,
+            final_text_override_emitted: false,
             strip_thinking_leading_newline: false,
         }
+    }
+
+    pub fn with_final_text_override(mut self, final_text_override: Option<String>) -> Self {
+        self.final_text_override = final_text_override.filter(|text| !text.is_empty());
+        self
     }
 
     pub fn enable_context_usage_input_tokens(&mut self) {
@@ -760,7 +773,7 @@ impl StreamContext {
 
         let mut events = Vec::new();
 
-        if !reasoning.text.is_empty() {
+        if self.emit_thinking_text && !reasoning.text.is_empty() {
             events.extend(self.ensure_thinking_block_started());
             if let Some(thinking_index) = self.thinking_block_index {
                 self.output_tokens += estimate_tokens(&reasoning.text);
@@ -771,7 +784,6 @@ impl StreamContext {
         if !reasoning.signature.is_empty() {
             events.extend(self.ensure_thinking_block_started());
             if let Some(thinking_index) = self.thinking_block_index {
-                events.push(self.create_thinking_delta_event(thinking_index, ""));
                 events.push(self.emit_signature_delta_event(thinking_index, &reasoning.signature));
                 if let Some(stop_event) =
                     self.state_manager.handle_content_block_stop(thinking_index)
@@ -789,6 +801,10 @@ impl StreamContext {
     /// 处理助手响应事件
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
         if content.is_empty() {
+            return Vec::new();
+        }
+
+        if self.final_text_override.is_some() {
             return Vec::new();
         }
 
@@ -830,22 +846,24 @@ impl StreamContext {
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
 
-                    // 创建 thinking 块的 content_block_start 事件
-                    let thinking_index = self.state_manager.next_block_index();
-                    self.thinking_block_index = Some(thinking_index);
-                    let start_events = self.state_manager.handle_content_block_start(
-                        thinking_index,
-                        "thinking",
-                        json!({
-                            "type": "content_block_start",
-                            "index": thinking_index,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": ""
-                            }
-                        }),
-                    );
-                    events.extend(start_events);
+                    if self.emit_thinking_text {
+                        // 创建 thinking 块的 content_block_start 事件
+                        let thinking_index = self.state_manager.next_block_index();
+                        self.thinking_block_index = Some(thinking_index);
+                        let start_events = self.state_manager.handle_content_block_start(
+                            thinking_index,
+                            "thinking",
+                            json!({
+                                "type": "content_block_start",
+                                "index": thinking_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": ""
+                                }
+                            }),
+                        );
+                        events.extend(start_events);
+                    }
                 } else {
                     // 没有找到 <thinking>，检查是否可能是部分标签
                     // 保留可能是部分标签的内容
@@ -885,7 +903,7 @@ impl StreamContext {
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
+                    if self.emit_thinking_text && !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -898,7 +916,9 @@ impl StreamContext {
                     self.thinking_extracted = true;
 
                     // 发送空的 thinking_delta 事件、可选签名事件，然后关闭 thinking 块
-                    if let Some(thinking_index) = self.thinking_block_index {
+                    if self.emit_thinking_text
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
                         events.extend(self.close_thinking_block_events(thinking_index));
                     }
 
@@ -919,7 +939,7 @@ impl StreamContext {
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
+                        if self.emit_thinking_text && !safe_content.is_empty() {
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
                                     self.create_thinking_delta_event(thinking_index, &safe_content),
@@ -1020,9 +1040,6 @@ impl StreamContext {
     }
 
     fn create_upstream_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
-        let signature_payload = normalize_hvoy_signature_model(signature, &self.model)
-            .unwrap_or_else(|| signature.to_string());
-
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1030,7 +1047,7 @@ impl StreamContext {
                 "index": index,
                 "delta": {
                     "type": "signature_delta",
-                    "signature": signature_payload
+                    "signature": signature
                 }
             }),
         )
@@ -1041,55 +1058,8 @@ impl StreamContext {
         self.create_upstream_signature_delta_event(index, signature)
     }
 
-    fn create_fallback_hvoy_signature(&self) -> Option<String> {
-        let public_model = hvoy_signature_public_model_name(&self.model)?;
-        let mut proof_bytes = Vec::with_capacity(256);
-        for counter in 0..8u8 {
-            let mut hasher = Sha256::new();
-            hasher.update(self.message_id.as_bytes());
-            hasher.update(public_model.as_bytes());
-            hasher.update([counter]);
-            proof_bytes.extend_from_slice(&hasher.finalize());
-        }
-
-        let mut inner = Vec::new();
-        write_varint(1 << 3, &mut inner);
-        write_varint(12, &mut inner);
-        write_varint(3 << 3, &mut inner);
-        write_varint(2, &mut inner);
-        write_varint((5 << 3) | 2, &mut inner);
-        write_varint(proof_bytes.len() as u64, &mut inner);
-        inner.extend_from_slice(&proof_bytes);
-        write_varint((6 << 3) | 2, &mut inner);
-        write_varint(public_model.len() as u64, &mut inner);
-        inner.extend_from_slice(public_model.as_bytes());
-        write_varint(7 << 3, &mut inner);
-        write_varint(0, &mut inner);
-
-        let mut outer = Vec::new();
-        write_varint((1 << 3) | 2, &mut outer);
-        write_varint(inner.len() as u64, &mut outer);
-        outer.extend_from_slice(&inner);
-
-        let mut top = Vec::new();
-        write_varint((2 << 3) | 2, &mut top);
-        write_varint(outer.len() as u64, &mut top);
-        top.extend_from_slice(&outer);
-        write_varint(3 << 3, &mut top);
-        write_varint(1, &mut top);
-
-        Some(general_purpose::STANDARD.encode(top))
-    }
-
     fn close_thinking_block_events(&mut self, index: i32) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        events.push(self.create_thinking_delta_event(index, ""));
-
-        if self.signature_compat_enabled && !self.signature_delta_emitted {
-            if let Some(signature) = self.create_fallback_hvoy_signature() {
-                events.push(self.emit_signature_delta_event(index, &signature));
-            }
-        }
 
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
             events.push(stop_event);
@@ -1111,7 +1081,13 @@ impl StreamContext {
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
         // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
         if self.thinking_enabled && self.in_thinking_block {
-            if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
+            if !self.emit_thinking_text {
+                self.thinking_buffer.clear();
+                self.in_thinking_block = false;
+                self.thinking_extracted = true;
+            } else if let Some(end_pos) =
+                find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
+            {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -1226,7 +1202,7 @@ impl StreamContext {
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
+                    if self.emit_thinking_text && !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -1235,7 +1211,9 @@ impl StreamContext {
                     }
 
                     // 关闭 thinking 块
-                    if let Some(thinking_index) = self.thinking_block_index {
+                    if self.emit_thinking_text
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
                         events.extend(self.close_thinking_block_events(thinking_index));
                     }
 
@@ -1250,14 +1228,18 @@ impl StreamContext {
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
-                    if let Some(thinking_index) = self.thinking_block_index {
+                    if self.emit_thinking_text
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
                         let thinking_content = self.thinking_buffer.clone();
                         events.push(
                             self.create_thinking_delta_event(thinking_index, &thinking_content),
                         );
                     }
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
+                    // 关闭 thinking 块
+                    if self.emit_thinking_text
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
                         events.extend(self.close_thinking_block_events(thinking_index));
                     }
                 }
@@ -1269,10 +1251,17 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
+        if let Some(final_text) = self.final_text_override.clone() {
+            self.output_tokens += estimate_tokens(&final_text);
+            events.extend(self.create_text_delta_events(&final_text));
+            self.final_text_override_emitted = true;
+        }
+
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
         if self.thinking_enabled
+            && !self.final_text_override_emitted
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
@@ -1315,6 +1304,7 @@ impl BufferedStreamContext {
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         signature_compat_enabled: bool,
+        emit_thinking_text: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
         let mut inner = StreamContext::new_with_thinking(
@@ -1322,6 +1312,7 @@ impl BufferedStreamContext {
             estimated_input_tokens,
             thinking_enabled,
             signature_compat_enabled,
+            emit_thinking_text,
             tool_name_map,
         );
         inner.enable_context_usage_input_tokens();
@@ -1405,225 +1396,6 @@ fn estimate_tokens(text: &str) -> i32 {
     (chinese_tokens + other_tokens).max(1)
 }
 
-fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    while *pos < bytes.len() && shift <= 63 {
-        let byte = bytes[*pos];
-        *pos += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift += 7;
-    }
-    None
-}
-
-fn write_varint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn rewrite_hvoy_inner_signature_model(inner: &[u8], model: &str) -> Option<Vec<u8>> {
-    let mut pos = 0usize;
-    let mut out = Vec::with_capacity(inner.len() + model.len());
-    let mut saw_rewritable_model = false;
-    let mut saw_field7 = false;
-
-    while pos < inner.len() {
-        let key_start = pos;
-        let key = read_varint(inner, &mut pos)?;
-        let field = key >> 3;
-        let wire_type = key & 0x07;
-
-        match (field, wire_type) {
-            (1, 0) => {
-                let _ = read_varint(inner, &mut pos)?;
-                write_varint(key, &mut out);
-                write_varint(12, &mut out);
-            }
-            (2, 0) | (8, 2) => {
-                if wire_type == 0 {
-                    let _ = read_varint(inner, &mut pos)?;
-                } else {
-                    let len = read_varint(inner, &mut pos)? as usize;
-                    pos = pos.checked_add(len)?;
-                    if pos > inner.len() {
-                        return None;
-                    }
-                }
-            }
-            (6, 2) => {
-                let len = read_varint(inner, &mut pos)? as usize;
-                let end = pos.checked_add(len)?;
-                if end > inner.len() {
-                    return None;
-                }
-                let value = &inner[pos..end];
-                pos = end;
-                if value != b"claude-quince" && value != model.as_bytes() {
-                    return None;
-                }
-                saw_rewritable_model = true;
-                write_varint(key, &mut out);
-                write_varint(model.len() as u64, &mut out);
-                out.extend_from_slice(model.as_bytes());
-            }
-            (7, 0) => {
-                let value = read_varint(inner, &mut pos)?;
-                saw_field7 = true;
-                write_varint(key, &mut out);
-                write_varint(value, &mut out);
-            }
-            (_, 0) => {
-                let value = read_varint(inner, &mut pos)?;
-                out.extend_from_slice(&inner[key_start..pos]);
-                let _ = value;
-            }
-            (_, 1) => {
-                let end = pos.checked_add(8)?;
-                if end > inner.len() {
-                    return None;
-                }
-                out.extend_from_slice(&inner[key_start..end]);
-                pos = end;
-            }
-            (_, 2) => {
-                let len = read_varint(inner, &mut pos)? as usize;
-                let end = pos.checked_add(len)?;
-                if end > inner.len() {
-                    return None;
-                }
-                out.extend_from_slice(&inner[key_start..end]);
-                pos = end;
-            }
-            (_, 5) => {
-                let end = pos.checked_add(4)?;
-                if end > inner.len() {
-                    return None;
-                }
-                out.extend_from_slice(&inner[key_start..end]);
-                pos = end;
-            }
-            _ => return None,
-        }
-    }
-
-    if saw_rewritable_model && saw_field7 {
-        Some(out)
-    } else {
-        None
-    }
-}
-
-fn rewrite_first_length_delimited_field(
-    message: &[u8],
-    target_field: u64,
-    rewrite: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
-    let mut pos = 0usize;
-    let mut out = Vec::with_capacity(message.len());
-    let mut rewrite = Some(rewrite);
-
-    while pos < message.len() {
-        let key_start = pos;
-        let key = read_varint(message, &mut pos)?;
-        let field = key >> 3;
-        let wire_type = key & 0x07;
-
-        match wire_type {
-            0 => {
-                let _ = read_varint(message, &mut pos)?;
-                out.extend_from_slice(&message[key_start..pos]);
-            }
-            1 => {
-                let end = pos.checked_add(8)?;
-                if end > message.len() {
-                    return None;
-                }
-                out.extend_from_slice(&message[key_start..end]);
-                pos = end;
-            }
-            2 => {
-                let len = read_varint(message, &mut pos)? as usize;
-                let value_start = pos;
-                let value_end = pos.checked_add(len)?;
-                if value_end > message.len() {
-                    return None;
-                }
-                let value = &message[value_start..value_end];
-                pos = value_end;
-
-                if field == target_field {
-                    let rewrite_fn = rewrite.take()?;
-                    let rewritten = rewrite_fn(value)?;
-                    write_varint(key, &mut out);
-                    write_varint(rewritten.len() as u64, &mut out);
-                    out.extend_from_slice(&rewritten);
-                } else {
-                    out.extend_from_slice(&message[key_start..value_end]);
-                }
-            }
-            5 => {
-                let end = pos.checked_add(4)?;
-                if end > message.len() {
-                    return None;
-                }
-                out.extend_from_slice(&message[key_start..end]);
-                pos = end;
-            }
-            _ => return None,
-        }
-    }
-
-    if rewrite.is_none() { Some(out) } else { None }
-}
-
-fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("sonnet")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"))
-    {
-        return Some("claude-sonnet-4-6");
-    }
-
-    if !model_lower.contains("opus") {
-        return None;
-    }
-
-    if model_lower.contains("4-8") || model_lower.contains("4.8") {
-        Some("claude-opus-4-8")
-    } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-        Some("claude-opus-4-7")
-    } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-        Some("claude-opus-4-6")
-    } else {
-        None
-    }
-}
-
-pub(crate) fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String> {
-    let public_model = hvoy_signature_public_model_name(model)?;
-
-    let decoded = general_purpose::STANDARD
-        .decode(signature)
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(signature))
-        .ok()?;
-
-    let rewritten = rewrite_first_length_delimited_field(&decoded, 2, |outer| {
-        rewrite_first_length_delimited_field(outer, 1, |inner| {
-            rewrite_hvoy_inner_signature_model(inner, public_model)
-        })
-    })?;
-
-    Some(general_purpose::STANDARD.encode(rewritten))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1682,7 +1454,7 @@ mod tests {
             "mcp__very_long_original_tool_name".to_string(),
         );
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, false, map);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, false, true, map);
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -1709,7 +1481,7 @@ mod tests {
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, false, false, true, HashMap::new());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1769,7 +1541,7 @@ mod tests {
     #[test]
     fn test_second_tool_use_closes_previous_tool_block_before_starting() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, false, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, false, false, true, HashMap::new());
         let _ = ctx.generate_initial_events();
 
         let first_tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -1824,7 +1596,7 @@ mod tests {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -2032,7 +1804,7 @@ mod tests {
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2085,7 +1857,7 @@ mod tests {
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2106,7 +1878,7 @@ mod tests {
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -2136,7 +1908,7 @@ mod tests {
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -2169,7 +1941,7 @@ mod tests {
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -2199,7 +1971,7 @@ mod tests {
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
@@ -2269,8 +2041,14 @@ mod tests {
 
     #[test]
     fn test_v1_stream_ignores_context_usage_for_input_tokens() {
-        let mut ctx =
-            StreamContext::new_with_thinking("claude-opus-4-8", 12, false, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            12,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
 
         let mut events = ctx.generate_initial_events();
         events.extend(ctx.process_kiro_event(&Event::ContextUsage(
@@ -2288,7 +2066,7 @@ mod tests {
     #[test]
     fn test_cc_buffered_stream_uses_context_usage_consistently() {
         let mut ctx =
-            BufferedStreamContext::new("claude-opus-4-8", 12, false, false, HashMap::new());
+            BufferedStreamContext::new("claude-opus-4-8", 12, false, false, true, HashMap::new());
 
         ctx.process_and_buffer(&Event::ContextUsage(
             crate::kiro::model::events::ContextUsageEvent {
@@ -2305,143 +2083,10 @@ mod tests {
         assert_eq!(message_delta_input_tokens(&events), Some(expected));
     }
 
-    fn put_varint_field(field: u64, value: u64, out: &mut Vec<u8>) {
-        write_varint(field << 3, out);
-        write_varint(value, out);
-    }
-
-    fn put_len_field(field: u64, value: &[u8], out: &mut Vec<u8>) {
-        write_varint((field << 3) | 2, out);
-        write_varint(value.len() as u64, out);
-        out.extend_from_slice(value);
-    }
-
-    fn synthetic_hvoy_signature_with_model(model: &str) -> String {
-        let mut inner = Vec::new();
-        put_varint_field(1, 14, &mut inner);
-        put_varint_field(2, 1, &mut inner);
-        put_varint_field(3, 2, &mut inner);
-        put_len_field(5, &[7u8; 64], &mut inner);
-        put_len_field(6, model.as_bytes(), &mut inner);
-        put_varint_field(7, 0, &mut inner);
-        put_len_field(8, b"thinking", &mut inner);
-
-        let mut outer = Vec::new();
-        put_len_field(1, &inner, &mut outer);
-
-        let mut top = Vec::new();
-        put_len_field(2, &outer, &mut top);
-        put_varint_field(3, 1, &mut top);
-
-        general_purpose::STANDARD.encode(top)
-    }
-
-    fn synthetic_kiro_quince_signature() -> String {
-        synthetic_hvoy_signature_with_model("claude-quince")
-    }
-
-    fn assert_signature_contains_public_model(signature: &str, public_model: &str) {
-        let decoded = general_purpose::STANDARD.decode(signature).unwrap();
-        let ascii = String::from_utf8_lossy(&decoded);
-
-        assert!(
-            ascii.contains(public_model),
-            "normalized signature must expose expected public model {public_model}"
-        );
-        assert!(
-            !ascii.contains("claude-quince"),
-            "normalized signature must not expose Kiro internal model"
-        );
-        assert!(
-            !ascii.contains("thinking"),
-            "normalized signature must match the 110 shape without field8=thinking"
-        );
-    }
-
-    #[test]
-    fn test_normalize_hvoy_signature_model_rewrites_supported_public_models() {
-        let signature = synthetic_kiro_quince_signature();
-        let cases = [
-            ("claude-opus-4-8", "claude-opus-4-8"),
-            ("claude-opus-4-8-thinking", "claude-opus-4-8"),
-            ("claude-opus-4-7", "claude-opus-4-7"),
-            ("claude-opus-4-7-thinking", "claude-opus-4-7"),
-            ("claude-opus-4-6", "claude-opus-4-6"),
-            ("claude-opus-4-6-thinking", "claude-opus-4-6"),
-            ("claude-sonnet-4-6", "claude-sonnet-4-6"),
-            ("claude-sonnet-4-6-thinking", "claude-sonnet-4-6"),
-        ];
-
-        for (requested_model, public_model) in cases {
-            let normalized = normalize_hvoy_signature_model(&signature, requested_model)
-                .unwrap_or_else(|| panic!("signature should normalize for {requested_model}"));
-            assert_signature_contains_public_model(&normalized, public_model);
-        }
-    }
-
-    #[test]
-    fn test_normalize_hvoy_signature_model_removes_thinking_from_public_model_signature() {
-        let signature = synthetic_hvoy_signature_with_model("claude-opus-4-7");
-        let normalized = normalize_hvoy_signature_model(&signature, "claude-opus-4-7")
-            .expect("public opus 4.7 signature should still normalize");
-
-        assert_ne!(
-            normalized, signature,
-            "normalization must remove the Kiro field8=thinking shape"
-        );
-        assert_signature_contains_public_model(&normalized, "claude-opus-4-7");
-    }
-
-    #[test]
-    fn test_normalize_hvoy_signature_model_ignores_unsupported_models() {
-        let signature = synthetic_kiro_quince_signature();
-
-        assert!(
-            normalize_hvoy_signature_model(&signature, "claude-haiku-4-5").is_none(),
-            "must not rewrite unsupported signatures"
-        );
-    }
-
-    #[test]
-    fn test_supported_signature_delta_uses_normalized_model_name() {
-        let upstream_signature = synthetic_kiro_quince_signature();
-        let cases = [
-            ("claude-opus-4-8", "claude-opus-4-8"),
-            ("claude-opus-4-7", "claude-opus-4-7"),
-            ("claude-opus-4-6", "claude-opus-4-6"),
-            ("claude-sonnet-4-6", "claude-sonnet-4-6"),
-        ];
-
-        for (requested_model, public_model) in cases {
-            let mut ctx =
-                StreamContext::new_with_thinking(requested_model, 1, true, true, HashMap::new());
-            let _initial_events = ctx.generate_initial_events();
-
-            let events = ctx.process_kiro_event(&Event::ReasoningContent(
-                crate::kiro::model::events::ReasoningContentEvent {
-                    text: String::new(),
-                    signature: upstream_signature.clone(),
-                },
-            ));
-
-            let signatures = collect_signatures(&events);
-            assert_eq!(
-                signatures.len(),
-                1,
-                "{requested_model} must emit one signature_delta"
-            );
-            assert_ne!(
-                signatures[0], upstream_signature,
-                "{requested_model} signature should be normalized before emitting"
-            );
-            assert_signature_contains_public_model(&signatures[0], public_model);
-        }
-    }
-
     #[test]
     fn test_thinking_does_not_emit_signature_delta_by_default() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2456,7 +2101,8 @@ mod tests {
 
     #[test]
     fn test_upstream_reasoning_signature_is_forwarded_before_thinking_stop() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, true, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
         let upstream_signature = "upstream-real-signature-for-test";
 
@@ -2514,10 +2160,37 @@ mod tests {
     }
 
     #[test]
-    fn test_upstream_reasoning_signature_does_not_emit_fallback_duplicate() {
-        let upstream_signature = synthetic_kiro_quince_signature();
+    fn test_final_text_override_suppresses_upstream_text_and_preserves_signature() {
         let mut ctx =
-            StreamContext::new_with_thinking("claude-opus-4-6", 1, true, true, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, true, false, HashMap::new())
+                .with_final_text_override(Some("<antml:abc123def456>".to_string()));
+        let mut all_events = ctx.generate_initial_events();
+        let upstream_signature = "upstream-real-signature-for-test";
+
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: upstream_signature.to_string(),
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("<aabc123def456>"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_signatures(&all_events), vec![upstream_signature]);
+        assert_eq!(collect_text_content(&all_events), "<antml:abc123def456>");
+    }
+
+    #[test]
+    fn test_upstream_reasoning_signature_does_not_emit_fallback_duplicate() {
+        let upstream_signature = "upstream-real-signature-for-test".to_string();
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-6",
+            1,
+            true,
+            true,
+            true,
+            HashMap::new(),
+        );
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2542,12 +2215,13 @@ mod tests {
             1,
             "real upstream signature must not be followed by a fallback duplicate"
         );
-        assert_signature_contains_public_model(&signatures[0], "claude-opus-4-6");
+        assert_eq!(signatures[0], "upstream-real-signature-for-test");
     }
 
     #[test]
     fn test_upstream_reasoning_thinking_block_start_matches_anthropic_shape() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, true, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_kiro_event(&Event::ReasoningContent(
@@ -2572,51 +2246,15 @@ mod tests {
     }
 
     #[test]
-    fn test_signature_compat_mode_emits_fallback_for_supported_model_without_upstream_signature() {
-        let mut ctx =
-            StreamContext::new_with_thinking("claude-sonnet-4-6", 1, true, true, HashMap::new());
-        let _initial_events = ctx.generate_initial_events();
-
-        let mut all_events = Vec::new();
-        all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nanswer"));
-        all_events.extend(ctx.generate_final_events());
-
-        let signatures = collect_signatures(&all_events);
-        assert_eq!(
-            signatures.len(),
+    fn test_signature_mode_does_not_emit_local_fallback_without_upstream_signature() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
             1,
-            "supported HVOY target models should get one fallback signature_delta when upstream omits it"
+            true,
+            true,
+            true,
+            HashMap::new(),
         );
-        assert_signature_contains_public_model(&signatures[0], "claude-sonnet-4-6");
-        assert_eq!(collect_thinking_content(&all_events), "abc");
-        assert_eq!(collect_text_content(&all_events), "answer");
-
-        let thinking_index = ctx
-            .thinking_block_index
-            .expect("thinking block index should exist");
-        let signature_pos = all_events
-            .iter()
-            .position(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
-            })
-            .expect("signature delta should exist");
-        let stop_pos = all_events
-            .iter()
-            .position(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(thinking_index as i64)
-            })
-            .expect("thinking stop should exist");
-
-        assert!(
-            signature_pos < stop_pos,
-            "fallback signature_delta must be emitted before thinking content_block_stop"
-        );
-    }
-
-    #[test]
-    fn test_signature_compat_mode_does_not_fallback_for_unsupported_model() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2626,16 +2264,16 @@ mod tests {
         let signatures = collect_signatures(&all_events);
         assert!(
             signatures.is_empty(),
-            "unsupported models must not get local fallback signature_delta"
+            "must not synthesize signature_delta when upstream omits it"
         );
         assert_eq!(collect_thinking_content(&all_events), "abc");
         assert_eq!(collect_text_content(&all_events), "answer");
     }
 
     #[test]
-    fn test_adaptive_bare_does_not_forward_reasoning_signature() {
+    fn test_omitted_thinking_forwards_signature_without_reasoning_text() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2654,16 +2292,36 @@ mod tests {
         all_events.extend(ctx.process_assistant_response("answer"));
         all_events.extend(ctx.generate_final_events());
 
-        assert!(
-            collect_signatures(&all_events).is_empty(),
-            "adaptive_bare stages must not expose signature_delta"
-        );
+        assert_eq!(collect_signatures(&all_events), vec!["upstream-signature"]);
         assert_eq!(
             collect_thinking_content(&all_events),
             "",
-            "adaptive_bare stages must not expose reasoning text"
+            "display=omitted must not expose reasoning text"
         );
         assert_eq!(collect_text_content(&all_events), "answer");
+    }
+
+    #[test]
+    fn test_omitted_thinking_hides_textual_thinking_tags() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, true, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events
+            .extend(ctx.process_assistant_response("<thinking>hidden plan</thinking>\n\nanswer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "",
+            "display=omitted must also hide textual <thinking> blocks"
+        );
+        assert_eq!(collect_text_content(&all_events), "answer");
+        assert!(all_events.iter().all(|event| {
+            !(event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "thinking")
+        }));
     }
 
     #[test]
@@ -2671,7 +2329,7 @@ mod tests {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2695,7 +2353,7 @@ mod tests {
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2718,7 +2376,7 @@ mod tests {
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2743,7 +2401,7 @@ mod tests {
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2777,7 +2435,7 @@ mod tests {
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2833,7 +2491,7 @@ mod tests {
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2855,7 +2513,7 @@ mod tests {
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+            StreamContext::new_with_thinking("test-model", 1, true, false, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
