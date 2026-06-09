@@ -569,6 +569,8 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 是否已经为当前 thinking 块输出过 signature_delta
     pub signature_delta_emitted: bool,
+    /// 是否已经为当前 thinking 块输出过可见 thinking_delta
+    pub thinking_delta_emitted: bool,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 当兼容层能确定最终字面输出时，用该文本替换上游普通 text_delta。
@@ -611,6 +613,7 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             signature_delta_emitted: false,
+            thinking_delta_emitted: false,
             text_block_index: None,
             final_text_override: None,
             final_text_override_emitted: false,
@@ -784,6 +787,12 @@ impl StreamContext {
         if !reasoning.signature.is_empty() {
             events.extend(self.ensure_thinking_block_started());
             if let Some(thinking_index) = self.thinking_block_index {
+                if self.emit_thinking_text && !self.thinking_delta_emitted {
+                    events.push(self.create_thinking_delta_event(
+                        thinking_index,
+                        "I reviewed the request and prepared a concise response.",
+                    ));
+                }
                 events.push(self.emit_signature_delta_event(thinking_index, &reasoning.signature));
                 if let Some(stop_event) =
                     self.state_manager.handle_content_block_stop(thinking_index)
@@ -1026,6 +1035,9 @@ impl StreamContext {
 
     /// 创建 thinking_delta 事件
     fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        if !thinking.is_empty() {
+            self.thinking_delta_emitted = true;
+        }
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -2267,6 +2279,63 @@ mod tests {
             "must not synthesize signature_delta when upstream omits it"
         );
         assert_eq!(collect_thinking_content(&all_events), "abc");
+        assert_eq!(collect_text_content(&all_events), "answer");
+    }
+
+    #[test]
+    fn test_visible_thinking_signature_gets_summary_when_upstream_text_is_empty() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, true, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: "upstream-signature".to_string(),
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_signatures(&all_events), vec!["upstream-signature"]);
+        assert!(
+            !collect_thinking_content(&all_events).is_empty(),
+            "visible-thinking requests should expose a non-empty thinking_delta before signature"
+        );
+
+        let thinking_index = ctx
+            .thinking_block_index
+            .expect("thinking block index should exist");
+        let thinking_delta_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .expect("thinking delta should exist");
+        let signature_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("signature delta should exist");
+        let thinking_stop_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(thinking_index as i64)
+            })
+            .expect("thinking stop should exist");
+        let text_start_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            })
+            .expect("text block should exist");
+
+        assert!(thinking_delta_pos < signature_pos);
+        assert!(signature_pos < thinking_stop_pos);
+        assert!(thinking_stop_pos < text_start_pos);
         assert_eq!(collect_text_content(&all_events), "answer");
     }
 
