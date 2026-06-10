@@ -13,8 +13,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, ArmorBreakingResponse, BalanceResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    SetArmorBreakingRequest, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -346,6 +347,27 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取破甲模式
+    pub fn get_armor_breaking(&self) -> ArmorBreakingResponse {
+        ArmorBreakingResponse {
+            enabled: self.token_manager.get_armor_breaking(),
+        }
+    }
+
+    /// 设置破甲模式
+    pub fn set_armor_breaking(
+        &self,
+        req: SetArmorBreakingRequest,
+    ) -> Result<ArmorBreakingResponse, AdminServiceError> {
+        self.token_manager
+            .set_armor_breaking(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(ArmorBreakingResponse {
+            enabled: req.enabled,
+        })
     }
 
     /// 强制刷新指定凭据的 Token

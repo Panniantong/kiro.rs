@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetArmorBreakingRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -136,6 +136,25 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/armor-breaking
+/// 获取破甲模式
+pub async fn get_armor_breaking(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_armor_breaking();
+    Json(response)
+}
+
+/// PUT /api/admin/config/armor-breaking
+/// 设置破甲模式
+pub async fn set_armor_breaking(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetArmorBreakingRequest>,
+) -> impl IntoResponse {
+    match state.service.set_armor_breaking(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

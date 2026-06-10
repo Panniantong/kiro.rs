@@ -21,7 +21,9 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request, final_text_override_for_request};
+use super::converter::{
+    ConversionError, convert_request_with_armor, final_text_override_for_request_with_armor,
+};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -259,10 +261,13 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    let final_text_override = final_text_override_for_request(&payload);
+    // 读取运行时破甲开关（与 admin 共享同一 token_manager，热生效）
+    let armor_breaking = provider.token_manager().get_armor_breaking();
+
+    let final_text_override = final_text_override_for_request_with_armor(&payload, armor_breaking);
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_armor(&payload, armor_breaking) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -917,8 +922,11 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    // 读取运行时破甲开关（与 admin 共享同一 token_manager，热生效）
+    let armor_breaking = provider.token_manager().get_armor_breaking();
+
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_armor(&payload, armor_breaking) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {

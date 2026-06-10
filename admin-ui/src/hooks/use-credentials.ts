@@ -10,6 +10,8 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getArmorBreaking,
+  setArmorBreaking,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -115,6 +117,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取破甲模式
+export function useArmorBreaking() {
+  return useQuery({
+    queryKey: ['armorBreaking'],
+    queryFn: getArmorBreaking,
+  })
+}
+
+// 设置破甲模式
+export function useSetArmorBreaking() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setArmorBreaking,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['armorBreaking'] })
     },
   })
 }

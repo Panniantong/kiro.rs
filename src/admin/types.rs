@@ -196,6 +196,24 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 破甲模式配置 ============
+
+/// 破甲模式响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArmorBreakingResponse {
+    /// 当前是否开启破甲
+    pub enabled: bool,
+}
+
+/// 设置破甲模式请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetArmorBreakingRequest {
+    /// 是否开启破甲
+    pub enabled: bool,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

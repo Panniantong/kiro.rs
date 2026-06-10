@@ -521,6 +521,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 破甲模式开关（运行时可修改，默认 false = 最小满分版）
+    armor_breaking: Mutex<bool>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -650,6 +652,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let armor_breaking = config.armor_breaking;
         let manager = Self {
             config,
             proxy,
@@ -659,6 +662,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            armor_breaking: Mutex::new(armor_breaking),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -2045,6 +2049,50 @@ impl MultiTokenManager {
         }
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
+        Ok(())
+    }
+
+    /// 获取破甲模式（Admin API）
+    pub fn get_armor_breaking(&self) -> bool {
+        *self.armor_breaking.lock()
+    }
+
+    fn persist_armor_breaking(&self, on: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，破甲模式仅在当前进程生效: {}", on);
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.armor_breaking = on;
+        config
+            .save()
+            .with_context(|| format!("持久化破甲模式失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 设置破甲模式（Admin API）
+    pub fn set_armor_breaking(&self, on: bool) -> anyhow::Result<()> {
+        let previous = self.get_armor_breaking();
+        if previous == on {
+            return Ok(());
+        }
+
+        *self.armor_breaking.lock() = on;
+
+        if let Err(err) = self.persist_armor_breaking(on) {
+            *self.armor_breaking.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!("破甲模式已设置为: {}", on);
         Ok(())
     }
 }

@@ -81,6 +81,11 @@ impl KiroProvider {
         }
     }
 
+    /// 暴露底层 token_manager（只读），供请求路径读取运行时开关状态（如破甲模式）
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
