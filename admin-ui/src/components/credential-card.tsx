@@ -22,6 +22,7 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useSetRpm,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -60,12 +61,18 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [editingRpm, setEditingRpm] = useState(false)
+  const [rpmValue, setRpmValue] = useState(credential.rpm == null ? '' : String(credential.rpm))
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const setRpm = useSetRpm()
+
+  const effectiveRpm = credential.effectiveRpm
+  const isAtLimit = effectiveRpm != null && credential.currentRpm >= effectiveRpm
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -93,6 +100,33 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingPriority(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleRpmChange = () => {
+    const trimmed = rpmValue.trim()
+    let rpm: number | null
+    if (trimmed === '') {
+      rpm = null // 留空 = 跟随全局默认
+    } else {
+      const parsed = parseInt(trimmed, 10)
+      if (isNaN(parsed) || parsed < 0) {
+        toast.error('RPM 必须是非负整数；留空表示跟随默认，0 表示不限制')
+        return
+      }
+      rpm = parsed
+    }
+    setRpm.mutate(
+      { id: credential.id, rpm },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRpm(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -290,6 +324,81 @@ export function CredentialCard({
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
+              </div>
+            )}
+          </div>
+
+          {/* RPM 限流 */}
+          <div className="pt-3 border-t space-y-2">
+            <div className="flex items-center justify-between flex-wrap gap-2 text-sm">
+              <div className="flex items-center">
+                <span className="text-muted-foreground">RPM 限制：</span>
+                {editingRpm ? (
+                  <span className="inline-flex items-center gap-1 ml-1">
+                    <Input
+                      type="number"
+                      value={rpmValue}
+                      onChange={(e) => setRpmValue(e.target.value)}
+                      className="w-20 h-7 text-sm"
+                      min="0"
+                      placeholder="默认"
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 w-7 p-0"
+                      onClick={handleRpmChange}
+                      disabled={setRpm.isPending}
+                    >
+                      ✓
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 w-7 p-0"
+                      onClick={() => {
+                        setEditingRpm(false)
+                        setRpmValue(credential.rpm == null ? '' : String(credential.rpm))
+                      }}
+                    >
+                      ✕
+                    </Button>
+                  </span>
+                ) : (
+                  <span
+                    className="font-medium cursor-pointer hover:underline ml-1 inline-flex items-center"
+                    onClick={() => setEditingRpm(true)}
+                  >
+                    {effectiveRpm == null ? '不限' : effectiveRpm}
+                    {credential.rpmFollowsDefault ? (
+                      <span className="text-xs text-muted-foreground ml-1">跟随默认 (点击编辑)</span>
+                    ) : (
+                      <Badge variant="secondary" className="ml-1">自定义</Badge>
+                    )}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                <span>
+                  近1h峰值 <span className="text-foreground font-medium">{credential.peakRpm1h}</span>
+                </span>
+                <span className={credential.throttled1h > 0 ? 'text-amber-600' : ''}>
+                  近1h被限 <span className="font-medium">{credential.throttled1h}</span>
+                </span>
+              </div>
+            </div>
+            {effectiveRpm != null && (
+              <div className="flex items-center gap-2">
+                <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${isAtLimit ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                    style={{ width: `${Math.min(100, (credential.currentRpm / effectiveRpm) * 100)}%` }}
+                  />
+                </div>
+                <span className={`text-xs whitespace-nowrap ${isAtLimit ? 'text-amber-600 font-medium' : 'text-muted-foreground'}`}>
+                  {credential.currentRpm} / {effectiveRpm}
+                  {isAtLimit ? ' · 本分钟已满' : ''}
+                </span>
               </div>
             )}
           </div>

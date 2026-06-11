@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -12,7 +12,8 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useDefaultRpm, useSetDefaultRpm, useBatchSetRpm } from '@/hooks/use-credentials'
+import { Input } from '@/components/ui/input'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -54,6 +55,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: defaultRpmData } = useDefaultRpm()
+  const { mutate: setDefaultRpm, isPending: isSettingDefaultRpm } = useSetDefaultRpm()
+  const batchSetRpm = useBatchSetRpm()
+  const [editingDefaultRpm, setEditingDefaultRpm] = useState(false)
+  const [defaultRpmValue, setDefaultRpmValue] = useState('')
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -507,6 +513,69 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  // 保存全局默认 RPM
+  const handleDefaultRpmSave = () => {
+    const trimmed = defaultRpmValue.trim()
+    let value: number | null
+    if (trimmed === '') {
+      value = null
+    } else {
+      const parsed = parseInt(trimmed, 10)
+      if (isNaN(parsed) || parsed < 0) {
+        toast.error('RPM 必须是非负整数；留空或 0 表示不限制')
+        return
+      }
+      value = parsed
+    }
+    setDefaultRpm(value, {
+      onSuccess: () => {
+        toast.success('全局默认 RPM 已更新')
+        setEditingDefaultRpm(false)
+      },
+      onError: (error) => {
+        toast.error(`设置失败: ${extractErrorMessage(error)}`)
+      }
+    })
+  }
+
+  // 批量设置 RPM
+  const handleBatchSetRpm = () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要设置的凭据')
+      return
+    }
+    const ids = Array.from(selectedIds)
+    const input = window.prompt(
+      `为选中的 ${ids.length} 个凭据设置 RPM 上限：\n· 数字（如 10）= 每分钟最多 10 次\n· 0 = 不限制\n· 留空 = 跟随全局默认`,
+      ''
+    )
+    if (input === null) return // 取消
+    const trimmed = input.trim()
+    let rpm: number | null
+    if (trimmed === '') {
+      rpm = null
+    } else {
+      const parsed = parseInt(trimmed, 10)
+      if (isNaN(parsed) || parsed < 0) {
+        toast.error('RPM 必须是非负整数')
+        return
+      }
+      rpm = parsed
+    }
+    batchSetRpm.mutate(
+      { ids, rpm },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          deselectAll()
+        },
+        onError: (error) => {
+          toast.error(`批量设置失败: ${extractErrorMessage(error)}`)
+        }
+      }
+    )
+  }
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -606,6 +675,64 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         </div>
 
+        {/* 全局默认 RPM 配置 */}
+        <Card className="mb-6">
+          <CardContent className="py-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <Gauge className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-medium">全局默认 RPM：</span>
+                {editingDefaultRpm ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Input
+                      type="number"
+                      value={defaultRpmValue}
+                      onChange={(e) => setDefaultRpmValue(e.target.value)}
+                      className="w-24 h-8 text-sm"
+                      min="0"
+                      placeholder="不限制"
+                      autoFocus
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-8 w-8 p-0"
+                      onClick={handleDefaultRpmSave}
+                      disabled={isSettingDefaultRpm}
+                    >
+                      ✓
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-8 w-8 p-0"
+                      onClick={() => setEditingDefaultRpm(false)}
+                    >
+                      ✕
+                    </Button>
+                  </span>
+                ) : (
+                  <span
+                    className="text-sm font-medium cursor-pointer hover:underline"
+                    onClick={() => {
+                      setDefaultRpmValue(
+                        defaultRpmData?.defaultRpm == null ? '' : String(defaultRpmData.defaultRpm)
+                      )
+                      setEditingDefaultRpm(true)
+                    }}
+                  >
+                    {defaultRpmData?.defaultRpm == null || defaultRpmData?.defaultRpm === 0
+                      ? '不限制'
+                      : defaultRpmData.defaultRpm}
+                    <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                  </span>
+                )}
+              </div>
+              <span className="text-xs text-muted-foreground">未单独设置 RPM 的账号沿用此值</span>
+            </div>
+          </CardContent>
+        </Card>
+
         {/* 凭据列表 */}
         <div className="space-y-4">
           <div className="flex items-center justify-between">
@@ -639,6 +766,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
                     恢复异常
+                  </Button>
+                  <Button
+                    onClick={handleBatchSetRpm}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchSetRpm.isPending}
+                  >
+                    <Gauge className="h-4 w-4 mr-2" />
+                    批量设置 RPM
                   </Button>
                   <Button
                     onClick={handleBatchDelete}

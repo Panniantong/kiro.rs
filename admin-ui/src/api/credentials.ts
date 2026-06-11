@@ -8,6 +8,10 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  SetRpmRequest,
+  BatchSetRpmRequest,
+  DefaultRpmResponse,
+  SetDefaultRpmRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -102,5 +106,38 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 设置单个凭据 RPM（rpm=null 跟随全局默认；0 不限制）
+export async function setCredentialRpm(id: number, rpm: number | null): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/rpm`,
+    { rpm } as SetRpmRequest
+  )
+  return data
+}
+
+// 批量设置凭据 RPM
+export async function batchSetCredentialRpm(ids: number[], rpm: number | null): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    '/credentials/batch-rpm',
+    { ids, rpm } as BatchSetRpmRequest
+  )
+  return data
+}
+
+// 获取全局默认 RPM
+export async function getDefaultRpm(): Promise<DefaultRpmResponse> {
+  const { data } = await api.get<DefaultRpmResponse>('/config/default-rpm')
+  return data
+}
+
+// 设置全局默认 RPM
+export async function setDefaultRpm(defaultRpm: number | null): Promise<DefaultRpmResponse> {
+  const { data } = await api.put<DefaultRpmResponse>(
+    '/config/default-rpm',
+    { defaultRpm } as SetDefaultRpmRequest
+  )
   return data
 }

@@ -6,6 +6,7 @@ use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::token_manager::AllRateLimitedError;
 use crate::token;
 use axum::{
     Json as JsonExtractor,
@@ -30,6 +31,20 @@ use super::websearch;
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
+
+    // 所有凭据均达 RPM 上限：返回 429 + Retry-After，把背压交给下游重试
+    if let Some(rate_err) = err.downcast_ref::<AllRateLimitedError>() {
+        tracing::warn!(error = %err, "所有凭据均达 RPM 上限，返回 429");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, rate_err.retry_after_secs.to_string())],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "All upstream credentials are at their per-minute request limit. Please retry shortly.",
+            )),
+        )
+            .into_response();
+    }
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {

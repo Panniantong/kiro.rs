@@ -14,7 +14,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -89,6 +90,12 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                rpm: entry.rpm,
+                effective_rpm: entry.effective_rpm,
+                rpm_follows_default: entry.rpm_follows_default,
+                current_rpm: entry.current_rpm,
+                peak_rpm_1h: entry.peak_rpm_1h,
+                throttled_1h: entry.throttled_1h,
             })
             .collect();
 
@@ -99,6 +106,7 @@ impl AdminService {
             total: snapshot.total,
             available: snapshot.available,
             current_id: snapshot.current_id,
+            default_rpm: snapshot.default_rpm,
             credentials,
         }
     }
@@ -284,6 +292,7 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            rpm: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -346,6 +355,35 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 设置单个凭据的 RPM 上限
+    pub fn set_rpm(&self, id: u64, rpm: Option<u32>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_rpm(id, rpm)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量设置多个凭据的 RPM 上限，返回成功更新的数量
+    pub fn batch_set_rpm(&self, ids: &[u64], rpm: Option<u32>) -> Result<usize, AdminServiceError> {
+        self.token_manager
+            .set_credentials_rpm_batch(ids, rpm)
+            .map(|updated| updated.len())
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 获取全局默认 RPM
+    pub fn get_default_rpm(&self) -> DefaultRpmResponse {
+        DefaultRpmResponse {
+            default_rpm: self.token_manager.get_default_rpm(),
+        }
+    }
+
+    /// 设置全局默认 RPM
+    pub fn set_default_rpm(&self, default_rpm: Option<u32>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_default_rpm(default_rpm)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
     }
 
     /// 强制刷新指定凭据的 Token

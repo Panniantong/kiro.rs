@@ -10,6 +10,10 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  setCredentialRpm,
+  batchSetCredentialRpm,
+  getDefaultRpm,
+  setDefaultRpm,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -115,6 +119,50 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 设置单个凭据 RPM
+export function useSetRpm() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, rpm }: { id: number; rpm: number | null }) =>
+      setCredentialRpm(id, rpm),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量设置凭据 RPM
+export function useBatchSetRpm() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, rpm }: { ids: number[]; rpm: number | null }) =>
+      batchSetCredentialRpm(ids, rpm),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 查询全局默认 RPM
+export function useDefaultRpm() {
+  return useQuery({
+    queryKey: ['defaultRpm'],
+    queryFn: getDefaultRpm,
+  })
+}
+
+// 设置全局默认 RPM
+export function useSetDefaultRpm() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (defaultRpm: number | null) => setDefaultRpm(defaultRpm),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['defaultRpm'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

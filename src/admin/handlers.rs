@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, BatchSetRpmRequest, SetDefaultRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
     },
 };
 
@@ -137,6 +137,51 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/rpm
+/// 设置单个凭据 RPM 上限（rpm=null 跟随全局默认；0 不限制）
+pub async fn set_credential_rpm(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetRpmRequest>,
+) -> impl IntoResponse {
+    match state.service.set_rpm(id, payload.rpm) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} RPM 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-rpm
+/// 批量设置凭据 RPM 上限
+pub async fn batch_set_credential_rpm(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetRpmRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_set_rpm(&payload.ids, payload.rpm) {
+        Ok(count) => {
+            Json(SuccessResponse::new(format!("已更新 {} 个凭据的 RPM", count))).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/default-rpm
+/// 获取全局默认 RPM
+pub async fn get_default_rpm(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_default_rpm())
+}
+
+/// PUT /api/admin/config/default-rpm
+/// 设置全局默认 RPM
+pub async fn set_default_rpm(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetDefaultRpmRequest>,
+) -> impl IntoResponse {
+    match state.service.set_default_rpm(payload.default_rpm) {
+        Ok(_) => Json(SuccessResponse::new("全局默认 RPM 已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

@@ -15,7 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{AllRateLimitedError, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -302,6 +302,10 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
+                    // RPM 全限：立即终止重试，交由 HTTP 层返回 429 + Retry-After
+                    if e.downcast_ref::<AllRateLimitedError>().is_some() {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                     continue;
                 }

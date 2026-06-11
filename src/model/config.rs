@@ -91,6 +91,12 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 全局默认 RPM 上限（每分钟最大请求数）
+    ///
+    /// 凭据未单独配置 `rpm` 时沿用此值。`None` 或 `0` = 不限制。
+    #[serde(default)]
+    pub default_rpm: Option<u32>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -181,6 +187,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            default_rpm: None,
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

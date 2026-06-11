@@ -14,6 +14,8 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
+    /// 全局默认 RPM（None 或 0 表示不限制）
+    pub default_rpm: Option<u32>,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -62,6 +64,18 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据级 RPM 配置原值（None 表示跟随全局默认）
+    pub rpm: Option<u32>,
+    /// 有效 RPM 上限（凭据级优先，回退全局默认；None 表示不限制）
+    pub effective_rpm: Option<u32>,
+    /// 是否跟随全局默认（凭据级未单独配置 rpm）
+    pub rpm_follows_default: bool,
+    /// 当前滑动窗口已用请求数（瞬时 RPM）
+    pub current_rpm: u32,
+    /// 近 1h 峰值 RPM
+    pub peak_rpm_1h: u32,
+    /// 近 1h 因 RPM 受限被跳过次数
+    pub throttled_1h: u32,
 }
 
 // ============ 操作请求 ============
@@ -194,6 +208,45 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+// ============ RPM 限流配置 ============
+
+/// 设置单个凭据 RPM 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRpmRequest {
+    /// RPM 上限。null/缺省 = 跟随全局默认；0 = 不限制
+    #[serde(default)]
+    pub rpm: Option<u32>,
+}
+
+/// 批量设置凭据 RPM 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetRpmRequest {
+    /// 目标凭据 ID 列表
+    pub ids: Vec<u64>,
+    /// RPM 上限。null/缺省 = 跟随全局默认；0 = 不限制
+    #[serde(default)]
+    pub rpm: Option<u32>,
+}
+
+/// 全局默认 RPM 响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultRpmResponse {
+    /// 全局默认 RPM（None 或 0 表示不限制）
+    pub default_rpm: Option<u32>,
+}
+
+/// 设置全局默认 RPM 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDefaultRpmRequest {
+    /// 全局默认 RPM。null/缺省 = 不限制；0 = 不限制
+    #[serde(default)]
+    pub default_rpm: Option<u32>,
 }
 
 // ============ 通用响应 ============

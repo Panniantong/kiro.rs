@@ -109,6 +109,14 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 凭据级 RPM 上限（每分钟最大请求数）
+    ///
+    /// 控制该凭据发往上游的请求频率，防止单账号触发上游风控。
+    /// `None` = 跟随全局 `config.defaultRpm`；`Some(0)` = 显式不限制（覆盖全局默认）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -343,6 +351,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            rpm: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -461,6 +470,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            rpm: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -492,6 +502,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            rpm: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -606,6 +617,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            rpm: None,
         };
 
         let json = original.to_pretty_json().unwrap();

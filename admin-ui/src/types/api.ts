@@ -3,6 +3,7 @@ export interface CredentialsStatusResponse {
   total: number
   available: number
   currentId: number
+  defaultRpm: number | null
   credentials: CredentialStatusItem[]
 }
 
@@ -27,6 +28,13 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  // RPM 限流
+  rpm: number | null
+  effectiveRpm: number | null
+  rpmFollowsDefault: boolean
+  currentRpm: number
+  peakRpm1h: number
+  throttled1h: number
 }
 
 // 余额响应
@@ -86,4 +94,22 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+// RPM 限流请求
+export interface SetRpmRequest {
+  rpm: number | null
+}
+
+export interface BatchSetRpmRequest {
+  ids: number[]
+  rpm: number | null
+}
+
+export interface DefaultRpmResponse {
+  defaultRpm: number | null
+}
+
+export interface SetDefaultRpmRequest {
+  defaultRpm: number | null
 }
