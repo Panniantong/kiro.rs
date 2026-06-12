@@ -70,9 +70,9 @@ pub struct CredentialStatusItem {
     pub effective_rpm: Option<u32>,
     /// 是否跟随全局默认（凭据级未单独配置 rpm）
     pub rpm_follows_default: bool,
-    /// 当前滑动窗口已用请求数（瞬时 RPM）
+    /// 当前滑动窗口成功响应数（瞬时成功 RPM）
     pub current_rpm: u32,
-    /// 近 1h 峰值 RPM
+    /// 近 1h 峰值成功 RPM
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数
     pub throttled_1h: u32,

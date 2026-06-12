@@ -380,7 +380,7 @@ export function CredentialCard({
               </div>
               <div className="flex items-center gap-4 text-xs text-muted-foreground">
                 <span>
-                  近1h峰值 <span className="text-foreground font-medium">{credential.peakRpm1h}</span>
+                  近1h成功峰值 <span className="text-foreground font-medium">{credential.peakRpm1h}</span>
                 </span>
                 <span className={credential.throttled1h > 0 ? 'text-amber-600' : ''}>
                   近1h被限 <span className="font-medium">{credential.throttled1h}</span>
@@ -397,7 +397,7 @@ export function CredentialCard({
                 </div>
                 <span className={`text-xs whitespace-nowrap ${isAtLimit ? 'text-amber-600 font-medium' : 'text-muted-foreground'}`}>
                   {credential.currentRpm} / {effectiveRpm}
-                  {isAtLimit ? ' · 本分钟已满' : ''}
+                  {isAtLimit ? ' · 本分钟成功已满' : ''}
                 </span>
               </div>
             )}

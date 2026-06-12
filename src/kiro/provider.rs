@@ -162,8 +162,16 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    self.token_manager
+                        .report_attempt_finished_without_success(ctx.id);
+                    return Err(e);
+                }
+            };
+
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -179,6 +187,8 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    self.token_manager
+                        .report_attempt_finished_without_success(ctx.id);
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -212,6 +222,8 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                self.token_manager
+                    .report_attempt_finished_without_success(ctx.id);
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -228,6 +240,8 @@ impl KiroProvider {
                         .is_ok()
                     {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        self.token_manager
+                            .report_attempt_finished_without_success(ctx.id);
                         continue;
                     }
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
@@ -245,6 +259,9 @@ impl KiroProvider {
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 if status.as_u16() == 429 {
                     self.token_manager.report_rate_limited(ctx.id, retry_after);
+                } else {
+                    self.token_manager
+                        .report_attempt_finished_without_success(ctx.id);
                 }
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -262,11 +279,15 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                self.token_manager
+                    .report_attempt_finished_without_success(ctx.id);
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
             // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            self.token_manager
+                .report_attempt_finished_without_success(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -333,8 +354,16 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    self.token_manager
+                        .report_attempt_finished_without_success(ctx.id);
+                    return Err(e);
+                }
+            };
+
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -352,6 +381,8 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    self.token_manager
+                        .report_attempt_finished_without_success(ctx.id);
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -404,6 +435,8 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                self.token_manager
+                    .report_attempt_finished_without_success(ctx.id);
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -428,6 +461,8 @@ impl KiroProvider {
                         .is_ok()
                     {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        self.token_manager
+                            .report_attempt_finished_without_success(ctx.id);
                         continue;
                     }
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
@@ -457,6 +492,9 @@ impl KiroProvider {
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 if status.as_u16() == 429 {
                     self.token_manager.report_rate_limited(ctx.id, retry_after);
+                } else {
+                    self.token_manager
+                        .report_attempt_finished_without_success(ctx.id);
                 }
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -479,6 +517,8 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
+                self.token_manager
+                    .report_attempt_finished_without_success(ctx.id);
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -496,6 +536,8 @@ impl KiroProvider {
                 status,
                 body
             ));
+            self.token_manager
+                .report_attempt_finished_without_success(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -555,11 +597,13 @@ mod tests {
     use super::*;
     use axum::{
         Router,
+        extract::State,
         http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
         routing::post,
     };
     use chrono::Utc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::model::config::Config;
 
@@ -619,6 +663,14 @@ mod tests {
         }
     }
 
+    async fn fail_once_then_ok(State(count): State<Arc<AtomicUsize>>) -> Response {
+        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+            (StatusCode::INTERNAL_SERVER_ERROR, "temporary").into_response()
+        } else {
+            (StatusCode::OK, "ok").into_response()
+        }
+    }
+
     #[tokio::test]
     async fn test_call_api_rate_limits_current_credential_and_tries_next() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -660,5 +712,45 @@ mod tests {
         let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(!first.disabled);
         assert_eq!(first.failure_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_call_api_retries_failed_attempt_without_consuming_success_rpm() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api", post(fail_once_then_ok))
+            .with_state(attempt_count.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = Config::default();
+        config.default_rpm = Some(1);
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                base_url: format!("http://{}", addr),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
+
+        let response = provider.call_api("{}").await.unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].current_rpm, 1);
     }
 }

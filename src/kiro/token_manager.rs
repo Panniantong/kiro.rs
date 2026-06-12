@@ -105,7 +105,7 @@ impl std::error::Error for RefreshTokenInvalidError {}
 
 /// 所有凭据均已达到 RPM 上限错误
 ///
-/// 当账号池里所有可用凭据本分钟请求数都已打满时返回，
+/// 当账号池里所有可用凭据本分钟成功响应数和 in-flight 预留都已打满时返回，
 /// 由 HTTP 层转换为 429 + `Retry-After`，把背压交给下游重试。
 #[derive(Debug, Clone)]
 pub(crate) struct AllRateLimitedError {
@@ -435,9 +435,13 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
-    /// RPM 滑动窗口请求时间戳（仅保留最近 60s，用于 RPM 判定与恢复时刻计算）
-    request_window: VecDeque<DateTime<Utc>>,
-    /// 近 60 分钟的分钟级统计桶（用于 Admin UI 展示峰值 RPM 和被限次数）
+    /// RPM 滑动窗口成功响应时间戳（仅保留最近 60s，用于 RPM 判定与恢复时刻计算）
+    success_window: VecDeque<DateTime<Utc>>,
+    /// 已选中该凭据、但尚未返回成功/失败结果的请求数。
+    ///
+    /// 这只是并发保护，不计入成功 RPM；失败会释放，成功会转入 success_window。
+    in_flight_requests: u32,
+    /// 近 60 分钟的分钟级统计桶（用于 Admin UI 展示成功峰值 RPM 和被限次数）
     minute_buckets: VecDeque<MinuteBucket>,
 }
 
@@ -446,15 +450,15 @@ struct CredentialEntry {
 struct MinuteBucket {
     /// 分钟标识（Unix 时间戳 / 60）
     minute: i64,
-    /// 该分钟内成功选中（即将发往上游）的请求数
-    requests: u32,
+    /// 该分钟内成功上游响应数
+    successes: u32,
     /// 该分钟内因达到 RPM 上限被跳过的次数
     throttled: u32,
 }
 
 /// 选号结果
 enum SelectOutcome {
-    /// 成功选中并已预占一个请求名额
+    /// 成功选中并已预留一个 in-flight 名额
     Selected(u64, KiroCredentials),
     /// 所有未禁用凭据本分钟都已达 RPM 上限（应向客户端返回 429）
     AllRateLimited { retry_after_secs: u64 },
@@ -539,9 +543,9 @@ pub struct CredentialEntrySnapshot {
     pub effective_rpm: Option<u32>,
     /// 是否跟随全局默认（凭据级未单独配置 rpm）
     pub rpm_follows_default: bool,
-    /// 当前滑动窗口已用请求数（瞬时 RPM）
+    /// 当前滑动窗口成功响应数（瞬时成功 RPM）
     pub current_rpm: u32,
-    /// 近 1h 峰值 RPM
+    /// 近 1h 峰值成功 RPM
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数
     pub throttled_1h: u32,
@@ -672,7 +676,8 @@ impl MultiTokenManager {
                     cooldown_until: None,
                     success_count: 0,
                     last_used_at: None,
-                    request_window: VecDeque::new(),
+                    success_window: VecDeque::new(),
+                    in_flight_requests: 0,
                     minute_buckets: VecDeque::new(),
                 }
             })
@@ -824,12 +829,12 @@ impl MultiTokenManager {
         if value == 0 { None } else { Some(value) }
     }
 
-    /// 清理滑动窗口中超出 60s 的旧时间戳
-    fn prune_request_window(entry: &mut CredentialEntry, now: DateTime<Utc>) {
+    /// 清理成功滑动窗口中超出 60s 的旧时间戳
+    fn prune_success_window(entry: &mut CredentialEntry, now: DateTime<Utc>) {
         let cutoff = now - Self::chrono_duration(RPM_WINDOW);
-        while let Some(&front) = entry.request_window.front() {
+        while let Some(&front) = entry.success_window.front() {
             if front <= cutoff {
-                entry.request_window.pop_front();
+                entry.success_window.pop_front();
             } else {
                 break;
             }
@@ -844,16 +849,21 @@ impl MultiTokenManager {
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
         let limit = Self::effective_rpm_limit(entry.credentials.rpm, default_rpm)?;
-        Self::prune_request_window(entry, now);
-        if (entry.request_window.len() as u32) < limit {
+        Self::prune_success_window(entry, now);
+        let reserved = entry.success_window.len() as u32 + entry.in_flight_requests;
+        if reserved < limit {
             return None;
         }
-        // 已达上限：最老的时间戳出窗后即空出一个名额
-        let oldest = *entry.request_window.front()?;
-        Some(oldest + Self::chrono_duration(RPM_WINDOW))
+        // 已达上限：优先按最老成功响应出窗计算恢复时刻；若当前仅由 in-flight 填满，
+        // 给一个短 Retry-After，等待请求完成后释放或转入成功窗口。
+        entry
+            .success_window
+            .front()
+            .map(|oldest| *oldest + Self::chrono_duration(RPM_WINDOW))
+            .or_else(|| Some(now + Duration::seconds(1)))
     }
 
-    /// 累加分钟桶计数（requests 或 throttled），并清理超过 60 分钟的旧桶
+    /// 累加分钟桶计数（successes 或 throttled），并清理超过 60 分钟的旧桶
     fn bump_minute_bucket(entry: &mut CredentialEntry, now: DateTime<Utc>, throttled: bool) {
         let minute = now.timestamp().div_euclid(60);
         let cutoff = minute - MINUTE_BUCKET_RETAIN;
@@ -869,22 +879,33 @@ impl MultiTokenManager {
                 if throttled {
                     bucket.throttled = bucket.throttled.saturating_add(1);
                 } else {
-                    bucket.requests = bucket.requests.saturating_add(1);
+                    bucket.successes = bucket.successes.saturating_add(1);
                 }
             }
             _ => {
                 entry.minute_buckets.push_back(MinuteBucket {
                     minute,
-                    requests: if throttled { 0 } else { 1 },
+                    successes: if throttled { 0 } else { 1 },
                     throttled: if throttled { 1 } else { 0 },
                 });
             }
         }
     }
 
-    /// 预占一次请求名额（push 时间戳 + 分钟桶 requests+1）
-    fn record_request_slot(entry: &mut CredentialEntry, now: DateTime<Utc>) {
-        entry.request_window.push_back(now);
+    /// 预留一个正在处理中的请求名额，用于并发保护；不计入成功 RPM。
+    fn reserve_in_flight(entry: &mut CredentialEntry) {
+        entry.in_flight_requests = entry.in_flight_requests.saturating_add(1);
+    }
+
+    /// 释放一个正在处理中的请求名额。
+    fn release_in_flight_slot(entry: &mut CredentialEntry) {
+        entry.in_flight_requests = entry.in_flight_requests.saturating_sub(1);
+    }
+
+    /// 记录一次成功响应（push 时间戳 + 分钟桶 successes+1）
+    fn record_success_slot(entry: &mut CredentialEntry, now: DateTime<Utc>) {
+        Self::release_in_flight_slot(entry);
+        entry.success_window.push_back(now);
         Self::bump_minute_bucket(entry, now, false);
     }
 
@@ -893,18 +914,18 @@ impl MultiTokenManager {
         Self::bump_minute_bucket(entry, now, true);
     }
 
-    /// 当前窗口已用请求数（瞬时 RPM，会顺带清理过期时间戳）
-    fn current_window_used(entry: &mut CredentialEntry, now: DateTime<Utc>) -> u32 {
-        Self::prune_request_window(entry, now);
-        entry.request_window.len() as u32
+    /// 当前窗口已成功响应数（瞬时成功 RPM，会顺带清理过期时间戳）
+    fn current_success_window_used(entry: &mut CredentialEntry, now: DateTime<Utc>) -> u32 {
+        Self::prune_success_window(entry, now);
+        entry.success_window.len() as u32
     }
 
-    /// 近 1h 峰值 RPM（各分钟桶 requests 的最大值）
+    /// 近 1h 峰值成功 RPM（各分钟桶 successes 的最大值）
     fn peak_rpm_1h(entry: &CredentialEntry) -> u32 {
         entry
             .minute_buckets
             .iter()
-            .map(|b| b.requests)
+            .map(|b| b.successes)
             .max()
             .unwrap_or(0)
     }
@@ -996,9 +1017,10 @@ impl MultiTokenManager {
         let chosen = match mode.as_str() {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据，平局按优先级
-                eligible.iter().copied().min_by_key(|&i| {
-                    (entries[i].success_count, entries[i].credentials.priority)
-                })
+                eligible
+                    .iter()
+                    .copied()
+                    .min_by_key(|&i| (entries[i].success_count, entries[i].credentials.priority))
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
@@ -1011,8 +1033,8 @@ impl MultiTokenManager {
 
         match chosen {
             Some(i) => {
-                // 预占一个请求名额，确保并发选号不超发
-                Self::record_request_slot(&mut entries[i], now);
+                // 预留一个 in-flight 名额，避免并发选号超发；失败会释放，成功才计入 RPM。
+                Self::reserve_in_flight(&mut entries[i]);
                 SelectOutcome::Selected(entries[i].id, entries[i].credentials.clone())
             }
             None => SelectOutcome::NoneAvailable,
@@ -1063,8 +1085,8 @@ impl MultiTokenManager {
                             if Self::rpm_exceeded_until(&mut entries[idx], default_rpm, now)
                                 .is_none() =>
                         {
-                            // 当前凭据可用且本窗口仍有余量：预占并复用
-                            Self::record_request_slot(&mut entries[idx], now);
+                            // 当前凭据可用且本窗口仍有余量：预留 in-flight 名额并复用
+                            Self::reserve_in_flight(&mut entries[idx]);
                             Some((entries[idx].id, entries[idx].credentials.clone()))
                         }
                         Some(idx) => {
@@ -1432,11 +1454,13 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let now = Utc::now();
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.cooldown_until = None;
                 entry.success_count += 1;
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.last_used_at = Some(now.to_rfc3339());
+                Self::record_success_slot(entry, now);
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -1445,6 +1469,14 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 释放一次未成功的 in-flight 预留，不改变失败计数。
+    pub fn report_attempt_finished_without_success(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            Self::release_in_flight_slot(entry);
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1468,6 +1500,7 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            Self::release_in_flight_slot(entry);
             entry.failure_count += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             let failure_count = entry.failure_count;
@@ -1530,6 +1563,7 @@ impl MultiTokenManager {
             let cooldown_until = now + Self::chrono_duration(cooldown);
 
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                Self::release_in_flight_slot(entry);
                 if !entry.disabled {
                     entry.cooldown_until = Some(match entry.cooldown_until {
                         Some(existing) if existing > cooldown_until => existing,
@@ -1572,9 +1606,11 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            Self::release_in_flight_slot(entry);
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.cooldown_until = None;
+            Self::release_in_flight_slot(entry);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
@@ -1624,6 +1660,7 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            Self::release_in_flight_slot(entry);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.refresh_failure_count += 1;
             let refresh_failure_count = entry.refresh_failure_count;
@@ -1761,7 +1798,7 @@ impl MultiTokenManager {
         let snapshot_entries = entries
             .iter_mut()
             .map(|e| {
-                let current_rpm = Self::current_window_used(e, now);
+                let current_rpm = Self::current_success_window_used(e, now);
                 let peak_rpm_1h = Self::peak_rpm_1h(e);
                 let throttled_1h = Self::throttled_count_1h(e);
                 let effective_rpm = Self::effective_rpm_limit(e.credentials.rpm, default_rpm);
@@ -2134,7 +2171,8 @@ impl MultiTokenManager {
                 cooldown_until: None,
                 success_count: 0,
                 last_used_at: None,
-                request_window: VecDeque::new(),
+                success_window: VecDeque::new(),
+                in_flight_requests: 0,
                 minute_buckets: VecDeque::new(),
             });
         }
@@ -2405,7 +2443,8 @@ mod tests {
             cooldown_until: None,
             success_count: 0,
             last_used_at: None,
-            request_window: VecDeque::new(),
+            success_window: VecDeque::new(),
+            in_flight_requests: 0,
             minute_buckets: VecDeque::new(),
         }
     }
@@ -2423,7 +2462,10 @@ mod tests {
             Some(10)
         );
         // 凭据级 0 = 显式不限，覆盖全局默认
-        assert_eq!(MultiTokenManager::effective_rpm_limit(Some(0), Some(10)), None);
+        assert_eq!(
+            MultiTokenManager::effective_rpm_limit(Some(0), Some(10)),
+            None
+        );
         // 全局默认 0 或都未设置 = 不限
         assert_eq!(MultiTokenManager::effective_rpm_limit(None, Some(0)), None);
         assert_eq!(MultiTokenManager::effective_rpm_limit(None, None), None);
@@ -2433,15 +2475,15 @@ mod tests {
     fn test_rpm_window_exceeded_and_recovery() {
         let mut entry = make_entry(1, Some(3));
         let base = Utc::now();
-        // 前两个请求未到限（2 < 3）
-        MultiTokenManager::record_request_slot(&mut entry, base);
-        MultiTokenManager::record_request_slot(&mut entry, base + Duration::seconds(1));
+        // 前两个成功响应未到限（2 < 3）
+        MultiTokenManager::record_success_slot(&mut entry, base);
+        MultiTokenManager::record_success_slot(&mut entry, base + Duration::seconds(1));
         assert!(
             MultiTokenManager::rpm_exceeded_until(&mut entry, None, base + Duration::seconds(1))
                 .is_none()
         );
-        // 第三个请求到限
-        MultiTokenManager::record_request_slot(&mut entry, base + Duration::seconds(2));
+        // 第三个成功响应到限
+        MultiTokenManager::record_success_slot(&mut entry, base + Duration::seconds(2));
         let until =
             MultiTokenManager::rpm_exceeded_until(&mut entry, None, base + Duration::seconds(2));
         // 恢复时刻 = 最老时间戳 + 60s
@@ -2453,14 +2495,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_rpm_counts_successes_not_failed_attempts() {
+        let mut config = Config::default();
+        config.default_rpm = Some(1);
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+        assert!(manager.report_failure(first.id));
+
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_rpm_counts_successes_only() {
+        let mut config = Config::default();
+        config.default_rpm = Some(1);
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        let before_success = manager.snapshot();
+        assert_eq!(before_success.entries[0].current_rpm, 0);
+
+        manager.report_success(ctx.id);
+        let after_success = manager.snapshot();
+        assert_eq!(after_success.entries[0].current_rpm, 1);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_request_temporarily_reserves_rpm_capacity() {
+        let mut config = Config::default();
+        config.default_rpm = Some(1);
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let blocked = match manager.acquire_context(None).await {
+            Ok(_) => panic!("expected in-flight request to reserve RPM capacity"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            blocked.contains("每分钟请求上限"),
+            "expected in-flight request to reserve RPM capacity, got: {}",
+            blocked
+        );
+
+        manager.report_attempt_finished_without_success(first.id);
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 1);
+    }
+
     #[test]
     fn test_rpm_no_limit_when_unset() {
         let mut entry = make_entry(1, None);
         let base = Utc::now();
         for i in 0..100 {
-            MultiTokenManager::record_request_slot(&mut entry, base + Duration::milliseconds(i));
+            MultiTokenManager::record_success_slot(&mut entry, base + Duration::milliseconds(i));
         }
-        // 未配置 RPM：无论多少请求都不受限
+        // 未配置 RPM：无论多少成功响应都不受限
         assert!(
             MultiTokenManager::rpm_exceeded_until(&mut entry, None, base + Duration::seconds(1))
                 .is_none()
@@ -2471,11 +2579,11 @@ mod tests {
     fn test_minute_bucket_peak_and_throttle() {
         let mut entry = make_entry(1, Some(2));
         let base = Utc::now();
-        MultiTokenManager::record_request_slot(&mut entry, base);
-        MultiTokenManager::record_request_slot(&mut entry, base);
-        MultiTokenManager::record_request_slot(&mut entry, base);
+        MultiTokenManager::record_success_slot(&mut entry, base);
+        MultiTokenManager::record_success_slot(&mut entry, base);
+        MultiTokenManager::record_success_slot(&mut entry, base);
         MultiTokenManager::record_throttle(&mut entry, base);
-        // 同一分钟内 3 次请求、1 次受限
+        // 同一分钟内 3 次成功响应、1 次受限
         assert_eq!(MultiTokenManager::peak_rpm_1h(&entry), 3);
         assert_eq!(MultiTokenManager::throttled_count_1h(&entry), 1);
     }
