@@ -32,15 +32,14 @@ use super::websearch;
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
-    // 所有凭据均达 RPM 上限：返回 429 + Retry-After，把背压交给下游重试
-    if let Some(rate_err) = err.downcast_ref::<AllRateLimitedError>() {
-        tracing::warn!(error = %err, "所有凭据均达 RPM 上限，返回 429");
+    // 所有凭据均达 RPM 上限：对下游隐藏账号池细节，按通用上游不可用处理。
+    if err.downcast_ref::<AllRateLimitedError>().is_some() {
+        tracing::warn!(error = %err, "所有凭据均达 RPM 上限，返回通用上游不可用");
         return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, rate_err.retry_after_secs.to_string())],
+            StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
-                "rate_limit_error",
-                "All upstream credentials are at their per-minute request limit. Please retry shortly.",
+                "api_error",
+                "Upstream service temporarily unavailable. Please retry later.",
             )),
         )
             .into_response();
@@ -986,4 +985,31 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn all_rate_limited_error_is_reported_as_generic_upstream_unavailable() {
+        let response = map_provider_error(
+            AllRateLimitedError {
+                retry_after_secs: 30,
+            }
+            .into(),
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().get("retry-after").is_none());
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Upstream service temporarily unavailable. Please retry later."
+        );
+    }
 }
