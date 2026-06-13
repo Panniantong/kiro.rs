@@ -460,7 +460,7 @@ struct MinuteBucket {
 enum SelectOutcome {
     /// 成功选中并已预留一个 in-flight 名额
     Selected(u64, KiroCredentials),
-    /// 所有未禁用凭据本分钟都已达 RPM 上限（应向客户端返回 429）
+    /// 所有未禁用凭据本分钟都已达 RPM 上限（由 HTTP 层映射为通用上游不可用）
     AllRateLimited { retry_after_secs: u64 },
     /// 无可用凭据（全禁用 / 全冷却等非 RPM 原因）
     NoneAvailable,
@@ -1007,7 +1007,7 @@ impl MultiTokenManager {
             }
         }
 
-        // 所有候选都被 RPM 限制 → 返回最早恢复时间，交由上层返回 429
+        // 所有候选都被 RPM 限制，返回最早恢复时间，交由上层映射为通用上游不可用。
         if eligible.is_empty() {
             return match earliest_recovery {
                 Some(until) => SelectOutcome::AllRateLimited {
@@ -1139,7 +1139,7 @@ impl MultiTokenManager {
                         }
                         SelectOutcome::AllRateLimited { retry_after_secs } => {
                             tracing::warn!(
-                                "所有凭据均已达到 RPM 上限，返回 429（建议 {}s 后重试）",
+                                "所有凭据均已达到 RPM 上限，返回限流错误（建议 {}s 后重试）",
                                 retry_after_secs
                             );
                             return Err(AllRateLimitedError { retry_after_secs }.into());

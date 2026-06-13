@@ -328,7 +328,7 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
-                    // RPM 全限：立即终止重试，交由 HTTP 层返回 429 + Retry-After
+                    // RPM 全限：立即终止重试，交由 HTTP 层映射为通用上游不可用。
                     if e.downcast_ref::<AllRateLimitedError>().is_some() {
                         return Err(e);
                     }
