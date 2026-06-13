@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_api_retries_failed_attempt_without_consuming_success_rpm() {
+    async fn test_call_api_does_not_retry_when_failed_attempt_exhausts_rpm() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let attempt_count = Arc::new(AtomicUsize::new(0));
@@ -749,11 +749,14 @@ mod tests {
         );
         let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
 
-        let response = provider.call_api("{}").await.unwrap();
+        let err = provider.call_api("{}").await.unwrap_err().to_string();
 
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), "ok");
-        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+        assert!(
+            err.contains("每分钟请求上限") || err.contains("temporarily unavailable"),
+            "expected failed attempt to exhaust RPM before retrying, got: {}",
+            err
+        );
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
 
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.entries[0].current_rpm, 1);

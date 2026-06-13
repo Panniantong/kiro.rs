@@ -28,7 +28,7 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
-  // 成功 RPM 限流
+  // 上游尝试 RPM 限流
   rpm: number | null
   effectiveRpm: number | null
   rpmFollowsDefault: boolean

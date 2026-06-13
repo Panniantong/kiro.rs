@@ -105,8 +105,8 @@ impl std::error::Error for RefreshTokenInvalidError {}
 
 /// 所有凭据均已达到 RPM 上限错误
 ///
-/// 当账号池里所有可用凭据本分钟成功响应数和 in-flight 预留都已打满时返回，
-/// 由 HTTP 层转换为 429 + `Retry-After`，把背压交给下游重试。
+/// 当账号池里所有可用凭据本分钟上游尝试数都已打满时返回，
+/// 由 HTTP 层转换为通用上游不可用错误，把背压交给下游重试。
 #[derive(Debug, Clone)]
 pub(crate) struct AllRateLimitedError {
     /// 建议的重试等待秒数（最早恢复名额所需时间）
@@ -435,13 +435,13 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
-    /// RPM 滑动窗口成功响应时间戳（仅保留最近 60s，用于 RPM 判定与恢复时刻计算）
+    /// RPM 滑动窗口上游尝试时间戳（仅保留最近 60s，用于 RPM 判定与恢复时刻计算）
     success_window: VecDeque<DateTime<Utc>>,
     /// 已选中该凭据、但尚未返回成功/失败结果的请求数。
     ///
-    /// 这只是并发保护，不计入成功 RPM；失败会释放，成功会转入 success_window。
+    /// 尝试在选中凭据时已经计入 RPM 窗口；这里仅用于避免完成回调重复释放。
     in_flight_requests: u32,
-    /// 近 60 分钟的分钟级统计桶（用于 Admin UI 展示成功峰值 RPM 和被限次数）
+    /// 近 60 分钟的分钟级统计桶（用于 Admin UI 展示上游尝试峰值 RPM 和被限次数）
     minute_buckets: VecDeque<MinuteBucket>,
 }
 
@@ -450,15 +450,15 @@ struct CredentialEntry {
 struct MinuteBucket {
     /// 分钟标识（Unix 时间戳 / 60）
     minute: i64,
-    /// 该分钟内成功上游响应数
-    successes: u32,
+    /// 该分钟内上游尝试数
+    attempts: u32,
     /// 该分钟内因达到 RPM 上限被跳过的次数
     throttled: u32,
 }
 
 /// 选号结果
 enum SelectOutcome {
-    /// 成功选中并已预留一个 in-flight 名额
+    /// 成功选中并已预留一次上游尝试名额
     Selected(u64, KiroCredentials),
     /// 所有未禁用凭据本分钟都已达 RPM 上限（由 HTTP 层映射为通用上游不可用）
     AllRateLimited { retry_after_secs: u64 },
@@ -543,9 +543,9 @@ pub struct CredentialEntrySnapshot {
     pub effective_rpm: Option<u32>,
     /// 是否跟随全局默认（凭据级未单独配置 rpm）
     pub rpm_follows_default: bool,
-    /// 当前滑动窗口成功响应数（瞬时成功 RPM）
+    /// 当前滑动窗口上游尝试数（瞬时上游尝试 RPM）
     pub current_rpm: u32,
-    /// 近 1h 峰值成功 RPM
+    /// 近 1h 峰值上游尝试 RPM
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数
     pub throttled_1h: u32,
@@ -833,7 +833,7 @@ impl MultiTokenManager {
         if value == 0 { None } else { Some(value) }
     }
 
-    /// 清理成功滑动窗口中超出 60s 的旧时间戳
+    /// 清理上游尝试滑动窗口中超出 60s 的旧时间戳
     fn prune_success_window(entry: &mut CredentialEntry, now: DateTime<Utc>) {
         let cutoff = now - Self::chrono_duration(RPM_WINDOW);
         while let Some(&front) = entry.success_window.front() {
@@ -854,12 +854,11 @@ impl MultiTokenManager {
     ) -> Option<DateTime<Utc>> {
         let limit = Self::effective_rpm_limit(entry.credentials.rpm, default_rpm)?;
         Self::prune_success_window(entry, now);
-        let reserved = entry.success_window.len() as u32 + entry.in_flight_requests;
-        if reserved < limit {
+        let attempts = entry.success_window.len() as u32;
+        if attempts < limit {
             return None;
         }
-        // 已达上限：优先按最老成功响应出窗计算恢复时刻；若当前仅由 in-flight 填满，
-        // 给一个短 Retry-After，等待请求完成后释放或转入成功窗口。
+        // 已达上限：按最老上游尝试出窗计算恢复时刻。
         entry
             .success_window
             .front()
@@ -867,7 +866,7 @@ impl MultiTokenManager {
             .or_else(|| Some(now + Duration::seconds(1)))
     }
 
-    /// 累加分钟桶计数（successes 或 throttled），并清理超过 60 分钟的旧桶
+    /// 累加分钟桶计数（upstream attempts 或 throttled），并清理超过 60 分钟的旧桶
     fn bump_minute_bucket(entry: &mut CredentialEntry, now: DateTime<Utc>, throttled: bool) {
         let minute = now.timestamp().div_euclid(60);
         let cutoff = minute - MINUTE_BUCKET_RETAIN;
@@ -883,22 +882,27 @@ impl MultiTokenManager {
                 if throttled {
                     bucket.throttled = bucket.throttled.saturating_add(1);
                 } else {
-                    bucket.successes = bucket.successes.saturating_add(1);
+                    bucket.attempts = bucket.attempts.saturating_add(1);
                 }
             }
             _ => {
                 entry.minute_buckets.push_back(MinuteBucket {
                     minute,
-                    successes: if throttled { 0 } else { 1 },
+                    attempts: if throttled { 0 } else { 1 },
                     throttled: if throttled { 1 } else { 0 },
                 });
             }
         }
     }
 
-    /// 预留一个正在处理中的请求名额，用于并发保护；不计入成功 RPM。
-    fn reserve_in_flight(entry: &mut CredentialEntry) {
+    /// 预留一次即将发往上游的尝试名额。
+    ///
+    /// 这个名额会立即计入 60s RPM 窗口；无论后续成功、失败、403、超时，
+    /// 都不会从窗口里移除，直到自然出窗。
+    fn reserve_attempt_slot(entry: &mut CredentialEntry, now: DateTime<Utc>) {
         entry.in_flight_requests = entry.in_flight_requests.saturating_add(1);
+        entry.success_window.push_back(now);
+        Self::bump_minute_bucket(entry, now, false);
     }
 
     /// 释放一个正在处理中的请求名额。
@@ -906,11 +910,11 @@ impl MultiTokenManager {
         entry.in_flight_requests = entry.in_flight_requests.saturating_sub(1);
     }
 
-    /// 记录一次成功响应（push 时间戳 + 分钟桶 successes+1）
-    fn record_success_slot(entry: &mut CredentialEntry, now: DateTime<Utc>) {
+    /// 记录一次成功响应。
+    ///
+    /// RPM 名额在选中凭据、准备打上游时已经消耗；成功只负责释放 in-flight。
+    fn record_success_slot(entry: &mut CredentialEntry, _now: DateTime<Utc>) {
         Self::release_in_flight_slot(entry);
-        entry.success_window.push_back(now);
-        Self::bump_minute_bucket(entry, now, false);
     }
 
     /// 记录一次因 RPM 受限被跳过（分钟桶 throttled+1）
@@ -918,18 +922,18 @@ impl MultiTokenManager {
         Self::bump_minute_bucket(entry, now, true);
     }
 
-    /// 当前窗口已成功响应数（瞬时成功 RPM，会顺带清理过期时间戳）
-    fn current_success_window_used(entry: &mut CredentialEntry, now: DateTime<Utc>) -> u32 {
+    /// 当前窗口已发起上游尝试数（瞬时上游尝试 RPM，会顺带清理过期时间戳）
+    fn current_attempt_window_used(entry: &mut CredentialEntry, now: DateTime<Utc>) -> u32 {
         Self::prune_success_window(entry, now);
         entry.success_window.len() as u32
     }
 
-    /// 近 1h 峰值成功 RPM（各分钟桶 successes 的最大值）
+    /// 近 1h 峰值上游尝试 RPM（各分钟桶 attempts 的最大值）
     fn peak_rpm_1h(entry: &CredentialEntry) -> u32 {
         entry
             .minute_buckets
             .iter()
-            .map(|b| b.successes)
+            .map(|b| b.attempts)
             .max()
             .unwrap_or(0)
     }
@@ -1037,8 +1041,8 @@ impl MultiTokenManager {
 
         match chosen {
             Some(i) => {
-                // 预留一个 in-flight 名额，避免并发选号超发；失败会释放，成功才计入 RPM。
-                Self::reserve_in_flight(&mut entries[i]);
+                // 预留一次上游尝试名额，避免并发选号超发；成功和失败都会占用 RPM 窗口。
+                Self::reserve_attempt_slot(&mut entries[i], now);
                 SelectOutcome::Selected(entries[i].id, entries[i].credentials.clone())
             }
             None => SelectOutcome::NoneAvailable,
@@ -1089,8 +1093,8 @@ impl MultiTokenManager {
                             if Self::rpm_exceeded_until(&mut entries[idx], default_rpm, now)
                                 .is_none() =>
                         {
-                            // 当前凭据可用且本窗口仍有余量：预留 in-flight 名额并复用
-                            Self::reserve_in_flight(&mut entries[idx]);
+                            // 当前凭据可用且本窗口仍有余量：预留上游尝试名额并复用
+                            Self::reserve_attempt_slot(&mut entries[idx], now);
                             Some((entries[idx].id, entries[idx].credentials.clone()))
                         }
                         Some(idx) => {
@@ -1802,7 +1806,7 @@ impl MultiTokenManager {
         let snapshot_entries = entries
             .iter_mut()
             .map(|e| {
-                let current_rpm = Self::current_success_window_used(e, now);
+                let current_rpm = Self::current_attempt_window_used(e, now);
                 let peak_rpm_1h = Self::peak_rpm_1h(e);
                 let throttled_1h = Self::throttled_count_1h(e);
                 let effective_rpm = Self::effective_rpm_limit(e.credentials.rpm, default_rpm);
@@ -2523,15 +2527,15 @@ mod tests {
     fn test_rpm_window_exceeded_and_recovery() {
         let mut entry = make_entry(1, Some(3));
         let base = Utc::now();
-        // 前两个成功响应未到限（2 < 3）
-        MultiTokenManager::record_success_slot(&mut entry, base);
-        MultiTokenManager::record_success_slot(&mut entry, base + Duration::seconds(1));
+        // 前两个上游尝试未到限（2 < 3）
+        MultiTokenManager::reserve_attempt_slot(&mut entry, base);
+        MultiTokenManager::reserve_attempt_slot(&mut entry, base + Duration::seconds(1));
         assert!(
             MultiTokenManager::rpm_exceeded_until(&mut entry, None, base + Duration::seconds(1))
                 .is_none()
         );
-        // 第三个成功响应到限
-        MultiTokenManager::record_success_slot(&mut entry, base + Duration::seconds(2));
+        // 第三个上游尝试到限
+        MultiTokenManager::reserve_attempt_slot(&mut entry, base + Duration::seconds(2));
         let until =
             MultiTokenManager::rpm_exceeded_until(&mut entry, None, base + Duration::seconds(2));
         // 恢复时刻 = 最老时间戳 + 60s
@@ -2544,7 +2548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rpm_counts_successes_not_failed_attempts() {
+    async fn test_rpm_counts_failed_attempts_as_upstream_attempts() {
         let mut config = Config::default();
         config.default_rpm = Some(1);
 
@@ -2558,12 +2562,19 @@ mod tests {
         assert_eq!(first.id, 1);
         assert!(manager.report_failure(first.id));
 
-        let second = manager.acquire_context(None).await.unwrap();
-        assert_eq!(second.id, 1);
+        let blocked = match manager.acquire_context(None).await {
+            Ok(_) => panic!("expected failed upstream attempt to consume RPM capacity"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            blocked.contains("每分钟请求上限"),
+            "expected failed upstream attempt to consume RPM capacity, got: {}",
+            blocked
+        );
     }
 
     #[tokio::test]
-    async fn test_snapshot_rpm_counts_successes_only() {
+    async fn test_snapshot_rpm_counts_attempts_before_success() {
         let mut config = Config::default();
         config.default_rpm = Some(1);
 
@@ -2575,7 +2586,7 @@ mod tests {
 
         let ctx = manager.acquire_context(None).await.unwrap();
         let before_success = manager.snapshot();
-        assert_eq!(before_success.entries[0].current_rpm, 0);
+        assert_eq!(before_success.entries[0].current_rpm, 1);
 
         manager.report_success(ctx.id);
         let after_success = manager.snapshot();
@@ -2605,8 +2616,15 @@ mod tests {
         );
 
         manager.report_attempt_finished_without_success(first.id);
-        let second = manager.acquire_context(None).await.unwrap();
-        assert_eq!(second.id, 1);
+        let blocked_after_failure = match manager.acquire_context(None).await {
+            Ok(_) => panic!("expected failed upstream attempt to stay in RPM window"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            blocked_after_failure.contains("每分钟请求上限"),
+            "expected failed upstream attempt to stay in RPM window, got: {}",
+            blocked_after_failure
+        );
     }
 
     #[test]
@@ -2614,9 +2632,9 @@ mod tests {
         let mut entry = make_entry(1, None);
         let base = Utc::now();
         for i in 0..100 {
-            MultiTokenManager::record_success_slot(&mut entry, base + Duration::milliseconds(i));
+            MultiTokenManager::reserve_attempt_slot(&mut entry, base + Duration::milliseconds(i));
         }
-        // 未配置 RPM：无论多少成功响应都不受限
+        // 未配置 RPM：无论多少上游尝试都不受限
         assert!(
             MultiTokenManager::rpm_exceeded_until(&mut entry, None, base + Duration::seconds(1))
                 .is_none()
@@ -2627,11 +2645,11 @@ mod tests {
     fn test_minute_bucket_peak_and_throttle() {
         let mut entry = make_entry(1, Some(2));
         let base = Utc::now();
-        MultiTokenManager::record_success_slot(&mut entry, base);
-        MultiTokenManager::record_success_slot(&mut entry, base);
-        MultiTokenManager::record_success_slot(&mut entry, base);
+        MultiTokenManager::reserve_attempt_slot(&mut entry, base);
+        MultiTokenManager::reserve_attempt_slot(&mut entry, base);
+        MultiTokenManager::reserve_attempt_slot(&mut entry, base);
         MultiTokenManager::record_throttle(&mut entry, base);
-        // 同一分钟内 3 次成功响应、1 次受限
+        // 同一分钟内 3 次上游尝试、1 次受限
         assert_eq!(MultiTokenManager::peak_rpm_1h(&entry), 3);
         assert_eq!(MultiTokenManager::throttled_count_1h(&entry), 1);
     }

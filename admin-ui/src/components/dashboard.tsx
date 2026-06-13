@@ -573,7 +573,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     const ids = Array.from(selectedIds)
     const input = window.prompt(
-      `为选中的 ${ids.length} 个凭据设置 RPM 上限：\n· 数字（如 10）= 每分钟最多 10 次成功响应\n· 0 = 不限制\n· 留空 = 跟随全局默认`,
+      `为选中的 ${ids.length} 个凭据设置 RPM 上限：\n· 数字（如 10）= 每分钟最多 10 次上游尝试\n· 0 = 不限制\n· 留空 = 跟随全局默认`,
       ''
     )
     if (input === null) return // 取消
