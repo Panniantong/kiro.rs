@@ -2,12 +2,12 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::AllRateLimitedError;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -22,10 +22,15 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{
+    ConversionError, convert_request_with_armor, final_text_override_for_request_with_armor,
+};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -270,8 +275,13 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    // 读取运行时破甲开关（与 admin 共享同一 token_manager，热生效）
+    let armor_breaking = provider.token_manager().get_armor_breaking();
+
+    let final_text_override = final_text_override_for_request_with_armor(&payload, armor_breaking);
+
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_armor(&payload, armor_breaking) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -314,6 +324,8 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    let request_is_claude_code = is_claude_code_request(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -328,6 +340,9 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    let signature_compat_enabled =
+        should_forward_reasoning_signature(payload.thinking.as_ref(), request_is_claude_code);
+    let emit_thinking_text = should_emit_thinking_text(&payload.model, payload.thinking.as_ref());
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -339,13 +354,27 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            signature_compat_enabled,
+            emit_thinking_text,
             tool_name_map,
+            final_text_override,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            emit_thinking_text,
+            false,
+            tool_name_map,
+            final_text_override,
+        )
+        .await
     }
 }
 
@@ -356,7 +385,10 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    signature_compat_enabled: bool,
+    emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    final_text_override: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -365,7 +397,15 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        thinking_enabled,
+        signature_compat_enabled,
+        emit_thinking_text,
+        tool_name_map,
+    )
+    .with_final_text_override(final_text_override);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -486,13 +526,82 @@ fn create_sse_stream(
 use super::converter::get_context_window_size;
 
 /// 处理非流式请求
+fn build_non_stream_content_blocks(
+    text_content: String,
+    reasoning_content: String,
+    reasoning_signature: Option<String>,
+    tool_uses: Vec<serde_json::Value>,
+    thinking_enabled: bool,
+    emit_thinking_text: bool,
+    _model: &str,
+) -> Vec<serde_json::Value> {
+    let mut content: Vec<serde_json::Value> = Vec::new();
+
+    if thinking_enabled {
+        if !reasoning_content.is_empty() || reasoning_signature.is_some() {
+            if emit_thinking_text {
+                let mut thinking_block = json!({
+                    "type": "thinking",
+                    "thinking": reasoning_content
+                });
+
+                if let Some(signature) =
+                    reasoning_signature.filter(|signature| !signature.is_empty())
+                {
+                    if let Some(obj) = thinking_block.as_object_mut() {
+                        obj.insert("signature".to_string(), json!(signature));
+                    }
+                }
+
+                content.push(thinking_block);
+            }
+
+            if !text_content.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": text_content
+                }));
+            }
+        } else {
+            // 从完整文本中提取 thinking 块
+            let (thinking, remaining_text) =
+                super::stream::extract_thinking_from_complete_text(&text_content);
+
+            if let Some(thinking_text) = thinking {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking_text
+                }));
+            }
+
+            if !remaining_text.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": remaining_text
+                }));
+            }
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    }
+
+    content.extend(tool_uses);
+    content
+}
+
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    emit_thinking_text: bool,
+    use_context_usage_input_tokens: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    final_text_override: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -523,6 +632,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    let mut reasoning_content = String::new();
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -541,6 +652,16 @@ async fn handle_non_stream_request(
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
+                        Event::ReasoningContent(reasoning) => {
+                            if thinking_enabled {
+                                if !reasoning.text.is_empty() {
+                                    reasoning_content.push_str(&reasoning.text);
+                                }
+                                if !reasoning.signature.is_empty() {
+                                    reasoning_signature = Some(reasoning.signature);
+                                }
+                            }
+                        }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
 
@@ -555,14 +676,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -581,10 +702,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -617,40 +737,29 @@ async fn handle_non_stream_request(
     }
 
     // 构建响应内容
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
-            content.push(json!({
-                "type": "thinking",
-                "thinking": thinking_text
-            }));
-        }
-
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
-        }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
+    if let Some(final_text_override) = final_text_override {
+        text_content = final_text_override;
     }
 
-    content.extend(tool_uses);
+    let content = build_non_stream_content_blocks(
+        text_content,
+        reasoning_content,
+        reasoning_signature,
+        tool_uses,
+        thinking_enabled,
+        emit_thinking_text,
+        model,
+    );
 
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 普通 /v1 保持请求估算值；/cc/v1 才使用 contextUsageEvent 修正。
+    let final_input_tokens = if use_context_usage_input_tokens {
+        context_input_tokens.unwrap_or(input_tokens)
+    } else {
+        input_tokens
+    };
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -681,10 +790,15 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_adaptive_only_opus = model_lower.contains("opus")
+        && (model_lower.contains("4-8")
+            || model_lower.contains("4.8")
+            || model_lower.contains("4-7")
+            || model_lower.contains("4.7")
+            || model_lower.contains("4-6")
+            || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
+    let thinking_type = if is_adaptive_only_opus {
         "adaptive"
     } else {
         "enabled"
@@ -698,13 +812,52 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
+        display: None,
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
+
+    if is_adaptive_only_opus {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
+            format: None,
         });
+    }
+}
+
+fn should_emit_thinking_text(_model: &str, thinking: Option<&Thinking>) -> bool {
+    let Some(thinking) = thinking.filter(|thinking| thinking.is_enabled()) else {
+        return false;
+    };
+
+    match thinking.display.as_deref() {
+        Some("summarized") => true,
+        Some("omitted") => false,
+        _ if thinking.thinking_type == "enabled" => true,
+        _ => false,
+    }
+}
+
+fn is_claude_code_request(payload: &MessagesRequest) -> bool {
+    payload.system.as_ref().is_some_and(|system| {
+        system.iter().any(|message| {
+            message
+                .text
+                .contains("You are Claude Code, Anthropic's official CLI for Claude.")
+        })
+    })
+}
+
+fn should_forward_reasoning_signature(
+    thinking: Option<&Thinking>,
+    is_claude_code_request: bool,
+) -> bool {
+    let Some(thinking) = thinking.filter(|thinking| thinking.is_enabled()) else {
+        return false;
+    };
+
+    match thinking.display.as_deref() {
+        Some("summarized") | Some("omitted") => true,
+        _ => thinking.thinking_type == "enabled" || is_claude_code_request,
     }
 }
 
@@ -783,8 +936,11 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    // 读取运行时破甲开关（与 admin 共享同一 token_manager，热生效）
+    let armor_breaking = provider.token_manager().get_armor_breaking();
+
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_armor(&payload, armor_breaking) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -827,6 +983,8 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    let request_is_claude_code = is_claude_code_request(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -841,6 +999,9 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    let signature_compat_enabled =
+        should_forward_reasoning_signature(payload.thinking.as_ref(), request_is_claude_code);
+    let emit_thinking_text = should_emit_thinking_text(&payload.model, payload.thinking.as_ref());
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -852,13 +1013,26 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            signature_compat_enabled,
+            emit_thinking_text,
             tool_name_map,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            emit_thinking_text,
+            true,
+            tool_name_map,
+            None,
+        )
+        .await
     }
 }
 
@@ -872,6 +1046,8 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    signature_compat_enabled: bool,
+    emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -881,7 +1057,14 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        signature_compat_enabled,
+        emit_thinking_text,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
@@ -1011,5 +1194,120 @@ mod tests {
             body["error"]["message"],
             "Upstream service temporarily unavailable. Please retry later."
         );
+    }
+
+    #[test]
+    fn test_non_stream_content_includes_upstream_reasoning_signature() {
+        let content = build_non_stream_content_blocks(
+            "final answer".to_string(),
+            "real upstream thinking".to_string(),
+            Some("real-upstream-signature".to_string()),
+            Vec::new(),
+            true,
+            true,
+            "claude-opus-4-8",
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "real upstream thinking");
+        assert_eq!(content[0]["signature"], "real-upstream-signature");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn test_non_stream_content_does_not_fallback_signature_without_upstream_signature() {
+        let content = build_non_stream_content_blocks(
+            "final answer".to_string(),
+            "real upstream thinking".to_string(),
+            None,
+            Vec::new(),
+            true,
+            true,
+            "claude-opus-4-8",
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert!(content[0].get("signature").is_none());
+    }
+
+    #[test]
+    fn test_non_stream_omitted_thinking_suppresses_empty_thinking_block() {
+        let content = build_non_stream_content_blocks(
+            "final answer".to_string(),
+            "hidden upstream thinking".to_string(),
+            Some("real-upstream-signature".to_string()),
+            Vec::new(),
+            true,
+            false,
+            "claude-opus-4-8",
+        );
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "final answer");
+    }
+
+    #[test]
+    fn test_should_emit_enabled_thinking_by_default_for_opus_4_8() {
+        let thinking = Thinking {
+            thinking_type: "enabled".to_string(),
+            display: None,
+            budget_tokens: 1024,
+        };
+
+        assert!(should_emit_thinking_text(
+            "claude-opus-4-8",
+            Some(&thinking)
+        ));
+        assert!(should_forward_reasoning_signature(Some(&thinking), false));
+    }
+
+    #[test]
+    fn test_should_hide_adaptive_thinking_by_default_for_opus_4_8() {
+        let thinking = Thinking {
+            thinking_type: "adaptive".to_string(),
+            display: None,
+            budget_tokens: 1024,
+        };
+
+        assert!(!should_emit_thinking_text(
+            "claude-opus-4-8",
+            Some(&thinking)
+        ));
+        assert!(!should_forward_reasoning_signature(Some(&thinking), false));
+        assert!(should_forward_reasoning_signature(Some(&thinking), true));
+    }
+
+    #[test]
+    fn test_should_forward_omitted_thinking_signature_without_text() {
+        let thinking = Thinking {
+            thinking_type: "enabled".to_string(),
+            display: Some("omitted".to_string()),
+            budget_tokens: 1024,
+        };
+
+        assert!(!should_emit_thinking_text(
+            "claude-opus-4-8",
+            Some(&thinking)
+        ));
+        assert!(should_forward_reasoning_signature(Some(&thinking), false));
+    }
+
+    #[test]
+    fn test_should_emit_summarized_thinking_display() {
+        let thinking = Thinking {
+            thinking_type: "enabled".to_string(),
+            display: Some("summarized".to_string()),
+            budget_tokens: 1024,
+        };
+
+        assert!(should_emit_thinking_text(
+            "claude-opus-4-8",
+            Some(&thinking)
+        ));
+        assert!(should_forward_reasoning_signature(Some(&thinking), false));
     }
 }

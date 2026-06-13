@@ -68,6 +68,8 @@ const MAX_BUDGET_TOKENS: i32 = 24576;
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
+    #[serde(default)]
+    pub display: Option<String>,
     #[serde(
         default = "default_budget_tokens",
         deserialize_with = "deserialize_budget_tokens"
@@ -98,6 +100,17 @@ where
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
+}
+
+/// 结构化输出配置
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
 }
 
 fn default_effort() -> String {
@@ -234,6 +247,8 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

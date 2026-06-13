@@ -12,7 +12,18 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useDefaultRpm, useSetDefaultRpm, useBatchSetRpm } from '@/hooks/use-credentials'
+import {
+  useCredentials,
+  useDeleteCredential,
+  useResetFailure,
+  useLoadBalancingMode,
+  useSetLoadBalancingMode,
+  useDefaultRpm,
+  useSetDefaultRpm,
+  useBatchSetRpm,
+  useArmorBreaking,
+  useSetArmorBreaking,
+} from '@/hooks/use-credentials'
 import { Input } from '@/components/ui/input'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -60,6 +71,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const batchSetRpm = useBatchSetRpm()
   const [editingDefaultRpm, setEditingDefaultRpm] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
+  const { data: armorBreakingData, isLoading: isLoadingArmor } = useArmorBreaking()
+  const { mutate: setArmorBreaking, isPending: isSettingArmor } = useSetArmorBreaking()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -538,6 +551,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  // 切换破甲模式
+  const handleToggleArmorBreaking = () => {
+    const newEnabled = !(armorBreakingData?.enabled ?? false)
+
+    setArmorBreaking(newEnabled, {
+      onSuccess: () => {
+        toast.success(newEnabled ? '已开启破甲模式' : '已关闭破甲模式（最小满分版）')
+      },
+      onError: (error) => {
+        toast.error(`切换失败: ${extractErrorMessage(error)}`)
+      }
+    })
+  }
+
   // 批量设置 RPM
   const handleBatchSetRpm = () => {
     if (selectedIds.size === 0) {
@@ -575,7 +602,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
       }
     )
   }
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -622,6 +648,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
               title="切换负载均衡模式"
             >
               {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+            </Button>
+            <Button
+              variant={armorBreakingData?.enabled ? 'default' : 'outline'}
+              size="sm"
+              onClick={handleToggleArmorBreaking}
+              disabled={isLoadingArmor || isSettingArmor}
+              title="切换破甲模式（关=最小满分版；开=去除上游系统提示词与身份痕迹）"
+            >
+              {isLoadingArmor ? '加载中...' : (armorBreakingData?.enabled ? '破甲：开' : '破甲：关')}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}

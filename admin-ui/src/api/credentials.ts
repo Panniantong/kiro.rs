@@ -141,3 +141,15 @@ export async function setDefaultRpm(defaultRpm: number | null): Promise<DefaultR
   )
   return data
 }
+
+// 获取破甲模式
+export async function getArmorBreaking(): Promise<{ enabled: boolean }> {
+  const { data } = await api.get<{ enabled: boolean }>('/config/armor-breaking')
+  return data
+}
+
+// 设置破甲模式
+export async function setArmorBreaking(enabled: boolean): Promise<{ enabled: boolean }> {
+  const { data } = await api.put<{ enabled: boolean }>('/config/armor-breaking', { enabled })
+  return data
+}

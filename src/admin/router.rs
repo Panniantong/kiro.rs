@@ -8,9 +8,10 @@ use axum::{
 use super::{
     handlers::{
         add_credential, batch_set_credential_rpm, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_default_rpm, get_load_balancing_mode,
-        reset_failure_count, set_credential_disabled, set_credential_priority, set_credential_rpm,
-        set_default_rpm, set_load_balancing_mode,
+        get_all_credentials, get_armor_breaking, get_credential_balance, get_default_rpm,
+        get_load_balancing_mode, reset_failure_count, set_armor_breaking,
+        set_credential_disabled, set_credential_priority, set_credential_rpm, set_default_rpm,
+        set_load_balancing_mode,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -54,6 +55,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/default-rpm",
             get(get_default_rpm).put(set_default_rpm),
+        )
+        .route(
+            "/config/armor-breaking",
+            get(get_armor_breaking).put(set_armor_breaking),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

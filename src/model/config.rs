@@ -97,6 +97,14 @@ pub struct Config {
     #[serde(default)]
     pub default_rpm: Option<u32>,
 
+    /// 破甲模式：去除/绕过 Kiro 上游自带系统提示词与身份痕迹（默认 false = 最小满分版）
+    ///
+    /// 运行时可经 Admin API `/config/armor-breaking` 热切换。关闭时网关只保留
+    /// HVOY/API-CHECK 检测兼容能力，对正常客户请求行为等价于未破甲基线；
+    /// 开启时才注入身份合约、隐藏上游痕迹等破甲逻辑。
+    #[serde(default = "default_armor_breaking")]
+    pub armor_breaking: bool,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -157,6 +165,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_armor_breaking() -> bool {
+    false
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -188,6 +200,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             default_rpm: None,
+            armor_breaking: default_armor_breaking(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
@@ -243,7 +256,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

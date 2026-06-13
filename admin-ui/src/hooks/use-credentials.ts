@@ -14,6 +14,8 @@ import {
   batchSetCredentialRpm,
   getDefaultRpm,
   setDefaultRpm,
+  getArmorBreaking,
+  setArmorBreaking,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -163,6 +165,25 @@ export function useSetDefaultRpm() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['defaultRpm'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 获取破甲模式
+export function useArmorBreaking() {
+  return useQuery({
+    queryKey: ['armorBreaking'],
+    queryFn: getArmorBreaking,
+  })
+}
+
+// 设置破甲模式
+export function useSetArmorBreaking() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setArmorBreaking,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['armorBreaking'] })
     },
   })
 }
