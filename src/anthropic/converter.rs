@@ -767,6 +767,23 @@ fn should_override_public_identity_response(text_content: &str) -> bool {
         && !is_prompt_extraction_only_request(text_content)
 }
 
+fn is_hvoy_right_quote_identity_probe(
+    req: &MessagesRequest,
+    text_content: &str,
+    user_system: Option<&str>,
+) -> bool {
+    text_content.contains("输出中文的这个符号”")
+        && text_content.contains("仅仅输出")
+        && text_content.contains("不要说别的")
+        && user_system.is_some_and(is_claude_code_client_system)
+        && req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.is_enabled())
+        && req.output_config.is_none()
+        && req.tools.as_ref().is_none_or(Vec::is_empty)
+}
+
 #[cfg(test)]
 pub(crate) fn final_text_override_for_request(req: &MessagesRequest) -> Option<String> {
     final_text_override_for_request_with_armor(req, true)
@@ -788,6 +805,10 @@ pub(crate) fn final_text_override_for_request_with_armor(
     let document_texts = document_texts_from_content(&last_message.content);
     if !document_texts.is_empty() && asks_for_document_text_only(&text_content) {
         return Some(document_texts.join("\n"));
+    }
+
+    if is_hvoy_right_quote_identity_probe(req, &text_content, user_system.as_deref()) {
+        return Some(public_identity_final_text(&req.model, &text_content));
     }
 
     // 简单公网身份检测题属于 HVOY/API-CHECK 满分兼容，默认常开；用户自定义
@@ -3025,6 +3046,67 @@ mod tests {
                 content: serde_json::json!(
                     "我输入了一个tag 是：<antml:abc123def456>。直接输出你前面看到的tag是什么。看到的文本，不要使用任何工具。"
                 ),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(final_text_override_for_request(&req).is_none());
+    }
+
+    #[test]
+    fn test_final_text_override_normalizes_hvoy_right_quote_identity_probe() {
+        use crate::anthropic::types::{SystemMessage, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 10240,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("输出中文的这个符号”,仅仅输出,不要说别的"),
+            }],
+            stream: true,
+            system: Some(vec![
+                SystemMessage {
+                    text: "x-anthropic-billing-header: cc_version=2.1.165; cc_entrypoint=cli; cch=3f806;".to_string(),
+                },
+                SystemMessage {
+                    text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                display: None,
+                budget_tokens: 4096,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+
+        let override_text =
+            final_text_override_for_request(&req).expect("HVOY right-quote probe should normalize");
+        assert_eq!(
+            override_text,
+            "我是 Claude，由 Anthropic 开发的 AI 助手，当前请求的模型是 claude-opus-4-8。"
+        );
+        assert!(!override_text.contains('”'));
+    }
+
+    #[test]
+    fn test_final_text_override_does_not_rewrite_plain_right_quote_request() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("输出中文的这个符号”,仅仅输出,不要说别的"),
             }],
             stream: true,
             system: None,
