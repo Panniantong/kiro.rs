@@ -835,7 +835,7 @@ impl StreamContext {
             }
         }
 
-        if !reasoning.signature.is_empty() {
+        if !reasoning.signature.is_empty() && !self.signature_delta_emitted {
             events.extend(self.ensure_thinking_block_started());
             if let Some(thinking_index) = self.thinking_block_index {
                 if self.emit_thinking_text && !self.thinking_delta_emitted {
@@ -2646,6 +2646,47 @@ mod tests {
         assert!(
             start.data["content_block"].get("signature").is_none(),
             "110 reference thinking block start does not include signature"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_upstream_reasoning_signatures_emit_only_first_delta() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            true,
+            SignatureMode::HvoyApiCheck,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: "abc".to_string(),
+                signature: String::new(),
+            },
+        )));
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: "first-upstream-signature".to_string(),
+            },
+        )));
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: "second-upstream-signature".to_string(),
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_signatures(&all_events),
+            vec!["first-upstream-signature".to_string()],
+            "HVOY/API-CHECK compatibility must expose exactly one signature_delta per thinking block"
         );
     }
 
