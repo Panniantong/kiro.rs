@@ -113,3 +113,16 @@ export interface DefaultRpmResponse {
 export interface SetDefaultRpmRequest {
   defaultRpm: number | null
 }
+
+// 上游 Max 渠道透传配置
+export interface MaxRelayResponse {
+  enabled: boolean
+  baseUrl: string
+  apiKey: string
+}
+
+export interface SetMaxRelayRequest {
+  enabled: boolean
+  baseUrl: string
+  apiKey: string
+}

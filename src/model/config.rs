@@ -17,6 +17,27 @@ impl Default for TlsBackend {
     }
 }
 
+/// 上游 Max 渠道透传配置
+///
+/// 开启后，识别为 CCTest / Claude Code 形态的请求会被原样透传到配置的上游 Max
+/// 渠道（借其真签名通过 CCTest），其它请求仍走本机 Kiro。默认关闭，零影响现状。
+/// 运行时可经 Admin API `/config/max-relay` 热切换。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MaxRelayConfig {
+    /// 是否开启透传（默认 false = 不影响任何现状）
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 上游 Max 渠道 base_url（如 https://api.example.com，不带尾斜杠也可）
+    #[serde(default)]
+    pub base_url: String,
+
+    /// 上游 Max 渠道 api_key（同时用作 x-api-key 和 Authorization: Bearer）
+    #[serde(default)]
+    pub api_key: String,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +125,13 @@ pub struct Config {
     /// 开启时才注入身份合约、隐藏上游痕迹等破甲逻辑。
     #[serde(default = "default_armor_breaking")]
     pub armor_breaking: bool,
+
+    /// 上游 Max 渠道透传配置（默认关闭）
+    ///
+    /// 运行时可经 Admin API `/config/max-relay` 热切换。开启后 CCTest / Claude Code
+    /// 形态的请求原样转发到配置的上游 Max 渠道；其它请求仍走本机 Kiro。
+    #[serde(default)]
+    pub max_relay: MaxRelayConfig,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -201,6 +229,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             default_rpm: None,
             armor_breaking: default_armor_breaking(),
+            max_relay: MaxRelayConfig::default(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

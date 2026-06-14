@@ -1,24 +1,29 @@
 //! Anthropic API Handler 函数
 
-use std::convert::Infallible;
+use std::{
+    convert::Infallible,
+    env,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::AllRateLimitedError;
+use crate::model::config::MaxRelayConfig;
 use crate::token;
 use anyhow::Error;
 use axum::{
-    Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
-use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -232,8 +237,24 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    headers: HeaderMap,
+    raw_body: Bytes,
 ) -> Response {
+    let mut payload: MessagesRequest = match serde_json::from_slice(&raw_body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("请求 JSON 解析失败: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("Invalid request JSON: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -256,6 +277,14 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 上游 Max 渠道透传开关：开启且命中 CCTest/Claude Code 形态时，原样转发到上游
+    // Max 渠道（借其真签名通过 CCTest）；其它请求继续走本机 Kiro。默认关闭。
+    let max_relay = provider.token_manager().get_max_relay();
+    if max_relay.enabled && should_relay_to_max(&payload) {
+        tracing::warn!(target = %max_relay.base_url, "命中 Max 渠道透传，转发上游");
+        return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages").await;
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -847,6 +876,279 @@ fn is_claude_code_request(payload: &MessagesRequest) -> bool {
     })
 }
 
+/// 判断请求是否应透传到上游 Max 渠道。
+///
+/// 8997 是专用 CCTest 对照线。只要运行时显式开启 `maxRelay.enabled`，就应保证
+/// 所有 Messages 子请求都走同一个上游原生协议，避免 CCTest 的非 Claude Code
+/// system 探针、multimodal 探针或小 max_tokens 探针漏回 Kiro 分支。
+fn should_relay_to_max(_payload: &MessagesRequest) -> bool {
+    true
+}
+
+/// 把请求原样透传到上游 Max 渠道（纯透传：body 不改、响应 chunk 原样、不动签名）。
+///
+/// 鉴权同时带 `x-api-key` 和 `Authorization: Bearer`（不同上游要求不同，都带最稳），
+/// 并透传入站的 `anthropic-version` / `anthropic-beta`。
+async fn relay_to_max(
+    raw_body: Bytes,
+    headers: &HeaderMap,
+    config: &MaxRelayConfig,
+    path: &str,
+) -> Response {
+    let base_url = config.base_url.trim().trim_end_matches('/');
+    let capture = prepare_max_relay_capture(&raw_body, headers, base_url, path).await;
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!("Max 渠道透传 client 构建失败: {}", e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Max relay client unavailable",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // 出站 body 用原始 raw_body，不做任何改写（不 cap max_tokens、不改 model）
+    let mut request = client
+        .post(format!("{}{}", base_url, path))
+        .header("content-type", "application/json")
+        .header("x-api-key", config.api_key.as_str())
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", config.api_key),
+        )
+        .body(raw_body);
+
+    let anthropic_version = headers
+        .get("anthropic-version")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("2023-06-01");
+    request = request.header("anthropic-version", anthropic_version);
+
+    if let Some(beta) = headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+    {
+        request = request.header("anthropic-beta", beta);
+    }
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!("Max 渠道透传请求失败: {}", e);
+            if let Some(capture) = &capture {
+                capture
+                    .write_json(
+                        "error.json",
+                        &json!({
+                            "stage": "request_send",
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .await;
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("api_error", "Max relay upstream failed")),
+            )
+                .into_response();
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    if let Some(capture) = &capture {
+        capture
+            .write_json(
+                "response-meta.json",
+                &json!({
+                    "status": status.as_u16(),
+                    "content_type": content_type,
+                    "captured_at_unix_ms": now_unix_ms(),
+                }),
+            )
+            .await;
+    }
+
+    // 响应逐 chunk 原样转发，不做任何改写
+    let response_capture = capture.clone();
+    let body_stream = upstream.bytes_stream().map(|chunk| match chunk {
+        Ok(bytes) => Ok::<Bytes, Infallible>(bytes),
+        Err(e) => {
+            tracing::warn!("Max 渠道透传响应流错误: {}", e);
+            Ok(Bytes::from(
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream interrupted\"}}\n\n",
+            ))
+        }
+    });
+    let body_stream = body_stream.then(move |chunk| {
+        let response_capture = response_capture.clone();
+        async move {
+            if let (Ok(bytes), Some(capture)) = (&chunk, response_capture) {
+                capture.append_response(bytes).await;
+            }
+            chunk
+        }
+    });
+
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body_stream))
+        .unwrap()
+}
+
+#[derive(Clone)]
+struct RelayCapture {
+    dir: PathBuf,
+}
+
+impl RelayCapture {
+    async fn write_json(&self, name: &str, value: &serde_json::Value) {
+        let path = self.dir.join(name);
+        match serde_json::to_vec_pretty(value) {
+            Ok(mut body) => {
+                body.push(b'\n');
+                if let Err(err) = tokio::fs::write(&path, body).await {
+                    tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 写 JSON 失败");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 序列化 JSON 失败");
+            }
+        }
+    }
+
+    async fn append_response(&self, bytes: &Bytes) {
+        let path = self.dir.join("response.body");
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(bytes).await {
+                    tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 写响应 chunk 失败");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 打开响应文件失败");
+            }
+        }
+    }
+}
+
+async fn prepare_max_relay_capture(
+    raw_body: &Bytes,
+    headers: &HeaderMap,
+    base_url: &str,
+    path: &str,
+) -> Option<RelayCapture> {
+    let root = env::var("KIRO_RS_MAX_RELAY_CAPTURE_DIR").ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+
+    let dir = PathBuf::from(root).join(format!("{}-{}", now_unix_ms(), Uuid::new_v4()));
+    if let Err(err) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!(path = %dir.display(), error = %err, "Max Relay capture 创建目录失败");
+        return None;
+    }
+
+    let capture = RelayCapture { dir };
+    if let Err(err) = tokio::fs::write(capture.dir.join("request.body"), raw_body).await {
+        tracing::warn!(path = %capture.dir.display(), error = %err, "Max Relay capture 写请求体失败");
+    }
+
+    capture
+        .write_json(
+            "request-meta.json",
+            &json!({
+                "captured_at_unix_ms": now_unix_ms(),
+                "path": path,
+                "target_base_url": base_url,
+                "headers": summarize_relay_headers(headers),
+                "request": summarize_relay_request(raw_body),
+            }),
+        )
+        .await;
+
+    Some(capture)
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn summarize_relay_headers(headers: &HeaderMap) -> serde_json::Value {
+    let header_value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+
+    json!({
+        "content-type": header_value("content-type"),
+        "anthropic-version": header_value("anthropic-version"),
+        "anthropic-beta": header_value("anthropic-beta"),
+        "user-agent": header_value("user-agent"),
+        "x-api-key": headers.get("x-api-key").map(|_| "present_redacted"),
+        "authorization": headers.get("authorization").map(|_| "present_redacted"),
+    })
+}
+
+fn summarize_relay_request(raw_body: &Bytes) -> serde_json::Value {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw_body) else {
+        return json!({
+            "parse_error": true,
+            "body_len": raw_body.len(),
+        });
+    };
+
+    let messages_count = value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| messages.len());
+    let tools_count = value
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|tools| tools.len());
+
+    json!({
+        "model": value.get("model"),
+        "stream": value.get("stream"),
+        "max_tokens": value.get("max_tokens"),
+        "thinking": value.get("thinking"),
+        "output_config": value.get("output_config"),
+        "messages_count": messages_count,
+        "tools_count": tools_count,
+        "body_len": raw_body.len(),
+    })
+}
+
 fn should_forward_reasoning_signature(
     thinking: Option<&Thinking>,
     is_claude_code_request: bool,
@@ -865,13 +1167,41 @@ fn should_forward_reasoning_signature(
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
-) -> impl IntoResponse {
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Response {
+    let payload: CountTokensRequest = match serde_json::from_slice(&raw_body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("count_tokens 请求 JSON 解析失败: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("Invalid request JSON: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    if let Some(provider) = &state.kiro_provider {
+        let max_relay = provider.token_manager().get_max_relay();
+        if max_relay.enabled {
+            tracing::warn!(
+                target = %max_relay.base_url,
+                "命中 Max 渠道透传，转发上游 count_tokens"
+            );
+            return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages/count_tokens").await;
+        }
+    }
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -883,6 +1213,7 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
+    .into_response()
 }
 
 /// POST /cc/v1/messages
@@ -892,8 +1223,24 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    headers: HeaderMap,
+    raw_body: Bytes,
 ) -> Response {
+    let mut payload: MessagesRequest = match serde_json::from_slice(&raw_body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("请求 JSON 解析失败: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("Invalid request JSON: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -917,6 +1264,14 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    // 上游 Max 渠道透传开关：开启且命中 CCTest/Claude Code 形态时，原样转发到上游
+    // Max 渠道（借其真签名通过 CCTest）；其它请求继续走本机 Kiro。默认关闭。
+    let max_relay = provider.token_manager().get_max_relay();
+    if max_relay.enabled && should_relay_to_max(&payload) {
+        tracing::warn!(target = %max_relay.base_url, "命中 Max 渠道透传，转发上游");
+        return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages").await;
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);

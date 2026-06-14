@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -23,8 +23,11 @@ import {
   useBatchSetRpm,
   useArmorBreaking,
   useSetArmorBreaking,
+  useMaxRelay,
+  useSetMaxRelay,
 } from '@/hooks/use-credentials'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -73,6 +76,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
   const { data: armorBreakingData, isLoading: isLoadingArmor } = useArmorBreaking()
   const { mutate: setArmorBreaking, isPending: isSettingArmor } = useSetArmorBreaking()
+  const { data: maxRelayData } = useMaxRelay()
+  const { mutate: setMaxRelay, isPending: isSettingMaxRelay } = useSetMaxRelay()
+  const [maxRelayEnabled, setMaxRelayEnabled] = useState(false)
+  const [maxRelayBaseUrl, setMaxRelayBaseUrl] = useState('')
+  const [maxRelayApiKey, setMaxRelayApiKey] = useState('')
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -89,6 +97,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [data?.credentials.length])
+
+  // 上游 Max 渠道透传配置加载后回填到本地表单
+  useEffect(() => {
+    if (maxRelayData) {
+      setMaxRelayEnabled(maxRelayData.enabled)
+      setMaxRelayBaseUrl(maxRelayData.baseUrl)
+      setMaxRelayApiKey(maxRelayData.apiKey)
+    }
+  }, [maxRelayData])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -565,6 +582,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  // 保存上游 Max 渠道透传配置
+  const handleMaxRelaySave = () => {
+    const baseUrl = maxRelayBaseUrl.trim()
+    const apiKey = maxRelayApiKey.trim()
+    // 开启透传时要求 base_url 和 api_key 都填好，避免开了但配置不全
+    if (maxRelayEnabled && (baseUrl === '' || apiKey === '')) {
+      toast.error('开启透传前请填写 base_url 和 api_key')
+      return
+    }
+    setMaxRelay(
+      { enabled: maxRelayEnabled, baseUrl, apiKey },
+      {
+        onSuccess: () => {
+          toast.success(maxRelayEnabled ? '已保存并开启 Max 渠道透传' : '已保存（Max 渠道透传关闭）')
+        },
+        onError: (error) => {
+          toast.error(`保存失败: ${extractErrorMessage(error)}`)
+        }
+      }
+    )
+  }
+
   // 批量设置 RPM
   const handleBatchSetRpm = () => {
     if (selectedIds.size === 0) {
@@ -764,6 +803,61 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 )}
               </div>
               <span className="text-xs text-muted-foreground">未单独设置 RPM 的账号沿用此值</span>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 上游 Max 渠道透传配置 */}
+        <Card className="mb-6">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Network className="h-4 w-4 text-muted-foreground" />
+              上游 Max 渠道透传
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              开启后，识别为 CCTest / Claude Code 形态的请求会原样透传到下方配置的上游 Max 渠道（借其真签名通过 CCTest）；其它请求仍走本机 Kiro。默认关闭，不影响现状。
+            </p>
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">base_url</label>
+              <Input
+                type="text"
+                value={maxRelayBaseUrl}
+                onChange={(e) => setMaxRelayBaseUrl(e.target.value)}
+                placeholder="https://api.example.com"
+                className="h-9 text-sm"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">api_key</label>
+              <Input
+                type="password"
+                value={maxRelayApiKey}
+                onChange={(e) => setMaxRelayApiKey(e.target.value)}
+                placeholder="上游 Max 渠道密钥"
+                className="h-9 text-sm"
+                autoComplete="new-password"
+              />
+            </div>
+            <div className="flex items-center justify-between flex-wrap gap-2 pt-1">
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={maxRelayEnabled}
+                  onCheckedChange={setMaxRelayEnabled}
+                  id="max-relay-enabled"
+                />
+                <label htmlFor="max-relay-enabled" className="text-sm font-medium cursor-pointer">
+                  {maxRelayEnabled ? '透传：开' : '透传：关'}
+                </label>
+              </div>
+              <Button
+                size="sm"
+                onClick={handleMaxRelaySave}
+                disabled={isSettingMaxRelay}
+              >
+                {isSettingMaxRelay ? '保存中...' : '保存'}
+              </Button>
             </div>
           </CardContent>
         </Card>

@@ -15,8 +15,9 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, ArmorBreakingResponse, BalanceResponse,
     CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    SetArmorBreakingRequest, SetLoadBalancingModeRequest,
+    MaxRelayResponse, SetArmorBreakingRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
 };
+use crate::model::config::MaxRelayConfig;
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -404,6 +405,38 @@ impl AdminService {
 
         Ok(ArmorBreakingResponse {
             enabled: req.enabled,
+        })
+    }
+
+    /// 获取上游 Max 渠道透传配置
+    pub fn get_max_relay(&self) -> MaxRelayResponse {
+        let cfg = self.token_manager.get_max_relay();
+        MaxRelayResponse {
+            enabled: cfg.enabled,
+            base_url: cfg.base_url,
+            api_key: cfg.api_key,
+        }
+    }
+
+    /// 设置上游 Max 渠道透传配置
+    pub fn set_max_relay(
+        &self,
+        req: SetMaxRelayRequest,
+    ) -> Result<MaxRelayResponse, AdminServiceError> {
+        let cfg = MaxRelayConfig {
+            enabled: req.enabled,
+            base_url: req.base_url.trim().to_string(),
+            api_key: req.api_key.trim().to_string(),
+        };
+
+        self.token_manager
+            .set_max_relay(cfg.clone())
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(MaxRelayResponse {
+            enabled: cfg.enabled,
+            base_url: cfg.base_url,
+            api_key: cfg.api_key,
         })
     }
 

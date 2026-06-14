@@ -9,9 +9,9 @@ use super::{
     handlers::{
         add_credential, batch_set_credential_rpm, delete_credential, force_refresh_token,
         get_all_credentials, get_armor_breaking, get_credential_balance, get_default_rpm,
-        get_load_balancing_mode, reset_failure_count, set_armor_breaking,
+        get_load_balancing_mode, get_max_relay, reset_failure_count, set_armor_breaking,
         set_credential_disabled, set_credential_priority, set_credential_rpm, set_default_rpm,
-        set_load_balancing_mode,
+        set_load_balancing_mode, set_max_relay,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -60,6 +60,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/armor-breaking",
             get(get_armor_breaking).put(set_armor_breaking),
         )
+        .route("/config/max-relay", get(get_max_relay).put(set_max_relay))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

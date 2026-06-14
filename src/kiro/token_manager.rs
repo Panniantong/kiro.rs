@@ -23,7 +23,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{Config, MaxRelayConfig};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -590,6 +590,8 @@ pub struct MultiTokenManager {
     default_rpm: Mutex<Option<u32>>,
     /// 破甲模式开关（运行时可修改，默认 false = 最小满分版）
     armor_breaking: Mutex<bool>,
+    /// 上游 Max 渠道透传配置（运行时可修改，默认关闭）
+    max_relay: Mutex<MaxRelayConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -728,6 +730,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let default_rpm_init = config.default_rpm;
         let armor_breaking = config.armor_breaking;
+        let max_relay = config.max_relay.clone();
         let manager = Self {
             config,
             proxy,
@@ -739,6 +742,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             default_rpm: Mutex::new(default_rpm_init),
             armor_breaking: Mutex::new(armor_breaking),
+            max_relay: Mutex::new(max_relay),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -2465,6 +2469,53 @@ impl MultiTokenManager {
         }
 
         tracing::info!("破甲模式已设置为: {}", on);
+        Ok(())
+    }
+
+    /// 获取上游 Max 渠道透传配置（Admin API）
+    pub fn get_max_relay(&self) -> MaxRelayConfig {
+        self.max_relay.lock().clone()
+    }
+
+    fn persist_max_relay(&self, cfg: &MaxRelayConfig) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，上游 Max 渠道透传配置仅在当前进程生效: enabled={}",
+                    cfg.enabled
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.max_relay = cfg.clone();
+        config.save().with_context(|| {
+            format!("持久化上游 Max 渠道透传配置失败: {}", config_path.display())
+        })?;
+
+        Ok(())
+    }
+
+    /// 设置上游 Max 渠道透传配置（Admin API，热改并持久化，失败回滚）
+    pub fn set_max_relay(&self, cfg: MaxRelayConfig) -> anyhow::Result<()> {
+        let previous = self.get_max_relay();
+        *self.max_relay.lock() = cfg.clone();
+
+        if let Err(err) = self.persist_max_relay(&cfg) {
+            *self.max_relay.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!(
+            "上游 Max 渠道透传配置已更新: enabled={} base_url={}",
+            cfg.enabled,
+            cfg.base_url
+        );
         Ok(())
     }
 }

@@ -12,6 +12,8 @@ import type {
   BatchSetRpmRequest,
   DefaultRpmResponse,
   SetDefaultRpmRequest,
+  MaxRelayResponse,
+  SetMaxRelayRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -151,5 +153,17 @@ export async function getArmorBreaking(): Promise<{ enabled: boolean }> {
 // 设置破甲模式
 export async function setArmorBreaking(enabled: boolean): Promise<{ enabled: boolean }> {
   const { data } = await api.put<{ enabled: boolean }>('/config/armor-breaking', { enabled })
+  return data
+}
+
+// 获取上游 Max 渠道透传配置
+export async function getMaxRelay(): Promise<MaxRelayResponse> {
+  const { data } = await api.get<MaxRelayResponse>('/config/max-relay')
+  return data
+}
+
+// 设置上游 Max 渠道透传配置
+export async function setMaxRelay(req: SetMaxRelayRequest): Promise<MaxRelayResponse> {
+  const { data } = await api.put<MaxRelayResponse>('/config/max-relay', req)
   return data
 }

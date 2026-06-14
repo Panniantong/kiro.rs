@@ -267,6 +267,37 @@ pub struct SetArmorBreakingRequest {
     pub enabled: bool,
 }
 
+// ============ 上游 Max 渠道透传配置 ============
+
+/// 上游 Max 渠道透传响应
+///
+/// `api_key` 整串返回（仅 Admin API Key 认证后可见，便于前端回填编辑）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaxRelayResponse {
+    /// 是否开启透传
+    pub enabled: bool,
+    /// 上游 Max 渠道 base_url
+    pub base_url: String,
+    /// 上游 Max 渠道 api_key（整串返回）
+    pub api_key: String,
+}
+
+/// 设置上游 Max 渠道透传请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMaxRelayRequest {
+    /// 是否开启透传
+    #[serde(default)]
+    pub enabled: bool,
+    /// 上游 Max 渠道 base_url
+    #[serde(default)]
+    pub base_url: String,
+    /// 上游 Max 渠道 api_key
+    #[serde(default)]
+    pub api_key: String,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

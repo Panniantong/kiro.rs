@@ -10,8 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, BatchSetRpmRequest, SetArmorBreakingRequest, SetDefaultRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmRequest,
-        SuccessResponse,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest, SetPriorityRequest,
+        SetRpmRequest, SuccessResponse,
     },
 };
 
@@ -162,9 +162,11 @@ pub async fn batch_set_credential_rpm(
     Json(payload): Json<BatchSetRpmRequest>,
 ) -> impl IntoResponse {
     match state.service.batch_set_rpm(&payload.ids, payload.rpm) {
-        Ok(count) => {
-            Json(SuccessResponse::new(format!("已更新 {} 个凭据的 RPM", count))).into_response()
-        }
+        Ok(count) => Json(SuccessResponse::new(format!(
+            "已更新 {} 个凭据的 RPM",
+            count
+        )))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -201,6 +203,25 @@ pub async fn set_armor_breaking(
     Json(payload): Json<SetArmorBreakingRequest>,
 ) -> impl IntoResponse {
     match state.service.set_armor_breaking(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/max-relay
+/// 获取上游 Max 渠道透传配置
+pub async fn get_max_relay(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_max_relay();
+    Json(response)
+}
+
+/// PUT /api/admin/config/max-relay
+/// 设置上游 Max 渠道透传配置
+pub async fn set_max_relay(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetMaxRelayRequest>,
+) -> impl IntoResponse {
+    match state.service.set_max_relay(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

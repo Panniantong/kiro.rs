@@ -16,8 +16,10 @@ import {
   setDefaultRpm,
   getArmorBreaking,
   setArmorBreaking,
+  getMaxRelay,
+  setMaxRelay,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, SetMaxRelayRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -184,6 +186,25 @@ export function useSetArmorBreaking() {
     mutationFn: setArmorBreaking,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['armorBreaking'] })
+    },
+  })
+}
+
+// 获取上游 Max 渠道透传配置
+export function useMaxRelay() {
+  return useQuery({
+    queryKey: ['maxRelay'],
+    queryFn: getMaxRelay,
+  })
+}
+
+// 设置上游 Max 渠道透传配置
+export function useSetMaxRelay() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetMaxRelayRequest) => setMaxRelay(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['maxRelay'] })
     },
   })
 }
