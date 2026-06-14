@@ -42,9 +42,11 @@ use super::websearch;
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
-    // 所有凭据均达 RPM 上限：对下游隐藏账号池细节，按通用上游不可用处理。
-    if err.downcast_ref::<AllRateLimitedError>().is_some() {
-        tracing::warn!(error = %err, "所有凭据均达 RPM 上限，返回通用上游不可用");
+    // 账号池耗尽/限流类错误不能向下游暴露库存数量、禁用数量或内部状态。
+    if err.downcast_ref::<AllRateLimitedError>().is_some()
+        || is_private_pool_exhaustion_error(&err_str)
+    {
+        tracing::warn!(error = %err, "账号池暂不可用，返回通用上游不可用");
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -89,6 +91,19 @@ fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+fn is_private_pool_exhaustion_error(err: &str) -> bool {
+    [
+        "所有凭据均已禁用",
+        "所有凭据均无法获取有效 Token",
+        "所有凭据均已达到 RPM 上限",
+        "所有凭据均已达到每分钟请求上限",
+        "所有凭据已用尽",
+        "All upstream credentials",
+    ]
+    .iter()
+    .any(|needle| err.contains(needle))
 }
 
 /// GET /v1/models
@@ -1549,6 +1564,24 @@ mod tests {
             body["error"]["message"],
             "Upstream service temporarily unavailable. Please retry later."
         );
+    }
+
+    #[tokio::test]
+    async fn all_disabled_credentials_error_hides_pool_inventory() {
+        let response = map_provider_error(anyhow::anyhow!("所有凭据均已禁用（12/12）"));
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Upstream service temporarily unavailable. Please retry later."
+        );
+        let body_text = body.to_string();
+        assert!(!body_text.contains("12/12"));
+        assert!(!body_text.contains("凭据"));
     }
 
     #[test]
