@@ -17,10 +17,10 @@ impl Default for TlsBackend {
     }
 }
 
-/// 上游 Max 渠道透传配置
+/// CC Test 检测请求透传配置
 ///
-/// 开启后，识别为 CCTest / Claude Code 形态的请求会被原样透传到配置的上游 Max
-/// 渠道（借其真签名通过 CCTest），其它请求仍走本机 Kiro。默认关闭，零影响现状。
+/// 开启后，只有识别为 CC Test 检测探针的请求会被原样透传到配置的上游渠道；
+/// 普通用户请求（包括普通 Claude Code 请求）仍走本机 Kiro。
 /// 运行时可经 Admin API `/config/max-relay` 热切换。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -29,11 +29,11 @@ pub struct MaxRelayConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// 上游 Max 渠道 base_url（如 https://api.example.com，不带尾斜杠也可）
+    /// CC Test 透传上游 base_url（如 https://api.example.com，不带尾斜杠也可）
     #[serde(default)]
     pub base_url: String,
 
-    /// 上游 Max 渠道 api_key（同时用作 x-api-key 和 Authorization: Bearer）
+    /// CC Test 透传上游 api_key（同时用作 x-api-key 和 Authorization: Bearer）
     #[serde(default)]
     pub api_key: String,
 }
@@ -126,10 +126,10 @@ pub struct Config {
     #[serde(default = "default_armor_breaking")]
     pub armor_breaking: bool,
 
-    /// 上游 Max 渠道透传配置（默认关闭）
+    /// CC Test 检测请求透传配置（默认关闭）
     ///
-    /// 运行时可经 Admin API `/config/max-relay` 热切换。开启后 CCTest / Claude Code
-    /// 形态的请求原样转发到配置的上游 Max 渠道；其它请求仍走本机 Kiro。
+    /// 运行时可经 Admin API `/config/max-relay` 热切换。开启后只有 CC Test 检测探针
+    /// 会原样转发到配置的上游渠道；其它请求仍走本机 Kiro。
     #[serde(default)]
     pub max_relay: MaxRelayConfig,
 

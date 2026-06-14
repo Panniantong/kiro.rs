@@ -98,7 +98,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setCurrentPage(1)
   }, [data?.credentials.length])
 
-  // 上游 Max 渠道透传配置加载后回填到本地表单
+  // CC Test 透传配置加载后回填到本地表单
   useEffect(() => {
     if (maxRelayData) {
       setMaxRelayEnabled(maxRelayData.enabled)
@@ -582,20 +582,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
-  // 保存上游 Max 渠道透传配置
+  // 保存 CC Test 透传配置
   const handleMaxRelaySave = () => {
     const baseUrl = maxRelayBaseUrl.trim()
     const apiKey = maxRelayApiKey.trim()
     // 开启透传时要求 base_url 和 api_key 都填好，避免开了但配置不全
     if (maxRelayEnabled && (baseUrl === '' || apiKey === '')) {
-      toast.error('开启透传前请填写 base_url 和 api_key')
+      toast.error('开启 CC Test 透传前请填写 base_url 和 api_key')
       return
     }
     setMaxRelay(
       { enabled: maxRelayEnabled, baseUrl, apiKey },
       {
         onSuccess: () => {
-          toast.success(maxRelayEnabled ? '已保存并开启 Max 渠道透传' : '已保存（Max 渠道透传关闭）')
+          toast.success(maxRelayEnabled ? '已保存并开启 CC Test 透传' : '已保存（CC Test 透传关闭）')
         },
         onError: (error) => {
           toast.error(`保存失败: ${extractErrorMessage(error)}`)
@@ -807,17 +807,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </CardContent>
         </Card>
 
-        {/* 上游 Max 渠道透传配置 */}
+        {/* CC Test 透传配置 */}
         <Card className="mb-6">
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Network className="h-4 w-4 text-muted-foreground" />
-              上游 Max 渠道透传
+              CC Test 透传
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
             <p className="text-xs text-muted-foreground">
-              开启后，识别为 CCTest / Claude Code 形态的请求会原样透传到下方配置的上游 Max 渠道（借其真签名通过 CCTest）；其它请求仍走本机 Kiro。默认关闭，不影响现状。
+              开启后，只有识别出的 CC Test 检测请求会原样透传到下方配置的上游渠道；普通用户请求仍走本机 Kiro。
             </p>
             <div className="space-y-1">
               <label className="text-xs font-medium text-muted-foreground">base_url</label>
@@ -835,7 +835,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 type="password"
                 value={maxRelayApiKey}
                 onChange={(e) => setMaxRelayApiKey(e.target.value)}
-                placeholder="上游 Max 渠道密钥"
+                placeholder="CC Test 透传上游密钥"
                 className="h-9 text-sm"
                 autoComplete="new-password"
               />

@@ -114,7 +114,7 @@ export interface SetDefaultRpmRequest {
   defaultRpm: number | null
 }
 
-// 上游 Max 渠道透传配置
+// CC Test 透传配置
 export interface MaxRelayResponse {
   enabled: boolean
   baseUrl: string

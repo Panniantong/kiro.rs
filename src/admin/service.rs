@@ -408,7 +408,7 @@ impl AdminService {
         })
     }
 
-    /// 获取上游 Max 渠道透传配置
+    /// 获取 CC Test 透传配置
     pub fn get_max_relay(&self) -> MaxRelayResponse {
         let cfg = self.token_manager.get_max_relay();
         MaxRelayResponse {
@@ -418,7 +418,7 @@ impl AdminService {
         }
     }
 
-    /// 设置上游 Max 渠道透传配置
+    /// 设置 CC Test 透传配置
     pub fn set_max_relay(
         &self,
         req: SetMaxRelayRequest,

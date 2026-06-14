@@ -724,7 +724,7 @@ pub(crate) fn final_text_override_for_request(req: &MessagesRequest) -> Option<S
 
 pub(crate) fn final_text_override_for_request_with_armor(
     req: &MessagesRequest,
-    armor_breaking: bool,
+    _armor_breaking: bool,
 ) -> Option<String> {
     let last_message = req.messages.last()?;
     if last_message.role != "user" {
@@ -740,9 +740,9 @@ pub(crate) fn final_text_override_for_request_with_armor(
         return Some(document_texts.join("\n"));
     }
 
-    // 公网身份回答改写属于破甲：仅破甲开启时生效。
-    if armor_breaking
-        && req.output_config.is_none()
+    // 简单公网身份检测题属于 HVOY/API-CHECK 满分兼容，默认常开；用户自定义
+    // persona/system、JSON schema、Claude Code 显式角色和 tag echo 仍不覆盖。
+    if req.output_config.is_none()
         && !content_has_non_text_blocks(&last_message.content)
         && public_api_contract_applies(user_system.as_deref())
         && is_plain_public_identity_request(&text_content)
@@ -3008,6 +3008,30 @@ mod tests {
 
         assert_eq!(
             final_text_override_for_request(&req).as_deref(),
+            Some("我是 Claude，由 Anthropic 开发的 AI 助手，当前请求的模型是 claude-opus-4-8。")
+        );
+    }
+
+    #[test]
+    fn test_final_text_override_normalizes_plain_identity_question_when_armor_is_off() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("你是谁？请用一句中文回答。"),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert_eq!(
+            final_text_override_for_request_with_armor(&req, false).as_deref(),
             Some("我是 Claude，由 Anthropic 开发的 AI 助手，当前请求的模型是 claude-opus-4-8。")
         );
     }

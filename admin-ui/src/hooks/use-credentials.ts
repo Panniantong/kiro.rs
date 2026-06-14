@@ -190,7 +190,7 @@ export function useSetArmorBreaking() {
   })
 }
 
-// 获取上游 Max 渠道透传配置
+// 获取 CC Test 透传配置
 export function useMaxRelay() {
   return useQuery({
     queryKey: ['maxRelay'],
@@ -198,7 +198,7 @@ export function useMaxRelay() {
   })
 }
 
-// 设置上游 Max 渠道透传配置
+// 设置 CC Test 透传配置
 export function useSetMaxRelay() {
   const queryClient = useQueryClient()
   return useMutation({

@@ -209,14 +209,14 @@ pub async fn set_armor_breaking(
 }
 
 /// GET /api/admin/config/max-relay
-/// 获取上游 Max 渠道透传配置
+/// 获取 CC Test 透传配置
 pub async fn get_max_relay(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_max_relay();
     Json(response)
 }
 
 /// PUT /api/admin/config/max-relay
-/// 设置上游 Max 渠道透传配置
+/// 设置 CC Test 透传配置
 pub async fn set_max_relay(
     State(state): State<AdminState>,
     Json(payload): Json<SetMaxRelayRequest>,

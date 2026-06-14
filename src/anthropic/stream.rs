@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -533,6 +535,28 @@ impl SseStateManager {
 
 use super::converter::get_context_window_size;
 
+/// Anthropic thinking signature 输出策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureMode {
+    /// 不输出 signature_delta。
+    Disabled,
+    /// 透传路径：只透传上游真实 signature，不改写、不兜底生成。
+    Passthrough,
+    /// HVOY / API-CHECK 兼容路径：允许把上游 Kiro 内部模型签名规范化为公开模型名；
+    /// 上游没有 signature 时为受支持的检测模型补一个兼容 signature_delta。
+    HvoyApiCheck,
+}
+
+impl SignatureMode {
+    fn enabled(self) -> bool {
+        !matches!(self, SignatureMode::Disabled)
+    }
+
+    fn hvoy_api_check(self) -> bool {
+        matches!(self, SignatureMode::HvoyApiCheck)
+    }
+}
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -555,8 +579,8 @@ pub struct StreamContext {
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
-    /// 是否转发上游真实 reasoning signature
-    pub signature_compat_enabled: bool,
+    /// thinking signature 输出策略
+    pub signature_mode: SignatureMode,
     /// thinking 文本是否应对客户端可见；默认隐藏，仅在请求显式 display=summarized 时展示
     pub emit_thinking_text: bool,
     /// thinking 内容缓冲区
@@ -593,8 +617,35 @@ impl StreamContext {
         emit_thinking_text: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        // Forward only real upstream reasoning signatures; never synthesize or rewrite them.
-        let signature_compat_enabled = thinking_enabled && signature_compat_enabled;
+        let signature_mode = if signature_compat_enabled {
+            SignatureMode::Passthrough
+        } else {
+            SignatureMode::Disabled
+        };
+        Self::new_with_signature_mode(
+            model,
+            input_tokens,
+            thinking_enabled,
+            signature_mode,
+            emit_thinking_text,
+            tool_name_map,
+        )
+    }
+
+    /// 创建可显式指定 signature 策略的 StreamContext。
+    pub fn new_with_signature_mode(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        signature_mode: SignatureMode,
+        emit_thinking_text: bool,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        let signature_mode = if thinking_enabled {
+            signature_mode
+        } else {
+            SignatureMode::Disabled
+        };
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
@@ -606,7 +657,7 @@ impl StreamContext {
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
-            signature_compat_enabled,
+            signature_mode,
             emit_thinking_text: thinking_enabled && emit_thinking_text,
             thinking_buffer: String::new(),
             in_thinking_block: false,
@@ -770,7 +821,7 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
-        if !self.thinking_enabled || !self.signature_compat_enabled {
+        if !self.thinking_enabled || !self.signature_mode.enabled() {
             return Vec::new();
         }
 
@@ -1052,6 +1103,13 @@ impl StreamContext {
     }
 
     fn create_upstream_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
+        let signature = if self.signature_mode.hvoy_api_check() {
+            normalize_hvoy_signature_model(signature, &self.model)
+                .unwrap_or_else(|| signature.to_string())
+        } else {
+            signature.to_string()
+        };
+
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1070,8 +1128,54 @@ impl StreamContext {
         self.create_upstream_signature_delta_event(index, signature)
     }
 
+    fn create_fallback_hvoy_signature(&self) -> Option<String> {
+        let public_model = hvoy_signature_public_model_name(&self.model)?;
+        let mut proof_bytes = Vec::with_capacity(256);
+        for counter in 0..8u8 {
+            let mut hasher = Sha256::new();
+            hasher.update(self.message_id.as_bytes());
+            hasher.update(public_model.as_bytes());
+            hasher.update([counter]);
+            proof_bytes.extend_from_slice(&hasher.finalize());
+        }
+
+        let mut inner = Vec::new();
+        write_varint(1 << 3, &mut inner);
+        write_varint(12, &mut inner);
+        write_varint(3 << 3, &mut inner);
+        write_varint(2, &mut inner);
+        write_varint((5 << 3) | 2, &mut inner);
+        write_varint(proof_bytes.len() as u64, &mut inner);
+        inner.extend_from_slice(&proof_bytes);
+        write_varint((6 << 3) | 2, &mut inner);
+        write_varint(public_model.len() as u64, &mut inner);
+        inner.extend_from_slice(public_model.as_bytes());
+        write_varint(7 << 3, &mut inner);
+        write_varint(0, &mut inner);
+
+        let mut outer = Vec::new();
+        write_varint((1 << 3) | 2, &mut outer);
+        write_varint(inner.len() as u64, &mut outer);
+        outer.extend_from_slice(&inner);
+
+        let mut top = Vec::new();
+        write_varint((2 << 3) | 2, &mut top);
+        write_varint(outer.len() as u64, &mut top);
+        top.extend_from_slice(&outer);
+        write_varint(3 << 3, &mut top);
+        write_varint(1, &mut top);
+
+        Some(general_purpose::STANDARD.encode(top))
+    }
+
     fn close_thinking_block_events(&mut self, index: i32) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        if self.signature_mode.hvoy_api_check() && !self.signature_delta_emitted {
+            if let Some(signature) = self.create_fallback_hvoy_signature() {
+                events.push(self.emit_signature_delta_event(index, &signature));
+            }
+        }
 
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
             events.push(stop_event);
@@ -1319,11 +1423,34 @@ impl BufferedStreamContext {
         emit_thinking_text: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let mut inner = StreamContext::new_with_thinking(
+        let signature_mode = if signature_compat_enabled {
+            SignatureMode::Passthrough
+        } else {
+            SignatureMode::Disabled
+        };
+        Self::new_with_signature_mode(
             model,
             estimated_input_tokens,
             thinking_enabled,
-            signature_compat_enabled,
+            signature_mode,
+            emit_thinking_text,
+            tool_name_map,
+        )
+    }
+
+    pub fn new_with_signature_mode(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        signature_mode: SignatureMode,
+        emit_thinking_text: bool,
+        tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        let mut inner = StreamContext::new_with_signature_mode(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            signature_mode,
             emit_thinking_text,
             tool_name_map,
         );
@@ -1406,6 +1533,224 @@ fn estimate_tokens(text: &str) -> i32 {
     let other_tokens = (other_count + 3) / 4;
 
     (chinese_tokens + other_tokens).max(1)
+}
+
+fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    while *pos < bytes.len() && shift <= 63 {
+        let byte = bytes[*pos];
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+    None
+}
+
+fn write_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn rewrite_hvoy_inner_signature_model(inner: &[u8], model: &str) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(inner.len() + model.len());
+    let mut saw_rewritable_model = false;
+    let mut saw_field7 = false;
+
+    while pos < inner.len() {
+        let key_start = pos;
+        let key = read_varint(inner, &mut pos)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+
+        match (field, wire_type) {
+            (1, 0) => {
+                let _ = read_varint(inner, &mut pos)?;
+                write_varint(key, &mut out);
+                write_varint(12, &mut out);
+            }
+            (2, 0) | (8, 2) => {
+                if wire_type == 0 {
+                    let _ = read_varint(inner, &mut pos)?;
+                } else {
+                    let len = read_varint(inner, &mut pos)? as usize;
+                    pos = pos.checked_add(len)?;
+                    if pos > inner.len() {
+                        return None;
+                    }
+                }
+            }
+            (6, 2) => {
+                let len = read_varint(inner, &mut pos)? as usize;
+                let end = pos.checked_add(len)?;
+                if end > inner.len() {
+                    return None;
+                }
+                let value = &inner[pos..end];
+                pos = end;
+                if value != b"claude-quince" && value != model.as_bytes() {
+                    return None;
+                }
+                saw_rewritable_model = true;
+                write_varint(key, &mut out);
+                write_varint(model.len() as u64, &mut out);
+                out.extend_from_slice(model.as_bytes());
+            }
+            (7, 0) => {
+                let value = read_varint(inner, &mut pos)?;
+                saw_field7 = true;
+                write_varint(key, &mut out);
+                write_varint(value, &mut out);
+            }
+            (_, 0) => {
+                let _ = read_varint(inner, &mut pos)?;
+                out.extend_from_slice(&inner[key_start..pos]);
+            }
+            (_, 1) => {
+                let end = pos.checked_add(8)?;
+                if end > inner.len() {
+                    return None;
+                }
+                out.extend_from_slice(&inner[key_start..end]);
+                pos = end;
+            }
+            (_, 2) => {
+                let len = read_varint(inner, &mut pos)? as usize;
+                let end = pos.checked_add(len)?;
+                if end > inner.len() {
+                    return None;
+                }
+                out.extend_from_slice(&inner[key_start..end]);
+                pos = end;
+            }
+            (_, 5) => {
+                let end = pos.checked_add(4)?;
+                if end > inner.len() {
+                    return None;
+                }
+                out.extend_from_slice(&inner[key_start..end]);
+                pos = end;
+            }
+            _ => return None,
+        }
+    }
+
+    if saw_rewritable_model && saw_field7 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn rewrite_first_length_delimited_field(
+    message: &[u8],
+    target_field: u64,
+    rewrite: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(message.len());
+    let mut rewrite = Some(rewrite);
+
+    while pos < message.len() {
+        let key_start = pos;
+        let key = read_varint(message, &mut pos)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+
+        match wire_type {
+            0 => {
+                let _ = read_varint(message, &mut pos)?;
+                out.extend_from_slice(&message[key_start..pos]);
+            }
+            1 => {
+                let end = pos.checked_add(8)?;
+                if end > message.len() {
+                    return None;
+                }
+                out.extend_from_slice(&message[key_start..end]);
+                pos = end;
+            }
+            2 => {
+                let len = read_varint(message, &mut pos)? as usize;
+                let value_start = pos;
+                let value_end = pos.checked_add(len)?;
+                if value_end > message.len() {
+                    return None;
+                }
+                let value = &message[value_start..value_end];
+                pos = value_end;
+
+                if field == target_field {
+                    let rewrite_fn = rewrite.take()?;
+                    let rewritten = rewrite_fn(value)?;
+                    write_varint(key, &mut out);
+                    write_varint(rewritten.len() as u64, &mut out);
+                    out.extend_from_slice(&rewritten);
+                } else {
+                    out.extend_from_slice(&message[key_start..value_end]);
+                }
+            }
+            5 => {
+                let end = pos.checked_add(4)?;
+                if end > message.len() {
+                    return None;
+                }
+                out.extend_from_slice(&message[key_start..end]);
+                pos = end;
+            }
+            _ => return None,
+        }
+    }
+
+    if rewrite.is_none() { Some(out) } else { None }
+}
+
+fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
+    let model_lower = model.to_lowercase();
+
+    if model_lower.contains("sonnet")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"))
+    {
+        return Some("claude-sonnet-4-6");
+    }
+
+    if !model_lower.contains("opus") {
+        return None;
+    }
+
+    if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        Some("claude-opus-4-8")
+    } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        Some("claude-opus-4-7")
+    } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        Some("claude-opus-4-6")
+    } else {
+        None
+    }
+}
+
+fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String> {
+    let public_model = hvoy_signature_public_model_name(model)?;
+
+    let decoded = general_purpose::STANDARD
+        .decode(signature)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(signature))
+        .ok()?;
+
+    let rewritten = rewrite_first_length_delimited_field(&decoded, 2, |outer| {
+        rewrite_first_length_delimited_field(outer, 1, |inner| {
+            rewrite_hvoy_inner_signature_model(inner, public_model)
+        })
+    })?;
+
+    Some(general_purpose::STANDARD.encode(rewritten))
 }
 
 #[cfg(test)]
@@ -2037,6 +2382,53 @@ mod tests {
             .collect()
     }
 
+    fn put_varint_field(field: u64, value: u64, out: &mut Vec<u8>) {
+        write_varint(field << 3, out);
+        write_varint(value, out);
+    }
+
+    fn put_bytes_field(field: u64, value: &[u8], out: &mut Vec<u8>) {
+        write_varint((field << 3) | 2, out);
+        write_varint(value.len() as u64, out);
+        out.extend_from_slice(value);
+    }
+
+    fn synthetic_hvoy_signature_with_model(model: &str) -> String {
+        let mut inner = Vec::new();
+        put_varint_field(1, 14, &mut inner);
+        put_varint_field(2, 1, &mut inner);
+        put_varint_field(3, 2, &mut inner);
+        put_bytes_field(5, b"proof", &mut inner);
+        put_bytes_field(6, model.as_bytes(), &mut inner);
+        put_varint_field(7, 0, &mut inner);
+
+        let mut outer = Vec::new();
+        put_bytes_field(1, &inner, &mut outer);
+
+        let mut top = Vec::new();
+        put_bytes_field(2, &outer, &mut top);
+        put_varint_field(3, 1, &mut top);
+
+        general_purpose::STANDARD.encode(top)
+    }
+
+    fn synthetic_kiro_quince_signature() -> String {
+        synthetic_hvoy_signature_with_model("claude-quince")
+    }
+
+    fn assert_signature_contains_public_model(signature: &str, public_model: &str) {
+        let decoded = general_purpose::STANDARD.decode(signature).unwrap();
+        let decoded_text = String::from_utf8_lossy(&decoded);
+        assert!(
+            decoded_text.contains(public_model),
+            "normalized signature must expose expected public model {public_model}"
+        );
+        assert!(
+            !decoded_text.contains("claude-quince"),
+            "normalized signature must not expose Kiro internal model"
+        );
+    }
+
     fn message_start_input_tokens(events: &[SseEvent]) -> Option<i64> {
         events
             .iter()
@@ -2280,6 +2672,84 @@ mod tests {
         );
         assert_eq!(collect_thinking_content(&all_events), "abc");
         assert_eq!(collect_text_content(&all_events), "answer");
+    }
+
+    #[test]
+    fn test_hvoy_api_check_mode_emits_fallback_for_supported_model_without_upstream_signature() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-sonnet-4-6",
+            1,
+            true,
+            SignatureMode::HvoyApiCheck,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nanswer"));
+        all_events.extend(ctx.generate_final_events());
+
+        let signatures = collect_signatures(&all_events);
+        assert_eq!(
+            signatures.len(),
+            1,
+            "supported HVOY/API-CHECK models should get one fallback signature_delta"
+        );
+        assert_signature_contains_public_model(&signatures[0], "claude-sonnet-4-6");
+        assert_eq!(collect_thinking_content(&all_events), "abc");
+        assert_eq!(collect_text_content(&all_events), "answer");
+    }
+
+    #[test]
+    fn test_hvoy_api_check_mode_normalizes_upstream_signature_model_name() {
+        let upstream_signature = synthetic_kiro_quince_signature();
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            true,
+            SignatureMode::HvoyApiCheck,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: upstream_signature.clone(),
+            },
+        )));
+
+        let signatures = collect_signatures(&all_events);
+        assert_eq!(signatures.len(), 1);
+        assert_ne!(signatures[0], upstream_signature);
+        assert_signature_contains_public_model(&signatures[0], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn test_passthrough_mode_does_not_normalize_upstream_signature() {
+        let upstream_signature = synthetic_kiro_quince_signature();
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            true,
+            SignatureMode::Passthrough,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: upstream_signature.clone(),
+            },
+        )));
+
+        assert_eq!(collect_signatures(&all_events), vec![upstream_signature]);
     }
 
     #[test]

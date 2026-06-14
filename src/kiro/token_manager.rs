@@ -590,7 +590,7 @@ pub struct MultiTokenManager {
     default_rpm: Mutex<Option<u32>>,
     /// 破甲模式开关（运行时可修改，默认 false = 最小满分版）
     armor_breaking: Mutex<bool>,
-    /// 上游 Max 渠道透传配置（运行时可修改，默认关闭）
+    /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
@@ -2472,7 +2472,7 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取上游 Max 渠道透传配置（Admin API）
+    /// 获取 CC Test 透传配置（Admin API）
     pub fn get_max_relay(&self) -> MaxRelayConfig {
         self.max_relay.lock().clone()
     }
@@ -2484,7 +2484,7 @@ impl MultiTokenManager {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!(
-                    "配置文件路径未知，上游 Max 渠道透传配置仅在当前进程生效: enabled={}",
+                    "配置文件路径未知，CC Test 透传配置仅在当前进程生效: enabled={}",
                     cfg.enabled
                 );
                 return Ok(());
@@ -2494,14 +2494,14 @@ impl MultiTokenManager {
         let mut config = Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.max_relay = cfg.clone();
-        config.save().with_context(|| {
-            format!("持久化上游 Max 渠道透传配置失败: {}", config_path.display())
-        })?;
+        config
+            .save()
+            .with_context(|| format!("持久化 CC Test 透传配置失败: {}", config_path.display()))?;
 
         Ok(())
     }
 
-    /// 设置上游 Max 渠道透传配置（Admin API，热改并持久化，失败回滚）
+    /// 设置 CC Test 透传配置（Admin API，热改并持久化，失败回滚）
     pub fn set_max_relay(&self, cfg: MaxRelayConfig) -> anyhow::Result<()> {
         let previous = self.get_max_relay();
         *self.max_relay.lock() = cfg.clone();
@@ -2512,7 +2512,7 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "上游 Max 渠道透传配置已更新: enabled={} base_url={}",
+            "CC Test 透传配置已更新: enabled={} base_url={}",
             cfg.enabled,
             cfg.base_url
         );

@@ -156,13 +156,13 @@ export async function setArmorBreaking(enabled: boolean): Promise<{ enabled: boo
   return data
 }
 
-// 获取上游 Max 渠道透传配置
+// 获取 CC Test 透传配置
 export async function getMaxRelay(): Promise<MaxRelayResponse> {
   const { data } = await api.get<MaxRelayResponse>('/config/max-relay')
   return data
 }
 
-// 设置上游 Max 渠道透传配置
+// 设置 CC Test 透传配置
 export async function setMaxRelay(req: SetMaxRelayRequest): Promise<MaxRelayResponse> {
   const { data } = await api.put<MaxRelayResponse>('/config/max-relay', req)
   return data

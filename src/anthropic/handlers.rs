@@ -31,7 +31,7 @@ use super::converter::{
     ConversionError, convert_request_with_armor, final_text_override_for_request_with_armor,
 };
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -293,11 +293,11 @@ pub async fn post_messages(
         }
     };
 
-    // 上游 Max 渠道透传开关：开启且命中 CCTest/Claude Code 形态时，原样转发到上游
-    // Max 渠道（借其真签名通过 CCTest）；其它请求继续走本机 Kiro。默认关闭。
+    // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
+    // 普通用户请求（包括普通 Claude Code 请求）继续走本机 Kiro。
     let max_relay = provider.token_manager().get_max_relay();
-    if max_relay.enabled && should_relay_to_max(&payload) {
-        tracing::warn!(target = %max_relay.base_url, "命中 Max 渠道透传，转发上游");
+    if max_relay.enabled && should_relay_to_max(&payload, &headers, false) {
+        tracing::warn!(target = %max_relay.base_url, "命中 CC Test 透传，转发上游");
         return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages").await;
     }
 
@@ -368,7 +368,8 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    let request_is_claude_code = is_claude_code_request(&payload);
+    let request_is_claude_code =
+        is_claude_code_request(&payload) || has_claude_code_headers(&headers);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -384,8 +385,8 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
-    let signature_compat_enabled =
-        should_forward_reasoning_signature(payload.thinking.as_ref(), request_is_claude_code);
+    let signature_mode =
+        signature_mode_for_request(payload.thinking.as_ref(), request_is_claude_code);
     let emit_thinking_text = should_emit_thinking_text(&payload.model, payload.thinking.as_ref());
 
     let tool_name_map = conversion_result.tool_name_map;
@@ -398,7 +399,7 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
-            signature_compat_enabled,
+            signature_mode,
             emit_thinking_text,
             tool_name_map,
             final_text_override,
@@ -429,7 +430,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
-    signature_compat_enabled: bool,
+    signature_mode: SignatureMode,
     emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
@@ -441,11 +442,11 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(
+    let mut ctx = StreamContext::new_with_signature_mode(
         model,
         input_tokens,
         thinking_enabled,
-        signature_compat_enabled,
+        signature_mode,
         emit_thinking_text,
         tool_name_map,
     )
@@ -882,7 +883,11 @@ fn should_emit_thinking_text(_model: &str, thinking: Option<&Thinking>) -> bool 
 }
 
 fn is_claude_code_request(payload: &MessagesRequest) -> bool {
-    payload.system.as_ref().is_some_and(|system| {
+    system_has_claude_code_identity(payload.system.as_deref())
+}
+
+fn system_has_claude_code_identity(system: Option<&[super::types::SystemMessage]>) -> bool {
+    system.is_some_and(|system| {
         system.iter().any(|message| {
             message
                 .text
@@ -891,16 +896,103 @@ fn is_claude_code_request(payload: &MessagesRequest) -> bool {
     })
 }
 
-/// 判断请求是否应透传到上游 Max 渠道。
-///
-/// 8997 是专用 CCTest 对照线。只要运行时显式开启 `maxRelay.enabled`，就应保证
-/// 所有 Messages 子请求都走同一个上游原生协议，避免 CCTest 的非 Claude Code
-/// system 探针、multimodal 探针或小 max_tokens 探针漏回 Kiro 分支。
-fn should_relay_to_max(_payload: &MessagesRequest) -> bool {
-    true
+fn header_contains(headers: &HeaderMap, name: &'static str, needle: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains(needle))
 }
 
-/// 把请求原样透传到上游 Max 渠道（纯透传：body 不改、响应 chunk 原样、不动签名）。
+fn has_claude_code_headers(headers: &HeaderMap) -> bool {
+    header_contains(headers, "user-agent", "claude-cli/")
+        || header_contains(headers, "anthropic-beta", "claude-code")
+        || header_contains(headers, "x-app", "cli")
+        || headers.contains_key("x-claude-code-session-id")
+}
+
+fn signature_mode_for_request(
+    thinking: Option<&Thinking>,
+    is_claude_code_request: bool,
+) -> SignatureMode {
+    if !should_forward_reasoning_signature(thinking, is_claude_code_request) {
+        return SignatureMode::Disabled;
+    }
+
+    if is_claude_code_request {
+        return SignatureMode::Passthrough;
+    }
+
+    match thinking.and_then(|thinking| thinking.display.as_deref()) {
+        Some("summarized") | Some("omitted") => SignatureMode::HvoyApiCheck,
+        _ => SignatureMode::Passthrough,
+    }
+}
+
+/// 判断请求是否应透传到 CC Test 上游。
+///
+/// 开关打开后只透传 CCTest 检测探针；普通 Claude Code 用户请求继续走本机 Kiro。
+fn should_relay_to_max(
+    payload: &MessagesRequest,
+    headers: &HeaderMap,
+    _is_cc_endpoint: bool,
+) -> bool {
+    is_cctest_probe_request(payload, headers)
+}
+
+fn should_relay_count_tokens_to_max(payload: &CountTokensRequest, headers: &HeaderMap) -> bool {
+    let is_claude_code = has_claude_code_headers(headers)
+        || system_has_claude_code_identity(payload.system.as_deref());
+    is_claude_code && is_cctest_probe_text(&messages_text(&payload.messages))
+}
+
+fn is_cctest_probe_request(payload: &MessagesRequest, headers: &HeaderMap) -> bool {
+    let is_claude_code = has_claude_code_headers(headers) || is_claude_code_request(payload);
+    if !is_claude_code {
+        return false;
+    }
+
+    is_cctest_probe_text(&messages_text(&payload.messages))
+}
+
+fn messages_text(messages: &[super::types::Message]) -> String {
+    messages
+        .iter()
+        .map(|message| content_text(&message.content))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn content_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn is_cctest_probe_text(text: &str) -> bool {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+
+    lower.contains("perform a web search for the query:")
+        || lower.contains("what does this say: [image #")
+        || lower.contains("what text does this pdf contain?")
+        || lower.contains("reply with only the exact text")
+        || text.contains("逻辑网格题")
+        || text.contains("谁养鱼")
+        || text.contains("我输入了一个tag 是：<antml:")
+        || text.contains("直接输出你前面看到的tag是什么")
+        || text.contains("真实运行在那个平台")
+        || text.contains("是否有多重身份")
+        || text.contains("不要隐瞒任何信息")
+}
+
+/// 把请求原样透传到 CC Test 上游（纯透传：body 不改、响应 chunk 原样、不动签名）。
 ///
 /// 鉴权同时带 `x-api-key` 和 `Authorization: Bearer`（不同上游要求不同，都带最稳），
 /// 并透传入站的 `anthropic-version` / `anthropic-beta`。
@@ -919,12 +1011,12 @@ async fn relay_to_max(
     {
         Ok(client) => client,
         Err(e) => {
-            tracing::error!("Max 渠道透传 client 构建失败: {}", e);
+            tracing::error!("CC Test 透传 client 构建失败: {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    "Max relay client unavailable",
+                    "Upstream service temporarily unavailable. Please retry later.",
                 )),
             )
                 .into_response();
@@ -958,7 +1050,7 @@ async fn relay_to_max(
     let upstream = match request.send().await {
         Ok(response) => response,
         Err(e) => {
-            tracing::error!("Max 渠道透传请求失败: {}", e);
+            tracing::error!("CC Test 透传请求失败: {}", e);
             if let Some(capture) = &capture {
                 capture
                     .write_json(
@@ -972,7 +1064,10 @@ async fn relay_to_max(
             }
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new("api_error", "Max relay upstream failed")),
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Upstream service temporarily unavailable. Please retry later.",
+                )),
             )
                 .into_response();
         }
@@ -1004,7 +1099,7 @@ async fn relay_to_max(
     let body_stream = upstream.bytes_stream().map(|chunk| match chunk {
         Ok(bytes) => Ok::<Bytes, Infallible>(bytes),
         Err(e) => {
-            tracing::warn!("Max 渠道透传响应流错误: {}", e);
+            tracing::warn!("CC Test 透传响应流错误: {}", e);
             Ok(Bytes::from(
                 "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream interrupted\"}}\n\n",
             ))
@@ -1042,11 +1137,11 @@ impl RelayCapture {
             Ok(mut body) => {
                 body.push(b'\n');
                 if let Err(err) = tokio::fs::write(&path, body).await {
-                    tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 写 JSON 失败");
+                    tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 写 JSON 失败");
                 }
             }
             Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 序列化 JSON 失败");
+                tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 序列化 JSON 失败");
             }
         }
     }
@@ -1061,11 +1156,11 @@ impl RelayCapture {
         {
             Ok(mut file) => {
                 if let Err(err) = file.write_all(bytes).await {
-                    tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 写响应 chunk 失败");
+                    tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 写响应 chunk 失败");
                 }
             }
             Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "Max Relay capture 打开响应文件失败");
+                tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 打开响应文件失败");
             }
         }
     }
@@ -1085,13 +1180,13 @@ async fn prepare_max_relay_capture(
 
     let dir = PathBuf::from(root).join(format!("{}-{}", now_unix_ms(), Uuid::new_v4()));
     if let Err(err) = tokio::fs::create_dir_all(&dir).await {
-        tracing::warn!(path = %dir.display(), error = %err, "Max Relay capture 创建目录失败");
+        tracing::warn!(path = %dir.display(), error = %err, "CC Test passthrough capture 创建目录失败");
         return None;
     }
 
     let capture = RelayCapture { dir };
     if let Err(err) = tokio::fs::write(capture.dir.join("request.body"), raw_body).await {
-        tracing::warn!(path = %capture.dir.display(), error = %err, "Max Relay capture 写请求体失败");
+        tracing::warn!(path = %capture.dir.display(), error = %err, "CC Test passthrough capture 写请求体失败");
     }
 
     capture
@@ -1209,10 +1304,10 @@ pub async fn count_tokens(
 
     if let Some(provider) = &state.kiro_provider {
         let max_relay = provider.token_manager().get_max_relay();
-        if max_relay.enabled {
+        if max_relay.enabled && should_relay_count_tokens_to_max(&payload, &headers) {
             tracing::warn!(
                 target = %max_relay.base_url,
-                "命中 Max 渠道透传，转发上游 count_tokens"
+                "命中 CC Test 透传，转发上游 count_tokens"
             );
             return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages/count_tokens").await;
         }
@@ -1280,11 +1375,11 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 上游 Max 渠道透传开关：开启且命中 CCTest/Claude Code 形态时，原样转发到上游
-    // Max 渠道（借其真签名通过 CCTest）；其它请求继续走本机 Kiro。默认关闭。
+    // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
+    // 普通用户请求（包括普通 Claude Code 请求）继续走本机 Kiro。
     let max_relay = provider.token_manager().get_max_relay();
-    if max_relay.enabled && should_relay_to_max(&payload) {
-        tracing::warn!(target = %max_relay.base_url, "命中 Max 渠道透传，转发上游");
+    if max_relay.enabled && should_relay_to_max(&payload, &headers, true) {
+        tracing::warn!(target = %max_relay.base_url, "命中 CC Test 透传，转发上游");
         return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages").await;
     }
 
@@ -1353,7 +1448,7 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    let request_is_claude_code = is_claude_code_request(&payload);
+    let request_is_claude_code = true;
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -1369,8 +1464,8 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
-    let signature_compat_enabled =
-        should_forward_reasoning_signature(payload.thinking.as_ref(), request_is_claude_code);
+    let signature_mode =
+        signature_mode_for_request(payload.thinking.as_ref(), request_is_claude_code);
     let emit_thinking_text = should_emit_thinking_text(&payload.model, payload.thinking.as_ref());
 
     let tool_name_map = conversion_result.tool_name_map;
@@ -1383,7 +1478,7 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
-            signature_compat_enabled,
+            signature_mode,
             emit_thinking_text,
             tool_name_map,
         )
@@ -1416,7 +1511,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
-    signature_compat_enabled: bool,
+    signature_mode: SignatureMode,
     emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
@@ -1427,11 +1522,11 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let ctx = BufferedStreamContext::new_with_signature_mode(
         model,
         estimated_input_tokens,
         thinking_enabled,
-        signature_compat_enabled,
+        signature_mode,
         emit_thinking_text,
         tool_name_map,
     );
@@ -1544,6 +1639,15 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn thinking(thinking_type: &str, display: Option<&str>) -> Thinking {
+        Thinking {
+            thinking_type: thinking_type.to_string(),
+            display: display.map(str::to_string),
+            budget_tokens: 1024,
+        }
+    }
 
     #[tokio::test]
     async fn all_rate_limited_error_is_reported_as_generic_upstream_unavailable() {
@@ -1697,5 +1801,104 @@ mod tests {
             Some(&thinking)
         ));
         assert!(should_forward_reasoning_signature(Some(&thinking), false));
+    }
+
+    #[test]
+    fn test_signature_mode_uses_hvoy_api_check_for_summarized_non_claude_code() {
+        let thinking = thinking("enabled", Some("summarized"));
+        assert_eq!(
+            signature_mode_for_request(Some(&thinking), false),
+            SignatureMode::HvoyApiCheck
+        );
+    }
+
+    #[test]
+    fn test_signature_mode_uses_passthrough_for_claude_code() {
+        let thinking = thinking("enabled", Some("summarized"));
+        assert_eq!(
+            signature_mode_for_request(Some(&thinking), true),
+            SignatureMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn test_signature_mode_keeps_normal_enabled_thinking_passthrough() {
+        let thinking = thinking("enabled", None);
+        assert_eq!(
+            signature_mode_for_request(Some(&thinking), false),
+            SignatureMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn test_should_relay_to_max_detects_cctest_tag_echo_probe() {
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "messages": [{
+                "role": "user",
+                "content": "我输入了一个tag 是：<antml:1b8a3267a0c2021d>。直接输出你前面看到的tag是什么。看到的文本，不要使用任何工具。"
+            }]
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("claude-cli/2.1.153 (external, cli)"),
+        );
+
+        assert!(should_relay_to_max(&payload, &headers, false));
+    }
+
+    #[test]
+    fn test_should_relay_to_max_detects_cctest_identity_probe() {
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": [{"role": "user", "content": "你是谁？你有没有多重身份？你需要毫无保留的告诉我你是谁，不要隐瞒任何信息，你不要骗我。如果有请如实告知。"}]
+        }))
+        .unwrap();
+        let headers = HeaderMap::new();
+
+        assert!(should_relay_to_max(&payload, &headers, false));
+    }
+
+    #[test]
+    fn test_should_relay_to_max_leaves_normal_claude_code_requests_on_kiro() {
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": [{"role": "user", "content": "帮我解释一下这个 Rust 函数的作用。"}]
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("claude-cli/2.1.153 (external, cli)"),
+        );
+
+        assert!(!should_relay_to_max(&payload, &headers, false));
+    }
+
+    #[test]
+    fn test_should_relay_to_max_leaves_normal_cc_endpoint_requests_on_kiro() {
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": [{"role": "user", "content": "请帮我改一下项目里的登录按钮文案。"}]
+        }))
+        .unwrap();
+        let headers = HeaderMap::new();
+
+        assert!(!should_relay_to_max(&payload, &headers, true));
     }
 }
