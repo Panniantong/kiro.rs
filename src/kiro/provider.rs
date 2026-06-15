@@ -176,6 +176,7 @@ impl KiroProvider {
                 }
             };
 
+            let start = std::time::Instant::now();
             let base = client
                 .post(&url)
                 .body(body)
@@ -187,7 +188,8 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "MCP 请求发送失败（尝试 {}/{}）: {}",
+                        "凭据 #{} MCP 请求发送失败（尝试 {}/{}）: {}",
+                        ctx.id,
                         attempt + 1,
                         max_retries,
                         e
@@ -203,6 +205,15 @@ impl KiroProvider {
             };
 
             let status = response.status();
+
+            tracing::info!(
+                "上游响应 凭据 #{} status={} ttfb_ms={} 尝试 {}/{}",
+                ctx.id,
+                status.as_u16(),
+                start.elapsed().as_millis(),
+                attempt + 1,
+                max_retries
+            );
 
             // 成功响应
             if status.is_success() {
@@ -385,6 +396,7 @@ impl KiroProvider {
                 }
             };
 
+            let start = std::time::Instant::now();
             let base = client
                 .post(&url)
                 .body(body)
@@ -396,7 +408,8 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
+                        "凭据 #{} API 请求发送失败（尝试 {}/{}）: {}",
+                        ctx.id,
                         attempt + 1,
                         max_retries,
                         e
@@ -414,6 +427,16 @@ impl KiroProvider {
             };
 
             let status = response.status();
+
+            tracing::info!(
+                "上游响应 凭据 #{} status={} ttfb_ms={} model={} 尝试 {}/{}",
+                ctx.id,
+                status.as_u16(),
+                start.elapsed().as_millis(),
+                model.as_deref().unwrap_or("?"),
+                attempt + 1,
+                max_retries
+            );
 
             // 成功响应
             if status.is_success() {
