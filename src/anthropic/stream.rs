@@ -2504,6 +2504,31 @@ mod tests {
     }
 
     #[test]
+    fn test_disabled_signature_mode_drops_upstream_reasoning_signature() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            true,
+            SignatureMode::Disabled,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: "hidden reasoning".to_string(),
+                signature: "upstream-signature-that-must-not-leak".to_string(),
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(collect_signatures(&all_events).is_empty());
+    }
+
+    #[test]
     fn test_upstream_reasoning_signature_is_forwarded_before_thinking_stop() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, true, true, true, HashMap::new());

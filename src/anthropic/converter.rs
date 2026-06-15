@@ -1202,10 +1202,20 @@ fn convert_tools(
 /// 生成thinking标签前缀
 fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
     if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" || t.thinking_type == "adaptive" {
+        if t.thinking_type == "enabled" {
             return Some(format!(
                 "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
                 t.budget_tokens
+            ));
+        } else if t.thinking_type == "adaptive" {
+            let effort = req
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str())
+                .unwrap_or("high");
+            return Some(format!(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
+                effort
             ));
         }
     }
@@ -2893,7 +2903,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_thinking_is_encoded_as_kiro_enabled_current_turn() {
+    fn test_adaptive_thinking_preserves_adaptive_effort_in_current_turn() {
         use crate::anthropic::types::{OutputConfig, Thinking};
 
         let req = MessagesRequest {
@@ -2925,12 +2935,12 @@ mod tests {
         assert!(
             current
                 .content
-                .starts_with("<thinking_mode>enabled</thinking_mode>")
+                .starts_with("<thinking_mode>adaptive</thinking_mode>")
         );
         assert!(
             current
                 .content
-                .contains("<max_thinking_length>1024</max_thinking_length>")
+                .contains("<thinking_effort>high</thinking_effort>")
         );
         assert!(current.content.contains("Thinking metadata request:"));
         assert!(current.content.contains("even for simple questions"));
