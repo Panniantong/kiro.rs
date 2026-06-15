@@ -35,6 +35,8 @@ export interface CredentialStatusItem {
   currentRpm: number
   peakRpm1h: number
   throttled1h: number
+  // AWS 侧超额状态（ENABLED / DISABLED；null/缺省 = 未知）
+  overageStatus?: string | null
 }
 
 // 余额响应
@@ -46,6 +48,11 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  // 超额（overage）信息（单位均为次数；overageRate 为美元/次）
+  overageStatus?: string | null
+  currentOverages: number
+  overageCap: number
+  overageRate: number
 }
 
 // 成功响应

@@ -207,6 +207,19 @@ export function CredentialCard({
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
+                {credential.overageStatus === 'ENABLED' && (
+                  <Badge variant="success">可超额</Badge>
+                )}
+                {credential.overageStatus === 'DISABLED' && (
+                  <Badge variant="secondary">不可超额</Badge>
+                )}
+                {credential.overageStatus === 'ENABLED' &&
+                  balance != null &&
+                  balance.currentUsage > balance.usageLimit && (
+                    <Badge variant="outline" className="border-amber-500 text-amber-600">
+                      超额中
+                    </Badge>
+                  )}
               </CardTitle>
             </div>
             <div className="flex items-center gap-2">
@@ -299,22 +312,35 @@ export function CredentialCard({
               </div>
             )}
             <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
+              <span className="text-muted-foreground">基础用量：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
               ) : balance ? (
                 <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+                  {Math.min(balance.currentUsage, balance.usageLimit).toFixed(0)} / {balance.usageLimit.toFixed(0)} 次
                   <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
+                    (剩余 {Math.max(0, balance.usageLimit - balance.currentUsage).toFixed(0)} 次)
                   </span>
                 </span>
               ) : (
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
+            {balance && balance.currentUsage > balance.usageLimit && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">超额用量：</span>
+                <span className="font-medium text-amber-600 ml-1">
+                  超额 {(balance.currentUsage - balance.usageLimit).toFixed(0)} 次
+                  {balance.overageCap > 0 && (
+                    <span className="text-xs text-muted-foreground ml-1">
+                      (上限 {balance.overageCap.toFixed(0)} 次)
+                    </span>
+                  )}
+                </span>
+              </div>
+            )}
             {credential.hasProxy && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>

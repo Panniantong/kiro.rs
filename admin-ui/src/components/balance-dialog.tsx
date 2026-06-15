@@ -22,8 +22,9 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
     return new Date(timestamp * 1000).toLocaleString('zh-CN')
   }
 
-  const formatNumber = (num: number) => {
-    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  // 用量单位是“次数”，按整数（带千分位）展示，避免误导成美元金额
+  const formatCount = (num: number) => {
+    return Math.round(num).toLocaleString('zh-CN')
   }
 
   return (
@@ -72,8 +73,8 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             {/* 使用进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>已使用: {formatCount(balance.currentUsage)} 次</span>
+                <span>限额: {formatCount(balance.usageLimit)} 次</span>
               </div>
               <Progress value={balance.usagePercentage} />
               <div className="text-center text-sm text-muted-foreground">
@@ -86,7 +87,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
               <div>
                 <span className="text-muted-foreground">剩余额度：</span>
                 <span className="font-medium text-green-600">
-                  ${formatNumber(balance.remaining)}
+                  {formatCount(balance.remaining)} 次
                 </span>
               </div>
               <div>
@@ -96,6 +97,63 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
                 </span>
               </div>
             </div>
+
+            {/* 超额信息 */}
+            {(() => {
+              const overageEnabled = balance.overageStatus === 'ENABLED'
+              const overageDisabled = balance.overageStatus === 'DISABLED'
+              const estimatedCost = balance.currentOverages * balance.overageRate
+              return (
+                <div className="space-y-2 pt-4 border-t">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-semibold">超额（overage）</span>
+                    {overageEnabled ? (
+                      <span className="font-medium text-green-600">可超额</span>
+                    ) : overageDisabled ? (
+                      <span className="font-medium text-muted-foreground">不可超额</span>
+                    ) : (
+                      <span className="font-medium text-muted-foreground">未知</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <span className="text-muted-foreground">已超额：</span>
+                      <span
+                        className={
+                          balance.currentOverages > 0
+                            ? 'font-medium text-amber-600'
+                            : 'font-medium'
+                        }
+                      >
+                        {formatCount(balance.currentOverages)} 次
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">超额上限：</span>
+                      <span className="font-medium">
+                        {balance.overageCap > 0 ? `${formatCount(balance.overageCap)} 次` : '无'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">单价：</span>
+                      <span className="font-medium">
+                        ${balance.overageRate.toFixed(4)} / 次
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">预估费用：</span>
+                      <span
+                        className={
+                          estimatedCost > 0 ? 'font-medium text-amber-600' : 'font-medium'
+                        }
+                      >
+                        ${estimatedCost.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )
+            })()}
           </div>
         )}
       </DialogContent>

@@ -76,6 +76,8 @@ pub struct CredentialStatusItem {
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数
     pub throttled_1h: u32,
+    /// AWS 侧超额（overage）状态（ENABLED / DISABLED；None 表示未知/未同步）
+    pub overage_status: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -190,6 +192,18 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// AWS 侧超额（overage）状态（ENABLED / DISABLED；None 表示未知/未同步）
+    #[serde(default)]
+    pub overage_status: Option<String>,
+    /// 当前已产生的超额用量（次数）
+    #[serde(default)]
+    pub current_overages: f64,
+    /// 超额上限（次数，0 表示无明确上限）
+    #[serde(default)]
+    pub overage_cap: f64,
+    /// 超额单价（美元 / 次）
+    #[serde(default)]
+    pub overage_rate: f64,
 }
 
 // ============ 负载均衡配置 ============

@@ -98,6 +98,7 @@ impl AdminService {
                 current_rpm: entry.current_rpm,
                 peak_rpm_1h: entry.peak_rpm_1h,
                 throttled_1h: entry.throttled_1h,
+                overage_status: entry.overage_status,
             })
             .collect();
 
@@ -258,6 +259,10 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+            overage_status: usage.overage_status().map(|s| s.to_string()),
+            current_overages: usage.current_overages(),
+            overage_cap: usage.overage_cap(),
+            overage_rate: usage.overage_rate(),
         })
     }
 
@@ -648,6 +653,10 @@ mod tests {
                 0.0
             },
             next_reset_at: Some((Utc::now() + chrono::Duration::hours(1)).timestamp() as f64),
+            overage_status: None,
+            current_overages: 0.0,
+            overage_cap: 0.0,
+            overage_rate: 0.0,
         }
     }
 

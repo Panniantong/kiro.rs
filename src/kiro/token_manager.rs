@@ -549,6 +549,9 @@ pub struct CredentialEntrySnapshot {
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数
     pub throttled_1h: u32,
+    /// AWS 侧超额（overage）状态（ENABLED / DISABLED；None 表示未知/未同步）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overage_status: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1881,6 +1884,7 @@ impl MultiTokenManager {
                     current_rpm,
                     peak_rpm_1h,
                     throttled_1h,
+                    overage_status: e.credentials.overage_status.clone(),
                 }
             })
             .collect();
