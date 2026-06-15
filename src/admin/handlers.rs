@@ -10,8 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, BatchSetRpmRequest, SetArmorBreakingRequest, SetDefaultRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest, SetPriorityRequest,
-        SetRpmRequest, SuccessResponse,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+        SetOveragePassthroughRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
     },
 };
 
@@ -203,6 +203,25 @@ pub async fn set_armor_breaking(
     Json(payload): Json<SetArmorBreakingRequest>,
 ) -> impl IntoResponse {
     match state.service.set_armor_breaking(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/overage-passthrough
+/// 获取超额放行开关
+pub async fn get_overage_passthrough(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_overage_passthrough();
+    Json(response)
+}
+
+/// PUT /api/admin/config/overage-passthrough
+/// 设置超额放行开关
+pub async fn set_overage_passthrough(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetOveragePassthroughRequest>,
+) -> impl IntoResponse {
+    match state.service.set_overage_passthrough(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

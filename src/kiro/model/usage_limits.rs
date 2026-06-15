@@ -16,6 +16,12 @@ pub struct UsageLimitsResponse {
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
 
+    /// 超额（overage）配置
+    ///
+    /// AWS 侧若开启付费超额，该字段的 `overageStatus` 为 "ENABLED"。
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
@@ -28,6 +34,17 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+}
+
+/// 超额（overage）配置
+///
+/// 反映 AWS 侧账号的付费超额开关状态。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    /// 超额状态（ENABLED / DISABLED 等）
+    #[serde(default)]
+    pub overage_status: Option<String>,
 }
 
 /// 使用量明细
@@ -139,6 +156,13 @@ impl UsageLimitsResponse {
         self.subscription_info
             .as_ref()
             .and_then(|info| info.subscription_title.as_deref())
+    }
+
+    /// 获取超额状态字符串（如 "ENABLED" / "DISABLED"）
+    pub fn overage_status(&self) -> Option<&str> {
+        self.overage_configuration
+            .as_ref()
+            .and_then(|cfg| cfg.overage_status.as_deref())
     }
 
     /// 获取第一个使用量明细

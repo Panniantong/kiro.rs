@@ -126,6 +126,15 @@ pub struct Config {
     #[serde(default = "default_armor_breaking")]
     pub armor_breaking: bool,
 
+    /// 超额放行全局开关（默认 true = 开启）
+    ///
+    /// 运行时可经 Admin API `/config/overage-passthrough` 热切换。开启时，
+    /// AWS 侧 `overageStatus=ENABLED` 的凭据在额度用尽（402 MONTHLY_REQUEST_COUNT
+    /// 或余额耗尽）时走软冷却轮换、保持启用；关闭则回退到旧行为（永久禁用）。
+    /// DISABLED/未知的凭据不受此开关影响，始终维持永久禁用。
+    #[serde(default = "default_overage_passthrough")]
+    pub overage_passthrough: bool,
+
     /// CC Test 检测请求透传配置（默认关闭）
     ///
     /// 运行时可经 Admin API `/config/max-relay` 热切换。开启后只有 CC Test 检测探针
@@ -197,6 +206,10 @@ fn default_armor_breaking() -> bool {
     false
 }
 
+fn default_overage_passthrough() -> bool {
+    true
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -229,6 +242,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             default_rpm: None,
             armor_breaking: default_armor_breaking(),
+            overage_passthrough: default_overage_passthrough(),
             max_relay: MaxRelayConfig::default(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),

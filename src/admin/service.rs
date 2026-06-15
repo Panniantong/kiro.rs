@@ -15,7 +15,8 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, ArmorBreakingResponse, BalanceResponse,
     CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    MaxRelayResponse, SetArmorBreakingRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+    MaxRelayResponse, OveragePassthroughResponse, SetArmorBreakingRequest,
+    SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -190,6 +191,15 @@ impl AdminService {
             return;
         }
 
+        // AWS 侧 overage=ENABLED 且全局开关开启：进入超额、保持启用，不永久禁用
+        if self.token_manager.is_overage_enabled(balance.id) {
+            tracing::info!(
+                "凭据 #{} 余额耗尽但 overage=ENABLED，进入超额、保持启用",
+                balance.id
+            );
+            return;
+        }
+
         let has_available = self.token_manager.report_quota_exhausted(balance.id);
         if has_available {
             tracing::warn!(
@@ -287,6 +297,7 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
+            overage_status: None,     // 将在首次获取使用额度时自动同步
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -404,6 +415,27 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(ArmorBreakingResponse {
+            enabled: req.enabled,
+        })
+    }
+
+    /// 获取超额放行开关
+    pub fn get_overage_passthrough(&self) -> OveragePassthroughResponse {
+        OveragePassthroughResponse {
+            enabled: self.token_manager.get_overage_passthrough(),
+        }
+    }
+
+    /// 设置超额放行开关
+    pub fn set_overage_passthrough(
+        &self,
+        req: SetOveragePassthroughRequest,
+    ) -> Result<OveragePassthroughResponse, AdminServiceError> {
+        self.token_manager
+            .set_overage_passthrough(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(OveragePassthroughResponse {
             enabled: req.enabled,
         })
     }
@@ -726,6 +758,94 @@ mod tests {
         let persisted: Vec<KiroCredentials> =
             serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
         assert!(!persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_overage_enabled_balance_not_disabled() {
+        // AWS 侧 overage=ENABLED 的号，余额耗尽时不应被禁用（默认全局开关开启）
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-overage-enabled-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.machine_id = Some("machine-1".to_string());
+        cred.overage_status = Some("ENABLED".to_string());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        // 余额耗尽
+        service.disable_if_quota_exhausted_balance(&balance_response(1, 10000.0, 0.0));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!first.disabled, "overage=ENABLED 的号余额耗尽不应被禁用");
+        assert_eq!(snapshot.available, 1);
+
+        // 持久化文件中也不应标记为 disabled
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(!persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_overage_disabled_still_disabled() {
+        // overage_status=None（未知/未开启）的号，余额耗尽时维持现状：永久禁用
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-overage-disabled-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.machine_id = Some("machine-1".to_string());
+        // overage_status 未设置（None）
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service.disable_if_quota_exhausted_balance(&balance_response(1, 10000.0, 0.0));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled, "非 ENABLED 的号余额耗尽应被禁用");
+        assert_eq!(first.disabled_reason.as_deref(), Some("QuotaExceeded"));
 
         std::fs::remove_file(&credentials_path).unwrap();
     }

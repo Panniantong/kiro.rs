@@ -267,6 +267,22 @@ pub struct SetArmorBreakingRequest {
     pub enabled: bool,
 }
 
+/// 超额放行开关响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OveragePassthroughResponse {
+    /// 当前是否开启超额放行
+    pub enabled: bool,
+}
+
+/// 设置超额放行开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOveragePassthroughRequest {
+    /// 是否开启超额放行
+    pub enabled: bool,
+}
+
 // ============ CC Test 透传配置 ============
 
 /// CC Test 透传响应

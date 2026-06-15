@@ -217,6 +217,23 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                // AWS 侧 overage=ENABLED 且全局开关开启：放行软冷却轮换，不永久禁用
+                if self.token_manager.is_overage_enabled(ctx.id) {
+                    tracing::warn!(
+                        "额度用尽但 overage=ENABLED，放行轮换（尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    let has_available = self.token_manager.report_rate_limited(ctx.id, None);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据超额冷却中）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 超额放行轮换: {} {}", status, body));
+                    continue;
+                }
+
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -411,6 +428,33 @@ impl KiroProvider {
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                // AWS 侧 overage=ENABLED 且全局开关开启：放行软冷却轮换，不永久禁用
+                if self.token_manager.is_overage_enabled(ctx.id) {
+                    tracing::warn!(
+                        "额度用尽但 overage=ENABLED，放行轮换（尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    let has_available = self.token_manager.report_rate_limited(ctx.id, None);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据超额冷却中）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "{} 超额放行轮换: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -674,6 +718,138 @@ mod tests {
         } else {
             (StatusCode::OK, "ok").into_response()
         }
+    }
+
+    /// token=t1 返回 402 MONTHLY_REQUEST_COUNT（额度用尽），其余返回 200 OK。
+    /// 用于验证 overage 放行后软冷却轮换到兄弟凭据并最终成功。
+    async fn quota_exhausted_first_credential(headers: HeaderMap) -> Response {
+        let token = headers
+            .get("x-test-token")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        if token == "t1" {
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#,
+            )
+                .into_response()
+        } else {
+            (StatusCode::OK, "ok").into_response()
+        }
+    }
+
+    /// 始终返回 402 MONTHLY_REQUEST_COUNT。
+    async fn always_quota_exhausted() -> Response {
+        (
+            StatusCode::PAYMENT_REQUIRED,
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#,
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn test_402_overage_enabled_keeps_credential() {
+        // 两个 overage_status=ENABLED 的号；mock 对 t1 回 402 额度用尽、t2 回 200。
+        // 期望：t1 不被永久禁用（仅软冷却），放行轮换到 t2 后请求成功，两号都仍在池。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api", post(quota_exhausted_first_credential));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = Config::default(); // overage_passthrough 默认 true
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        cred1.priority = 0; // 优先选中
+        cred1.overage_status = Some("ENABLED".to_string());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        cred2.priority = 1;
+        cred2.overage_status = Some("ENABLED".to_string());
+
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                base_url: format!("http://{}", addr),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
+
+        let response = provider.call_api("{}").await.unwrap();
+
+        // 放行轮换到 t2 后请求成功
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+
+        // t1（overage=ENABLED）未被永久禁用（仅软冷却），两号都仍在池、均未 disabled。
+        // 注意：available_count 统计的是「当前可立即选中」的凭据，会把冷却中的 t1 排除，
+        // 因此判断「未永久禁用」要看 snapshot 的 disabled 标志，而非 available_count。
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        let second = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(
+            !first.disabled,
+            "overage=ENABLED 的号 402 后不应被永久禁用（应仅软冷却轮换）"
+        );
+        assert!(!second.disabled, "轮换目标号不应被禁用");
+        // 两号都未被永久禁用，仍在凭据池中
+        assert_eq!(
+            snapshot.entries.iter().filter(|e| !e.disabled).count(),
+            2,
+            "两个 overage=ENABLED 的号都应保留在池中（未 disabled）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_402_overage_disabled_disables_credential() {
+        // 非 ENABLED（overage_status=None）的号遇到 402 额度用尽：维持现状，永久禁用。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api", post(always_quota_exhausted));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = Config::default();
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        // overage_status 未设置（None）
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                base_url: format!("http://{}", addr),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
+
+        // 所有凭据额度用尽 → 调用最终失败
+        let err = provider.call_api("{}").await.unwrap_err().to_string();
+        assert!(
+            err.contains("所有凭据已用尽") || err.contains("MONTHLY_REQUEST_COUNT"),
+            "expected quota-exhausted failure, got: {}",
+            err
+        );
+
+        // 该号被永久禁用
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled, "非 ENABLED 的号 402 后应被禁用");
+        assert_eq!(manager.available_count(), 0);
     }
 
     #[tokio::test]

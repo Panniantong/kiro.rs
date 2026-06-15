@@ -360,7 +360,7 @@ pub(crate) async fn get_usage_limits(
 
     // 构建 URL
     let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
     );
 
@@ -590,6 +590,8 @@ pub struct MultiTokenManager {
     default_rpm: Mutex<Option<u32>>,
     /// 破甲模式开关（运行时可修改，默认 false = 最小满分版）
     armor_breaking: Mutex<bool>,
+    /// 超额放行全局开关（运行时可修改，默认 true = 开启）
+    overage_passthrough: Mutex<bool>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -730,6 +732,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let default_rpm_init = config.default_rpm;
         let armor_breaking = config.armor_breaking;
+        let overage_passthrough = config.overage_passthrough;
         let max_relay = config.max_relay.clone();
         let manager = Self {
             config,
@@ -742,6 +745,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             default_rpm: Mutex::new(default_rpm_init),
             armor_breaking: Mutex::new(armor_breaking),
+            overage_passthrough: Mutex::new(overage_passthrough),
             max_relay: Mutex::new(max_relay),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -2030,24 +2034,48 @@ impl MultiTokenManager {
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅等级到凭据（仅在发生变化时持久化）
-        if let Some(subscription_title) = usage_limits.subscription_title() {
+        // 更新订阅等级 / 超额状态到凭据（仅在发生变化时持久化）
+        {
+            let new_title = usage_limits.subscription_title();
+            let new_overage = usage_limits.overage_status().map(String::from);
+
             let changed = {
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let old_title = entry.credentials.subscription_title.clone();
-                    if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title = Some(subscription_title.to_string());
-                        tracing::info!(
-                            "凭据 #{} 订阅等级已更新: {:?} -> {}",
-                            id,
-                            old_title,
-                            subscription_title
-                        );
-                        true
-                    } else {
-                        false
+                    let mut changed = false;
+
+                    // 订阅等级（仅在上游返回时更新，缺失不清空）
+                    if let Some(subscription_title) = new_title {
+                        let old_title = entry.credentials.subscription_title.clone();
+                        if old_title.as_deref() != Some(subscription_title) {
+                            entry.credentials.subscription_title =
+                                Some(subscription_title.to_string());
+                            tracing::info!(
+                                "凭据 #{} 订阅等级已更新: {:?} -> {}",
+                                id,
+                                old_title,
+                                subscription_title
+                            );
+                            changed = true;
+                        }
                     }
+
+                    // 超额状态（仅在上游返回时更新，缺失不清空）
+                    if let Some(overage_status) = new_overage {
+                        let old_overage = entry.credentials.overage_status.clone();
+                        if old_overage.as_deref() != Some(overage_status.as_str()) {
+                            entry.credentials.overage_status = Some(overage_status.clone());
+                            tracing::info!(
+                                "凭据 #{} 超额状态已更新: {:?} -> {}",
+                                id,
+                                old_overage,
+                                overage_status
+                            );
+                            changed = true;
+                        }
+                    }
+
+                    changed
                 } else {
                     false
                 }
@@ -2055,7 +2083,7 @@ impl MultiTokenManager {
 
             if changed {
                 if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                    tracing::warn!("订阅等级/超额状态更新后持久化失败（不影响本次请求）: {}", e);
                 }
             }
         }
@@ -2470,6 +2498,67 @@ impl MultiTokenManager {
 
         tracing::info!("破甲模式已设置为: {}", on);
         Ok(())
+    }
+
+    /// 获取超额放行全局开关（Admin API）
+    pub fn get_overage_passthrough(&self) -> bool {
+        *self.overage_passthrough.lock()
+    }
+
+    fn persist_overage_passthrough(&self, on: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，超额放行开关仅在当前进程生效: {}", on);
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.overage_passthrough = on;
+        config
+            .save()
+            .with_context(|| format!("持久化超额放行开关失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 设置超额放行全局开关（Admin API，热改并持久化）
+    pub fn set_overage_passthrough(&self, on: bool) -> anyhow::Result<()> {
+        let previous = self.get_overage_passthrough();
+        if previous == on {
+            return Ok(());
+        }
+
+        *self.overage_passthrough.lock() = on;
+
+        if let Err(err) = self.persist_overage_passthrough(on) {
+            *self.overage_passthrough.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!("超额放行开关已设置为: {}", on);
+        Ok(())
+    }
+
+    /// 判断指定凭据当前是否应启用「超额放行」行为
+    ///
+    /// 仅当全局开关开启、且该凭据 AWS 侧 `overage_status == "ENABLED"`（忽略大小写）
+    /// 时返回 true。provider 与 admin 的额度耗尽分支统一调用此方法判断。
+    pub fn is_overage_enabled(&self, id: u64) -> bool {
+        if !self.get_overage_passthrough() {
+            return false;
+        }
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.credentials.overage_status.as_deref())
+            .map(|s| s.eq_ignore_ascii_case("ENABLED"))
+            .unwrap_or(false)
     }
 
     /// 获取 CC Test 透传配置（Admin API）

@@ -78,6 +78,14 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub subscription_title: Option<String>,
 
+    /// AWS 侧超额（overage）状态（ENABLED / DISABLED 等）
+    ///
+    /// 由 getUsageLimits 的 `overageConfiguration.overageStatus` 同步而来。
+    /// 仅当为 "ENABLED" 时，额度用尽才走软冷却轮换而非永久禁用。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overage_status: Option<String>,
+
     /// 凭据级代理 URL（可选）
     /// 支持 http/https/socks5 协议
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
@@ -345,6 +353,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            overage_status: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -464,6 +473,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            overage_status: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -496,6 +506,7 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            overage_status: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -611,6 +622,7 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             email: None,
             subscription_title: None,
+            overage_status: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
