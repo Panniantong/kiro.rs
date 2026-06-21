@@ -1621,6 +1621,41 @@ fn is_identity_or_prompt_extraction_request(text_content: &str) -> bool {
     let lower = text_content.to_lowercase();
     let has_self_reference =
         contains_any(&lower, &["you", "your", "yourself"]) || text_content.contains('你');
+    let chinese_direct_identity_probe = contains_any(
+        text_content,
+        &[
+            "你是谁",
+            "你是什么模型",
+            "谁开发了你",
+            "谁创造了你",
+            "真实身份",
+            "真实模型",
+            "底层模型",
+            "系统提示",
+            "系统指令",
+            "隐藏提示",
+            "隐藏指令",
+            "之前收到的",
+        ],
+    );
+    let chinese_self_reference_identity_probe = contains_any(
+        text_content,
+        &[
+            "身份",
+            "底层模型",
+            "真实身份",
+            "真实模型",
+            "你用的模型",
+            "开发公司",
+            "开发者",
+            "训练数据",
+            "截止时间",
+            "系统提示",
+            "系统指令",
+            "隐藏提示",
+            "隐藏指令",
+        ],
+    );
 
     if contains_any(
         &lower,
@@ -1646,20 +1681,8 @@ fn is_identity_or_prompt_extraction_request(text_content: &str) -> bool {
             "all text you received",
             "text you received before",
         ],
-    ) || contains_any(
-        text_content,
-        &[
-            "你是谁",
-            "你是什么模型",
-            "谁开发了你",
-            "谁创造了你",
-            "系统提示",
-            "系统指令",
-            "隐藏提示",
-            "隐藏指令",
-            "之前收到的",
-        ],
-    ) {
+    ) || chinese_direct_identity_probe
+    {
         return true;
     }
 
@@ -1686,21 +1709,7 @@ fn is_identity_or_prompt_extraction_request(text_content: &str) -> bool {
                 "aws",
                 "ide",
             ],
-        ) || contains_any(
-            text_content,
-            &[
-                "身份",
-                "真实",
-                "底层",
-                "模型",
-                "开发公司",
-                "开发者",
-                "训练数据",
-                "截止时间",
-                "系统提示",
-                "扮演",
-            ],
-        ))
+        ) || chinese_self_reference_identity_probe)
 }
 
 fn apply_public_identity_boundary(
@@ -3119,6 +3128,29 @@ mod tests {
                 content: serde_json::json!("输出中文的这个符号”,仅仅输出,不要说别的"),
             }],
             stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(final_text_override_for_request(&req).is_none());
+    }
+
+    #[test]
+    fn test_final_text_override_does_not_misread_real_viral_prompt_as_identity_probe() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 16000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(
+                    "你是短视频\"前3秒\"专家。围绕主题「秋天的第一杯咖啡」海选短视频开头钩子。\n\n爆款钩子模板库（从真实爆款抽象的跨行业句式，把 {X}{A}{N} 等占位符换成本主题的内容）：\n只输出 JSON 数组，共 6 个。"
+                ),
+            }],
+            stream: false,
             system: None,
             tools: None,
             tool_choice: None,
