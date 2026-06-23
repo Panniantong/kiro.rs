@@ -38,6 +38,32 @@ use super::types::{
 };
 use super::websearch;
 
+const MAX_ACCEPTED_INPUT_TOKENS: u64 = 1_000_000;
+
+fn reject_if_input_too_large(endpoint: &str, model: &str, input_tokens: u64) -> Option<Response> {
+    if input_tokens <= MAX_ACCEPTED_INPUT_TOKENS {
+        return None;
+    }
+
+    tracing::warn!(
+        endpoint = endpoint,
+        model = model,
+        input_tokens = input_tokens,
+        max_input_tokens = MAX_ACCEPTED_INPUT_TOKENS,
+        "拒绝超大输入请求，避免进入上游和计费链路"
+    );
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Input is too long. Reduce the size of your messages.",
+            )),
+        )
+            .into_response(),
+    )
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -314,9 +340,13 @@ pub async fn post_messages(
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
-        ) as i32;
+        );
+        if let Some(resp) = reject_if_input_too_large("/v1/messages", &payload.model, input_tokens)
+        {
+            return resp;
+        }
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens as i32).await;
     }
 
     // 读取运行时破甲开关（与 admin 共享同一 token_manager，热生效）
@@ -376,7 +406,11 @@ pub async fn post_messages(
         payload.system,
         payload.messages,
         payload.tools,
-    ) as i32;
+    );
+    if let Some(resp) = reject_if_input_too_large("/v1/messages", &payload.model, input_tokens) {
+        return resp;
+    }
+    let input_tokens = input_tokens as i32;
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1542,9 +1576,14 @@ pub async fn post_messages_cc(
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
-        ) as i32;
+        );
+        if let Some(resp) =
+            reject_if_input_too_large("/cc/v1/messages", &payload.model, input_tokens)
+        {
+            return resp;
+        }
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens as i32).await;
     }
 
     // 读取运行时破甲开关（与 admin 共享同一 token_manager，热生效）
@@ -1602,7 +1641,11 @@ pub async fn post_messages_cc(
         payload.system,
         payload.messages,
         payload.tools,
-    ) as i32;
+    );
+    if let Some(resp) = reject_if_input_too_large("/cc/v1/messages", &payload.model, input_tokens) {
+        return resp;
+    }
+    let input_tokens = input_tokens as i32;
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -2113,6 +2156,18 @@ mod tests {
             signature_mode_for_messages_request(&payload, &headers),
             SignatureMode::Passthrough
         );
+    }
+
+    #[test]
+    fn test_input_guard_allows_exact_limit() {
+        assert!(reject_if_input_too_large("/v1/messages", "claude-opus-4-8", 1_000_000).is_none());
+    }
+
+    #[test]
+    fn test_input_guard_rejects_over_limit() {
+        let response = reject_if_input_too_large("/v1/messages", "claude-opus-4-8", 1_000_001)
+            .expect("over-limit input should be rejected");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
