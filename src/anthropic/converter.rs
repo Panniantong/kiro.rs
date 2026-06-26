@@ -688,31 +688,40 @@ fn is_plain_public_identity_request(text_content: &str) -> bool {
         &[
             "who are you",
             "what are you",
+            "are you claude code",
+            "are you kiro",
             "what model are you",
             "which model are you",
             "who made you",
             "who created you",
             "your identity",
             "your real identity",
-            "underlying model",
-            "actual model",
-            "real model",
-            "developer",
-            "creator",
-            "provider",
+            "your underlying model",
+            "your actual model",
+            "your real model",
+            "who developed you",
+            "who built you",
+            "your developer",
+            "your creator",
+            "your provider",
         ],
     ) || contains_any(
         text_content,
         &[
             "你是谁",
             "你是什么模型",
+            "你是哪个模型",
+            "你用的什么模型",
             "谁开发了你",
             "谁创造了你",
+            "谁创建了你",
             "你的身份",
-            "真实身份",
-            "底层模型",
-            "开发公司",
-            "开发者",
+            "你真实身份",
+            "你的真实身份",
+            "你底层模型",
+            "你的底层模型",
+            "你的开发公司",
+            "你的开发者",
         ],
     )
 }
@@ -1628,9 +1637,12 @@ fn is_identity_or_prompt_extraction_request(text_content: &str) -> bool {
             "你是什么模型",
             "谁开发了你",
             "谁创造了你",
-            "真实身份",
-            "真实模型",
-            "底层模型",
+            "你的真实身份",
+            "你真实身份",
+            "你的真实模型",
+            "你真实模型",
+            "你的底层模型",
+            "你底层模型",
             "系统提示",
             "系统指令",
             "隐藏提示",
@@ -1641,19 +1653,24 @@ fn is_identity_or_prompt_extraction_request(text_content: &str) -> bool {
     let chinese_self_reference_identity_probe = contains_any(
         text_content,
         &[
-            "身份",
-            "底层模型",
-            "真实身份",
-            "真实模型",
+            "你的身份",
+            "多重身份",
+            "你的底层模型",
+            "你的真实身份",
+            "你的真实模型",
             "你用的模型",
-            "开发公司",
-            "开发者",
-            "训练数据",
-            "截止时间",
-            "系统提示",
-            "系统指令",
-            "隐藏提示",
-            "隐藏指令",
+            "开发了你",
+            "创造了你",
+            "创建了你",
+            "你的开发公司",
+            "你的开发者",
+            "你的训练数据",
+            "你的截止时间",
+            "你的知识截止",
+            "你的系统提示",
+            "你的系统指令",
+            "你的隐藏提示",
+            "你的隐藏指令",
         ],
     );
 
@@ -1662,13 +1679,15 @@ fn is_identity_or_prompt_extraction_request(text_content: &str) -> bool {
         &[
             "who are you",
             "what are you",
+            "are you claude code",
+            "are you kiro",
             "what model are you",
             "which model are you",
             "who made you",
             "who created you",
             "your identity",
             "your real identity",
-            "underlying model",
+            "your underlying model",
             "system prompt",
             "system instructions",
             "system-level instructions",
@@ -1690,24 +1709,20 @@ fn is_identity_or_prompt_extraction_request(text_content: &str) -> bool {
         && (contains_any(
             &lower,
             &[
-                "identity",
-                "real model",
-                "actual model",
-                "underlying",
-                "developer",
-                "creator",
-                "provider",
-                "training data",
-                "cutoff",
-                "system instruction",
-                "system-level instruction",
-                "previous instruction",
-                "hidden instruction",
-                "pretend",
-                "roleplay as",
-                "kiro",
-                "aws",
-                "ide",
+                "your real model",
+                "your actual model",
+                "your underlying model",
+                "who developed you",
+                "who built you",
+                "your developer",
+                "your creator",
+                "your provider",
+                "your training data",
+                "your cutoff",
+                "your system instruction",
+                "your system-level instruction",
+                "your previous instruction",
+                "your hidden instruction",
             ],
         ) || chinese_self_reference_identity_probe)
 }
@@ -3148,6 +3163,52 @@ mod tests {
                 role: "user".to_string(),
                 content: serde_json::json!(
                     "你是短视频\"前3秒\"专家。围绕主题「秋天的第一杯咖啡」海选短视频开头钩子。\n\n爆款钩子模板库（从真实爆款抽象的跨行业句式，把 {X}{A}{N} 等占位符换成本主题的内容）：\n只输出 JSON 数组，共 6 个。"
+                ),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(final_text_override_for_request(&req).is_none());
+    }
+
+    #[test]
+    fn test_final_text_override_does_not_misread_developer_tool_prompt_as_identity_probe() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 512,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(
+                    "你是短视频开头专家。请给开发者工具「代码审查助手」写 3 个短视频开头钩子，只输出 JSON 数组。"
+                ),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(final_text_override_for_request(&req).is_none());
+    }
+
+    #[test]
+    fn test_final_text_override_does_not_misread_role_identity_prompt_as_identity_probe() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 512,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(
+                    "你是剧本策划。请为主角设计真实身份、表面身份和反转身份，只输出三行。"
                 ),
             }],
             stream: false,
