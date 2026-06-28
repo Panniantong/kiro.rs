@@ -117,6 +117,35 @@ fn default_effort() -> String {
     "high".to_string()
 }
 
+/// Anthropic context management directives.
+///
+/// The current use case is `clear_thinking_20251015`, which removes older
+/// assistant thinking blocks from conversation history according to `keep`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextManagement {
+    #[serde(default)]
+    pub edits: Vec<ContextEdit>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextEdit {
+    #[serde(rename = "type")]
+    pub edit_type: String,
+    #[serde(default)]
+    pub keep: Option<ContextEditKeep>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ContextEditKeep {
+    String(String),
+    Object {
+        #[serde(rename = "type")]
+        keep_type: String,
+        value: Option<i32>,
+    },
+}
+
 /// Claude Code 请求中的 metadata
 #[derive(Debug, Clone, Deserialize)]
 pub struct Metadata {
@@ -139,6 +168,8 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
+    #[serde(default)]
+    pub context_management: Option<ContextManagement>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
 }

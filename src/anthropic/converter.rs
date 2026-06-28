@@ -16,7 +16,7 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest};
+use super::types::{ContentBlock, ContextEditKeep, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
@@ -1880,6 +1880,7 @@ fn build_history(
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
+    let thinking_retention = thinking_retention_for_request(req);
 
     // 1. 处理系统消息。Kiro 没有 Anthropic system role；用已确认的
     // history contract 表达公网 Claude API 身份与用户 system 已生效。
@@ -1991,7 +1992,9 @@ Complete all chunked operations without commentary.";
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
-    let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
+    let history_thinking_keep_indices =
+        assistant_thinking_keep_indices(messages, history_end_index, thinking_retention);
+    let mut assistant_buffer: Vec<(usize, &super::types::Message)> = Vec::new();
 
     for i in 0..history_end_index {
         let msg = &messages[i];
@@ -1999,7 +2002,12 @@ Complete all chunked operations without commentary.";
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                let merged = merge_assistant_messages_with_context_management(
+                    &assistant_buffer,
+                    tool_name_map,
+                    thinking_retention,
+                    &history_thinking_keep_indices,
+                )?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -2012,13 +2020,18 @@ Complete all chunked operations without commentary.";
                 user_buffer.clear();
             }
             // 累积 assistant 消息（支持连续多条）
-            assistant_buffer.push(msg);
+            assistant_buffer.push((i, msg));
         }
     }
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+        let merged = merge_assistant_messages_with_context_management(
+            &assistant_buffer,
+            tool_name_map,
+            thinking_retention,
+            &history_thinking_keep_indices,
+        )?;
         history.push(Message::Assistant(merged));
     }
 
@@ -2033,6 +2046,88 @@ Complete all chunked operations without commentary.";
     }
 
     Ok(history)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingRetention {
+    All,
+    RecentTurns(usize),
+}
+
+fn thinking_retention_for_request(req: &MessagesRequest) -> ThinkingRetention {
+    let Some(edit) = req.context_management.as_ref().and_then(|management| {
+        management
+            .edits
+            .iter()
+            .find(|edit| edit.edit_type == "clear_thinking_20251015")
+    }) else {
+        return ThinkingRetention::All;
+    };
+
+    match edit.keep.as_ref() {
+        Some(ContextEditKeep::String(value)) if value == "all" => ThinkingRetention::All,
+        Some(ContextEditKeep::Object { keep_type, value })
+            if keep_type == "thinking_turns" && value.is_some_and(|v| v > 0) =>
+        {
+            ThinkingRetention::RecentTurns(value.unwrap() as usize)
+        }
+        Some(_) => ThinkingRetention::All,
+        None => default_thinking_retention_for_model(&req.model),
+    }
+}
+
+fn default_thinking_retention_for_model(model: &str) -> ThinkingRetention {
+    if claude_4_minor_at_least(model, "opus", 5) || claude_4_minor_at_least(model, "sonnet", 5) {
+        ThinkingRetention::All
+    } else {
+        ThinkingRetention::RecentTurns(1)
+    }
+}
+
+fn claude_4_minor_at_least(model: &str, family: &str, min_minor: i32) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    for marker in [format!("{family}-4-"), format!("{family}-4.")] {
+        if let Some(idx) = normalized.find(&marker) {
+            let tail = &normalized[idx + marker.len()..];
+            let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if digits.parse::<i32>().is_ok_and(|minor| minor >= min_minor) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn assistant_thinking_keep_indices(
+    messages: &[super::types::Message],
+    history_end_index: usize,
+    retention: ThinkingRetention,
+) -> HashSet<usize> {
+    let ThinkingRetention::RecentTurns(turns) = retention else {
+        return HashSet::new();
+    };
+
+    messages
+        .iter()
+        .take(history_end_index)
+        .enumerate()
+        .filter(|(_, msg)| msg.role == "assistant" && message_has_thinking(msg))
+        .map(|(idx, _)| idx)
+        .rev()
+        .take(turns)
+        .collect()
+}
+
+fn message_has_thinking(msg: &super::types::Message) -> bool {
+    let serde_json::Value::Array(blocks) = &msg.content else {
+        return false;
+    };
+    blocks.iter().any(|block| {
+        block
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|block_type| block_type == "thinking")
+    })
 }
 
 /// 合并多个 user 消息
@@ -2077,6 +2172,14 @@ fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
+    convert_assistant_message_with_thinking(msg, tool_name_map, true)
+}
+
+fn convert_assistant_message_with_thinking(
+    msg: &super::types::Message,
+    tool_name_map: &mut HashMap<String, String>,
+    keep_thinking: bool,
+) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
@@ -2090,8 +2193,10 @@ fn convert_assistant_message(
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
+                            if keep_thinking {
+                                if let Some(thinking) = block.thinking {
+                                    thinking_content.push_str(&thinking);
+                                }
                             }
                         }
                         "text" => {
@@ -2151,16 +2256,40 @@ fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
+    let indexed = messages
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| (idx, *msg))
+        .collect::<Vec<_>>();
+    merge_assistant_messages_with_context_management(
+        &indexed,
+        tool_name_map,
+        ThinkingRetention::All,
+        &HashSet::new(),
+    )
+}
+
+fn merge_assistant_messages_with_context_management(
+    messages: &[(usize, &super::types::Message)],
+    tool_name_map: &mut HashMap<String, String>,
+    thinking_retention: ThinkingRetention,
+    keep_thinking_indices: &HashSet<usize>,
+) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
+        let (idx, msg) = messages[0];
+        let keep_thinking =
+            thinking_retention == ThinkingRetention::All || keep_thinking_indices.contains(&idx);
+        return convert_assistant_message_with_thinking(msg, tool_name_map, keep_thinking);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
 
-    for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
+    for (idx, msg) in messages {
+        let keep_thinking =
+            thinking_retention == ThinkingRetention::All || keep_thinking_indices.contains(idx);
+        let converted = convert_assistant_message_with_thinking(msg, tool_name_map, keep_thinking)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -2292,6 +2421,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -2317,6 +2447,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2388,6 +2519,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2442,6 +2574,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2488,6 +2621,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2527,6 +2661,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2564,6 +2699,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2590,6 +2726,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2622,6 +2759,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2660,6 +2798,7 @@ mod tests {
                 budget_tokens: 1024,
             }),
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2721,6 +2860,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2769,6 +2909,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2804,6 +2945,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2846,6 +2988,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2909,6 +3052,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -2950,6 +3094,7 @@ mod tests {
                 effort: "high".to_string(),
                 format: None,
             }),
+            context_management: None,
             metadata: None,
         };
 
@@ -2991,6 +3136,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3055,6 +3201,7 @@ mod tests {
                 budget_tokens: 1024,
             }),
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3087,6 +3234,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3121,6 +3269,7 @@ mod tests {
                 budget_tokens: 4096,
             }),
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3148,6 +3297,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3171,6 +3321,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3194,6 +3345,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3217,6 +3369,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3238,6 +3391,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3262,6 +3416,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3288,6 +3443,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3316,6 +3472,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3351,6 +3508,7 @@ mod tests {
                 }),
                 effort: "medium".to_string(),
             }),
+            context_management: None,
             metadata: None,
         };
 
@@ -3372,6 +3530,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3417,6 +3576,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3462,6 +3622,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3505,6 +3666,7 @@ mod tests {
                     })),
                 }),
             }),
+            context_management: None,
             metadata: None,
         };
 
@@ -3635,6 +3797,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3703,6 +3866,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3760,6 +3924,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -3844,6 +4009,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -3876,6 +4042,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -4181,6 +4348,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -4250,6 +4418,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -4311,6 +4480,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
@@ -4411,6 +4581,143 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
+    }
+
+    #[test]
+    fn test_context_management_clear_thinking_keeps_recent_turns() {
+        use super::super::types::{
+            ContextEdit, ContextEditKeep, ContextManagement, Message as AnthropicMessage,
+        };
+
+        let req = MessagesRequest {
+            model: "claude-haiku-4-5-20251001".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("first"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "old hidden thinking"},
+                        {"type": "text", "text": "old visible answer"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("second"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "recent hidden thinking"},
+                        {"type": "text", "text": "recent visible answer"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("current"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: Some(ContextManagement {
+                edits: vec![ContextEdit {
+                    edit_type: "clear_thinking_20251015".to_string(),
+                    keep: Some(ContextEditKeep::Object {
+                        keep_type: "thinking_turns".to_string(),
+                        value: Some(1),
+                    }),
+                }],
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("context management should convert");
+        let history = result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(message) => {
+                    Some(message.assistant_response_message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !history.contains("old hidden thinking"),
+            "older thinking turn should be cleared"
+        );
+        assert!(history.contains("old visible answer"));
+        assert!(history.contains("recent hidden thinking"));
+        assert!(history.contains("recent visible answer"));
+    }
+
+    #[test]
+    fn test_context_management_clear_thinking_keep_all_preserves_thinking() {
+        use super::super::types::{
+            ContextEdit, ContextEditKeep, ContextManagement, Message as AnthropicMessage,
+        };
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("first"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "old hidden thinking"},
+                        {"type": "text", "text": "old visible answer"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("current"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: Some(ContextManagement {
+                edits: vec![ContextEdit {
+                    edit_type: "clear_thinking_20251015".to_string(),
+                    keep: Some(ContextEditKeep::String("all".to_string())),
+                }],
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("context management should convert");
+        let history = result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(message) => {
+                    Some(message.assistant_response_message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(history.contains("old hidden thinking"));
+        assert!(history.contains("old visible answer"));
     }
 
     #[test]
@@ -4567,6 +4874,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            context_management: None,
             metadata: None,
         };
 
