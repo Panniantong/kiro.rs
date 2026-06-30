@@ -18,12 +18,12 @@ use crate::kiro::model::requests::tool::{
 
 use super::types::{ContentBlock, ContextEditKeep, MessagesRequest};
 
-/// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
+/// 规范化 JSON Schema，修复 MCP 工具定义中常见的兼容问题。
 ///
-/// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
-/// 导致上游返回 400 "Improperly formed request"。
+/// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null`、
+/// 非标准类型（如 `long`）或 Bedrock/Kiro 不支持的组合 schema，导致上游返回 400。
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
-    let serde_json::Value::Object(mut obj) = schema else {
+    let serde_json::Value::Object(mut obj) = normalize_schema_value(schema, true) else {
         return serde_json::json!({
             "type": "object",
             "properties": {},
@@ -32,26 +32,75 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         });
     };
 
+    normalize_schema_object(&mut obj, true);
+
+    serde_json::Value::Object(obj)
+}
+
+fn normalize_schema_value(value: serde_json::Value, is_root: bool) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(mut obj) => {
+            normalize_schema_object(&mut obj, is_root);
+            serde_json::Value::Object(obj)
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(|value| normalize_schema_value(value, false))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn normalize_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>, is_root: bool) {
     // type（必须是字符串）
-    if !obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-    {
-        obj.insert(
-            "type".to_string(),
-            serde_json::Value::String("object".to_string()),
-        );
+    match obj.remove("type").and_then(normalize_schema_type) {
+        Some(schema_type) => {
+            obj.insert("type".to_string(), schema_type);
+        }
+        None if is_root => {
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String("object".to_string()),
+            );
+        }
+        None if obj.contains_key("properties") => {
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String("object".to_string()),
+            );
+        }
+        None if obj.contains_key("items") => {
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String("array".to_string()),
+            );
+        }
+        None => {}
+    }
+
+    flatten_schema_combinators(obj);
+
+    // Bedrock/Kiro 对 custom.input_schema 顶层组合 schema 支持很差；放宽为普通 schema。
+    for key in ["oneOf", "anyOf", "allOf"] {
+        obj.remove(key);
     }
 
     // properties（必须是 object）
-    match obj.get("properties") {
-        Some(serde_json::Value::Object(_)) => {}
-        _ => {
+    match obj.get_mut("properties") {
+        Some(serde_json::Value::Object(properties)) => {
+            for value in properties.values_mut() {
+                *value = normalize_schema_value(std::mem::take(value), false);
+            }
+        }
+        _ if is_root => {
             obj.insert(
                 "properties".to_string(),
                 serde_json::Value::Object(serde_json::Map::new()),
             );
+        }
+        _ => {
+            obj.remove("properties");
         }
     }
 
@@ -62,22 +111,210 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
                 .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
                 .collect(),
         ),
-        _ => serde_json::Value::Array(Vec::new()),
+        _ if is_root => serde_json::Value::Array(Vec::new()),
+        _ => serde_json::Value::Null,
     };
-    obj.insert("required".to_string(), required);
+    if !required.is_null() {
+        obj.insert("required".to_string(), required);
+    }
 
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
-    match obj.get("additionalProperties") {
-        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => {
+    match obj.get_mut("additionalProperties") {
+        Some(serde_json::Value::Bool(_)) => {}
+        Some(value @ serde_json::Value::Object(_)) => {
+            *value = normalize_schema_value(std::mem::take(value), false);
+        }
+        _ if is_root => {
             obj.insert(
                 "additionalProperties".to_string(),
                 serde_json::Value::Bool(true),
             );
         }
+        _ => {
+            obj.remove("additionalProperties");
+        }
     }
 
-    serde_json::Value::Object(obj)
+    normalize_schema_map_values(obj, "$defs");
+    normalize_schema_map_values(obj, "definitions");
+    normalize_schema_map_values(obj, "patternProperties");
+    normalize_schema_items(obj);
+    remove_kiro_unsafe_numeric_limits(obj);
+}
+
+fn normalize_schema_map_values(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
+    match obj.get_mut(key) {
+        Some(serde_json::Value::Object(values)) => {
+            for value in values.values_mut() {
+                *value = normalize_schema_value(std::mem::take(value), false);
+            }
+        }
+        Some(_) => {
+            obj.remove(key);
+        }
+        None => {}
+    }
+}
+
+fn normalize_schema_items(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    match obj.get_mut("items") {
+        Some(value @ serde_json::Value::Object(_)) | Some(value @ serde_json::Value::Array(_)) => {
+            *value = normalize_schema_value(std::mem::take(value), false);
+        }
+        Some(serde_json::Value::Bool(_)) | None => {}
+        Some(_) => {
+            obj.remove("items");
+        }
+    }
+}
+
+fn flatten_schema_combinators(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in ["allOf", "oneOf", "anyOf"] {
+        let Some(serde_json::Value::Array(variants)) = obj.get(key).cloned() else {
+            continue;
+        };
+
+        let candidates: Vec<_> = match key {
+            "allOf" => variants
+                .into_iter()
+                .filter_map(|value| match value {
+                    serde_json::Value::Object(obj) => Some(obj),
+                    _ => None,
+                })
+                .collect(),
+            _ => variants
+                .into_iter()
+                .find_map(|value| match value {
+                    serde_json::Value::Object(obj) => Some(vec![obj]),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+        };
+
+        for candidate in candidates {
+            merge_schema_object(obj, candidate);
+        }
+    }
+}
+
+fn merge_schema_object(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in source {
+        if matches!(key.as_str(), "oneOf" | "anyOf" | "allOf") {
+            continue;
+        }
+
+        match (target.get_mut(&key), value) {
+            (
+                Some(serde_json::Value::Object(target_props)),
+                serde_json::Value::Object(source_props),
+            ) if matches!(
+                key.as_str(),
+                "properties" | "$defs" | "definitions" | "patternProperties"
+            ) =>
+            {
+                for (prop_key, prop_value) in source_props {
+                    target_props.entry(prop_key).or_insert(prop_value);
+                }
+            }
+            (
+                Some(serde_json::Value::Array(target_required)),
+                serde_json::Value::Array(source_required),
+            ) if key == "required" => {
+                for required in source_required {
+                    if required
+                        .as_str()
+                        .is_some_and(|required| !target_required.iter().any(|v| v == required))
+                    {
+                        target_required.push(required);
+                    }
+                }
+            }
+            (Some(_), _) => {}
+            (None, value) => {
+                target.insert(key, value);
+            }
+        }
+    }
+}
+
+fn normalize_schema_type(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::String(schema_type) => normalize_schema_type_name(&schema_type)
+            .map(|schema_type| serde_json::Value::String(schema_type.to_string())),
+        serde_json::Value::Array(values) => {
+            let mut normalized = Vec::new();
+            for value in values {
+                let Some(schema_type) = value.as_str().and_then(normalize_schema_type_name) else {
+                    continue;
+                };
+                if !normalized
+                    .iter()
+                    .any(|value: &serde_json::Value| value.as_str() == Some(schema_type))
+                {
+                    normalized.push(serde_json::Value::String(schema_type.to_string()));
+                }
+            }
+            match normalized.len() {
+                0 => None,
+                1 => normalized.into_iter().next(),
+                _ => Some(serde_json::Value::Array(normalized)),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn normalize_schema_type_name(schema_type: &str) -> Option<&'static str> {
+    match schema_type.trim().to_ascii_lowercase().as_str() {
+        "string" | "str" => Some("string"),
+        "number" | "float" | "double" | "decimal" => Some("number"),
+        "integer" | "int" | "long" | "short" | "byte" | "bigint" | "int32" | "int64" | "uint"
+        | "uint32" | "uint64" => Some("integer"),
+        "object" | "dict" | "map" | "record" => Some("object"),
+        "array" | "list" | "tuple" => Some("array"),
+        "boolean" | "bool" => Some("boolean"),
+        "null" => Some("null"),
+        _ => None,
+    }
+}
+
+fn remove_kiro_unsafe_numeric_limits(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    ] {
+        if obj.get(key).is_some_and(is_kiro_unsafe_number) {
+            obj.remove(key);
+        }
+    }
+}
+
+fn is_kiro_unsafe_number(value: &serde_json::Value) -> bool {
+    let serde_json::Value::Number(number) = value else {
+        return false;
+    };
+
+    if number.as_i64().is_some() {
+        return false;
+    }
+
+    if let Some(value) = number.as_u64() {
+        return value > i64::MAX as u64;
+    }
+
+    number
+        .as_f64()
+        .is_some_and(|value| value.abs() > i64::MAX as f64)
 }
 
 /// 追加到 Write 工具 description 末尾的内容
@@ -2413,6 +2650,100 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_normalize_json_schema_maps_nonstandard_types_recursively() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nid": {
+                    "type": "long",
+                    "description": "history record id"
+                },
+                "enabled": {
+                    "type": "bool"
+                },
+                "items": {
+                    "type": "list",
+                    "items": {
+                        "type": "str"
+                    }
+                }
+            },
+            "required": ["nid", 7, null],
+            "additionalProperties": {
+                "type": "double"
+            }
+        });
+
+        let normalized = normalize_json_schema(schema);
+
+        assert_eq!(
+            normalized["properties"]["nid"]["type"].as_str(),
+            Some("integer")
+        );
+        assert_eq!(
+            normalized["properties"]["enabled"]["type"].as_str(),
+            Some("boolean")
+        );
+        assert_eq!(
+            normalized["properties"]["items"]["type"].as_str(),
+            Some("array")
+        );
+        assert_eq!(
+            normalized["properties"]["items"]["items"]["type"].as_str(),
+            Some("string")
+        );
+        assert_eq!(normalized["required"], serde_json::json!(["nid"]));
+        assert_eq!(
+            normalized["additionalProperties"]["type"].as_str(),
+            Some("number")
+        );
+    }
+
+    #[test]
+    fn test_normalize_json_schema_removes_kiro_unsafe_constraints() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "anyOf": [
+                                {"enum": ["pending", "completed"]},
+                                {"const": "deleted"}
+                            ]
+                        },
+                        "count": {
+                            "type": "integer",
+                            "maximum": u64::MAX
+                        },
+                        "script": {
+                            "type": "string",
+                            "maxLength": 524288
+                        }
+                    }
+                }
+            ]
+        });
+
+        let normalized = normalize_json_schema(schema);
+
+        assert_eq!(normalized["type"].as_str(), Some("object"));
+        assert!(normalized.get("oneOf").is_none());
+        assert!(
+            normalized["properties"]["status"].get("anyOf").is_none(),
+            "组合 schema 应被移除，避免 Bedrock/Kiro 拒绝"
+        );
+        assert!(
+            normalized["properties"]["count"].get("maximum").is_none(),
+            "超过 i64 的数字约束会触发 int too big，应移除"
+        );
+        assert_eq!(
+            normalized["properties"]["script"]["maxLength"].as_i64(),
+            Some(524288)
+        );
     }
 
     #[test]
