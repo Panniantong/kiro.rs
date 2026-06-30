@@ -717,7 +717,9 @@ fn process_message_content(
                         }
                         "image" => {
                             if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
+                                if let Some(format) =
+                                    get_image_format(&source.media_type, &source.data)
+                                {
                                     images.push(KiroImage::from_base64(format, source.data));
                                 }
                             }
@@ -1075,8 +1077,15 @@ pub(crate) fn final_text_override_for_request_with_armor(
     None
 }
 
-/// 从 media_type 获取图片格式
-fn get_image_format(media_type: &str) -> Option<String> {
+/// 从 media_type 和图片文件头获取 Kiro 图片格式。
+///
+/// 一些客户端会把 PNG/GIF/WebP 错标成 JPEG，Bedrock/Kiro 会按真实文件头拒绝。
+/// 这里只修正格式标签，不改图片字节；无法识别文件头时回退到客户端声明。
+fn get_image_format(media_type: &str, data: &str) -> Option<String> {
+    detect_image_format_from_base64(data).or_else(|| get_declared_image_format(media_type))
+}
+
+fn get_declared_image_format(media_type: &str) -> Option<String> {
     match media_type {
         "image/jpeg" => Some("jpeg".to_string()),
         "image/png" => Some("png".to_string()),
@@ -1084,6 +1093,31 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/webp" => Some("webp".to_string()),
         _ => None,
     }
+}
+
+fn detect_image_format_from_base64(data: &str) -> Option<String> {
+    let bytes = BASE64_STANDARD.decode(data).ok()?;
+    detect_image_format(&bytes).map(str::to_string)
+}
+
+fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("jpeg");
+    }
+
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+
+    None
 }
 
 /// 提取工具结果内容
@@ -2744,6 +2778,47 @@ mod tests {
             normalized["properties"]["script"]["maxLength"].as_i64(),
             Some(524288)
         );
+    }
+
+    #[test]
+    fn test_get_image_format_prefers_detected_bytes_over_declared_media_type() {
+        assert_eq!(
+            get_image_format("image/jpeg", "iVBORw0KGgo="),
+            Some("png".to_string())
+        );
+        assert_eq!(
+            get_image_format("image/png", "/9j/4AAQSkZJRg=="),
+            Some("jpeg".to_string())
+        );
+        assert_eq!(
+            get_image_format("image/jpeg", "not-valid-base64"),
+            Some("jpeg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_process_message_content_corrects_mismatched_image_format() {
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": "iVBORw0KGgo="
+                }
+            },
+            {
+                "type": "text",
+                "text": "describe it"
+            }
+        ]);
+
+        let (text, images, tool_results) = process_message_content(&content).unwrap();
+
+        assert_eq!(text, "describe it");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert!(tool_results.is_empty());
     }
 
     #[test]
