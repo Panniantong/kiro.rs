@@ -192,7 +192,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
-    /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
+    /// 工具名称映射（Kiro 兼容名称 → 原始名称）
     pub tool_name_map: HashMap<String, String>,
 }
 
@@ -439,7 +439,10 @@ pub fn convert_request_with_armor(
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
+        tracing::info!(
+            "工具名称映射: {} 个名称已转换为 Kiro 兼容格式",
+            tool_name_map.len()
+        );
     }
 
     Ok(ConversionResult {
@@ -1139,29 +1142,80 @@ fn remove_empty_history_user_messages(history: &mut Vec<Message>) {
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
 
-/// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
-fn shorten_tool_name(name: &str) -> String {
+fn tool_name_hash_suffix(name: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.as_bytes());
     let hash_hex = format!("{:x}", hasher.finalize());
-    let hash_suffix = &hash_hex[..8];
-    // 54 prefix + 1 underscore + 8 hash = 63
-    let prefix_max = TOOL_NAME_MAX_LEN - 1 - 8;
-    let prefix = match name.char_indices().nth(prefix_max) {
-        Some((idx, _)) => &name[..idx],
-        None => name,
-    };
-    format!("{}_{}", prefix, hash_suffix)
+    hash_hex[..8].to_string()
 }
 
-/// 如果名称超长则缩短，并记录映射（short → original）
+fn sanitize_tool_name(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    let mut last_was_separator = false;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch);
+            last_was_separator = false;
+        } else if !last_was_separator {
+            sanitized.push('_');
+            last_was_separator = true;
+        }
+    }
+
+    let sanitized = sanitized.trim_matches('_').to_string();
+    if sanitized.is_empty() {
+        "tool".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// 生成确定性 Kiro 兼容名称：安全前缀 + "_" + 8 位 SHA256 hex
+fn shorten_tool_name(name: &str) -> String {
+    let safe_name = sanitize_tool_name(name);
+    let hash_suffix = tool_name_hash_suffix(name);
+    // 54 prefix + 1 underscore + 8 hash = 63
+    let prefix_max = TOOL_NAME_MAX_LEN - 1 - 8;
+    let prefix = if safe_name.len() > prefix_max {
+        &safe_name[..prefix_max]
+    } else {
+        &safe_name
+    }
+    .trim_end_matches('_');
+
+    if prefix.is_empty() {
+        format!("tool_{}", hash_suffix)
+    } else {
+        format!("{}_{}", prefix, hash_suffix)
+    }
+}
+
+fn is_kiro_safe_tool_name(name: &str) -> bool {
+    name.len() <= TOOL_NAME_MAX_LEN
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// 如果名称不兼容 Kiro 或超长，则转换为安全名称，并记录映射（safe → original）
 fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
-    if name.len() <= TOOL_NAME_MAX_LEN {
+    if is_kiro_safe_tool_name(name) {
         return name.to_string();
     }
-    let short = shorten_tool_name(name);
-    tool_name_map.insert(short.clone(), name.to_string());
-    short
+
+    let safe = shorten_tool_name(name);
+    tool_name_map.insert(safe.clone(), name.to_string());
+    safe
+}
+
+fn normalize_tool_description(name: &str, description: &str) -> String {
+    if description.trim().is_empty() {
+        format!("Tool {}", name)
+    } else {
+        description.to_string()
+    }
 }
 
 /// 转换工具定义
@@ -1176,7 +1230,7 @@ fn convert_tools(
     tools
         .iter()
         .map(|t| {
-            let mut description = t.description.clone();
+            let mut description = normalize_tool_description(&t.name, &t.description);
 
             // 对 Write/Edit 工具追加自定义描述后缀
             let suffix = match t.name.as_str() {
@@ -3763,7 +3817,22 @@ mod tests {
         let long_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         let result = map_tool_name(long_name, &mut map);
         assert!(result.len() <= TOOL_NAME_MAX_LEN);
+        assert!(is_kiro_safe_tool_name(&result));
         assert_eq!(map.get(&result), Some(&long_name.to_string()));
+    }
+
+    #[test]
+    fn test_map_tool_name_sanitizes_mcp_hyphen_namespace() {
+        let mut map = HashMap::new();
+        let original = "mcp__read-feishu-document__get_document_content";
+
+        let result = map_tool_name(original, &mut map);
+
+        assert_ne!(result, original);
+        assert!(is_kiro_safe_tool_name(&result));
+        assert!(result.len() <= TOOL_NAME_MAX_LEN);
+        assert!(result.starts_with("mcp_read_feishu_document_get_document_content_"));
+        assert_eq!(map.get(&result), Some(&original.to_string()));
     }
 
     #[test]
@@ -3819,6 +3888,57 @@ mod tests {
             .user_input_message_context
             .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    #[test]
+    fn test_tool_name_mapping_in_convert_request_for_mcp_hyphen_namespace() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let original_tool_name = "mcp__read-feishu-document__get_document_content";
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(vec![AnthropicTool {
+                name: original_tool_name.to_string(),
+                description: "".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            context_management: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+
+        assert_eq!(result.tool_name_map.len(), 1);
+        let (safe_name, original) = result.tool_name_map.iter().next().unwrap();
+        assert_eq!(original, original_tool_name);
+        assert!(is_kiro_safe_tool_name(safe_name));
+
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        assert_eq!(tools[0].tool_specification.name, *safe_name);
+        assert_ne!(tools[0].tool_specification.name, original_tool_name);
+        assert!(!tools[0].tool_specification.description.trim().is_empty());
     }
 
     #[test]
