@@ -1715,17 +1715,10 @@ fn rewrite_first_length_delimited_field(
 fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("5-sonnet")
-        {
-            return Some("claude-sonnet-5");
-        }
-
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            return Some("claude-sonnet-4-6");
-        }
+    if model_lower.contains("sonnet")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"))
+    {
+        return Some("claude-sonnet-4-6");
     }
 
     if !model_lower.contains("opus") {
@@ -2775,30 +2768,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hvoy_api_check_mode_supports_sonnet5_signature_model() {
-        let mut ctx = StreamContext::new_with_signature_mode(
-            "claude-sonnet-5",
-            1,
-            true,
-            SignatureMode::HvoyApiCheck,
-            true,
-            HashMap::new(),
-        );
-        let _initial_events = ctx.generate_initial_events();
-
-        let mut all_events = Vec::new();
-        all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nanswer"));
-        all_events.extend(ctx.generate_final_events());
-
-        let signatures = collect_signatures(&all_events);
+    fn test_hvoy_signature_public_model_name_rejects_sonnet5_aliases() {
+        assert_eq!(hvoy_signature_public_model_name("claude-sonnet-5"), None);
         assert_eq!(
-            signatures.len(),
-            1,
-            "Sonnet 5 should get one fallback signature_delta in HVOY/API-CHECK mode"
+            hvoy_signature_public_model_name("claude-sonnet-5-thinking"),
+            None
         );
-        assert_signature_contains_public_model(&signatures[0], "claude-sonnet-5");
-        assert_eq!(collect_thinking_content(&all_events), "abc");
-        assert_eq!(collect_text_content(&all_events), "answer");
+        assert_eq!(hvoy_signature_public_model_name("sonnet5"), None);
     }
 
     #[test]

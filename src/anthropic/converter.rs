@@ -369,12 +369,7 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("5-sonnet")
-        {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
@@ -414,7 +409,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 alias、Opus 4.7 / 4.8 同 1M
+/// 4.7 / 4.8 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
@@ -2850,10 +2845,6 @@ mod tests {
     #[test]
     fn test_map_model_hvoy_target_models() {
         let cases = [
-            ("claude-sonnet-5", "claude-sonnet-4.6"),
-            ("claude-sonnet-5-thinking", "claude-sonnet-4.6"),
-            ("sonnet5", "claude-sonnet-4.6"),
-            ("claude-5-sonnet", "claude-sonnet-4.6"),
             ("claude-opus-4-8", "claude-opus-4.8"),
             ("claude-opus-4-8-thinking", "claude-opus-4.8"),
             ("claude-opus-4-7", "claude-opus-4.7"),
@@ -2867,6 +2858,19 @@ mod tests {
         for (requested_model, kiro_model) in cases {
             assert_eq!(map_model(requested_model), Some(kiro_model.to_string()));
             assert_eq!(get_context_window_size(requested_model), 1_000_000);
+        }
+    }
+
+    #[test]
+    fn test_map_model_rejects_unsupported_sonnet5_aliases() {
+        for requested_model in [
+            "claude-sonnet-5",
+            "claude-sonnet-5-thinking",
+            "sonnet5",
+            "claude-5-sonnet",
+        ] {
+            assert_eq!(map_model(requested_model), None);
+            assert_eq!(get_context_window_size(requested_model), 200_000);
         }
     }
 

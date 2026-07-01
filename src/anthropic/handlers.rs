@@ -140,24 +140,6 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
-            id: "claude-sonnet-5".to_string(),
-            object: "model".to_string(),
-            created: 1782864000, // Jul 1, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128_000,
-        },
-        Model {
-            id: "claude-sonnet-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1782864000, // Jul 1, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128_000,
-        },
-        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1779897600, // May 28, 2026
@@ -1022,9 +1004,7 @@ fn hvoy_api_check_signature_mode(
 
 fn is_hvoy_api_check_public_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model.contains("claude-sonnet-5")
-        || model.contains("sonnet5")
-        || model.contains("claude-opus-4-8")
+    model.contains("claude-opus-4-8")
         || model.contains("claude-opus-4-7")
         || model.contains("claude-opus-4-6")
         || model.contains("claude-sonnet-4-6")
@@ -2029,10 +2009,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hvoy_api_check_public_model_accepts_sonnet5() {
-        assert!(is_hvoy_api_check_public_model("claude-sonnet-5"));
-        assert!(is_hvoy_api_check_public_model("claude-sonnet-5-thinking"));
-        assert!(is_hvoy_api_check_public_model("sonnet5"));
+    fn test_hvoy_api_check_public_model_rejects_sonnet5_aliases() {
+        assert!(!is_hvoy_api_check_public_model("claude-sonnet-5"));
+        assert!(!is_hvoy_api_check_public_model("claude-sonnet-5-thinking"));
+        assert!(!is_hvoy_api_check_public_model("sonnet5"));
     }
 
     #[test]
