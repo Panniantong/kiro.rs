@@ -1715,10 +1715,17 @@ fn rewrite_first_length_delimited_field(
 fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"))
-    {
-        return Some("claude-sonnet-4-6");
+    if model_lower.contains("sonnet") {
+        if model_lower.contains("sonnet-5")
+            || model_lower.contains("sonnet5")
+            || model_lower.contains("5-sonnet")
+        {
+            return Some("claude-sonnet-5");
+        }
+
+        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+            return Some("claude-sonnet-4-6");
+        }
     }
 
     if !model_lower.contains("opus") {
@@ -2768,13 +2775,19 @@ mod tests {
     }
 
     #[test]
-    fn test_hvoy_signature_public_model_name_rejects_sonnet5_aliases() {
-        assert_eq!(hvoy_signature_public_model_name("claude-sonnet-5"), None);
+    fn test_hvoy_signature_public_model_name_keeps_sonnet5_native() {
+        assert_eq!(
+            hvoy_signature_public_model_name("claude-sonnet-5"),
+            Some("claude-sonnet-5")
+        );
         assert_eq!(
             hvoy_signature_public_model_name("claude-sonnet-5-thinking"),
-            None
+            Some("claude-sonnet-5")
         );
-        assert_eq!(hvoy_signature_public_model_name("sonnet5"), None);
+        assert_eq!(
+            hvoy_signature_public_model_name("sonnet5"),
+            Some("claude-sonnet-5")
+        );
     }
 
     #[test]

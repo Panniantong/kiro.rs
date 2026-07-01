@@ -437,8 +437,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
+| `*sonnet5*` / `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
-| 未知 / 未来 Sonnet 版本 | 不映射 |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
