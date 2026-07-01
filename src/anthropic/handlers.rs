@@ -10,6 +10,7 @@ use std::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::{KiroByteStream, KiroProvider, KiroStreamResponse};
 use crate::kiro::token_manager::AllRateLimitedError;
 use crate::model::config::MaxRelayConfig;
 use crate::token;
@@ -24,7 +25,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
-use tokio::time::interval;
+use tokio::time::{Interval, interval};
 use uuid::Uuid;
 
 use super::converter::{
@@ -399,6 +400,8 @@ pub async fn post_messages(
     tracing::debug!("Kiro request body: {}", request_body);
 
     let signature_mode = signature_mode_for_messages_request(&payload, &headers);
+    let guard_empty_stream_success =
+        final_text_override.is_none() && should_guard_empty_stream_success(&payload, &headers);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -434,6 +437,7 @@ pub async fn post_messages(
             emit_thinking_text,
             tool_name_map,
             final_text_override,
+            guard_empty_stream_success,
         )
         .await
     } else {
@@ -456,7 +460,7 @@ pub async fn post_messages(
 
 /// 处理流式请求
 async fn handle_stream_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
@@ -465,7 +469,23 @@ async fn handle_stream_request(
     emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
+    guard_empty_stream_success: bool,
 ) -> Response {
+    if guard_empty_stream_success {
+        return handle_stream_request_with_empty_retry(
+            provider,
+            request_body,
+            model,
+            input_tokens,
+            thinking_enabled,
+            signature_mode,
+            emit_thinking_text,
+            tool_name_map,
+            final_text_override,
+        )
+        .await;
+    }
+
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
@@ -501,15 +521,288 @@ async fn handle_stream_request(
 
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
+const EMPTY_STREAM_MAX_ATTEMPTS: usize = 3;
 
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+fn create_upstream_unavailable_sse() -> Bytes {
+    let data = json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": "Upstream service temporarily unavailable. Please retry later."
+        }
+    });
+    Bytes::from(format!("event: error\ndata: {}\n\n", data))
+}
+
+async fn handle_stream_request_with_empty_retry(
+    provider: std::sync::Arc<KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    signature_mode: SignatureMode,
+    emit_thinking_text: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    final_text_override: Option<String>,
+) -> Response {
+    let first_response = match provider.call_api_stream(request_body).await {
+        Ok(resp) => resp,
+        Err(e) => return map_provider_error(e),
+    };
+
+    let stream = create_retrying_buffered_sse_stream(
+        provider,
+        request_body.to_string(),
+        model.to_string(),
+        input_tokens,
+        thinking_enabled,
+        signature_mode,
+        emit_thinking_text,
+        tool_name_map,
+        final_text_override,
+        first_response,
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+enum EmptyStreamRetryState {
+    Start {
+        remaining_attempts: usize,
+    },
+    Reading {
+        body_stream: KiroByteStream,
+        ctx: BufferedStreamContext,
+        decoder: EventStreamDecoder,
+        credential_id: u64,
+        remaining_attempts: usize,
+        ping_interval: Interval,
+    },
+    Done,
+}
+
+fn new_buffered_context(
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    signature_mode: SignatureMode,
+    emit_thinking_text: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    final_text_override: Option<String>,
+) -> BufferedStreamContext {
+    BufferedStreamContext::new_with_signature_mode(
+        model,
+        input_tokens,
+        thinking_enabled,
+        signature_mode,
+        emit_thinking_text,
+        tool_name_map,
+    )
+    .with_final_text_override(final_text_override)
+}
+
+fn reading_state_for_response(
+    response: KiroStreamResponse,
+    ctx: BufferedStreamContext,
+    remaining_attempts: usize,
+) -> EmptyStreamRetryState {
+    let credential_id = response.credential_id();
+    EmptyStreamRetryState::Reading {
+        body_stream: response.bytes_stream(),
+        ctx,
+        decoder: EventStreamDecoder::new(),
+        credential_id,
+        remaining_attempts,
+        ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+    }
+}
+
+fn create_retrying_buffered_sse_stream(
+    provider: std::sync::Arc<KiroProvider>,
+    request_body: String,
+    model: String,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    signature_mode: SignatureMode,
+    emit_thinking_text: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    final_text_override: Option<String>,
+    first_response: KiroStreamResponse,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let first_ctx = new_buffered_context(
+        &model,
+        input_tokens,
+        thinking_enabled,
+        signature_mode,
+        emit_thinking_text,
+        tool_name_map.clone(),
+        final_text_override.clone(),
+    );
+    let initial_state =
+        reading_state_for_response(first_response, first_ctx, EMPTY_STREAM_MAX_ATTEMPTS);
+
+    stream::unfold(initial_state, move |state| {
+        let provider = provider.clone();
+        let request_body = request_body.clone();
+        let model = model.clone();
+        let tool_name_map = tool_name_map.clone();
+        let final_text_override = final_text_override.clone();
+
+        async move {
+            match state {
+                EmptyStreamRetryState::Done => None,
+                EmptyStreamRetryState::Start { remaining_attempts } => {
+                    if remaining_attempts == 0 {
+                        return Some((
+                            vec![Ok(create_upstream_unavailable_sse())],
+                            EmptyStreamRetryState::Done,
+                        ));
+                    }
+
+                    match provider.call_api_stream(&request_body).await {
+                        Ok(response) => {
+                            let ctx = new_buffered_context(
+                                &model,
+                                input_tokens,
+                                thinking_enabled,
+                                signature_mode,
+                                emit_thinking_text,
+                                tool_name_map,
+                                final_text_override,
+                            );
+                            Some((
+                                Vec::new(),
+                                reading_state_for_response(response, ctx, remaining_attempts),
+                            ))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "空流重试时上游调用失败");
+                            Some((
+                                vec![Ok(create_upstream_unavailable_sse())],
+                                EmptyStreamRetryState::Done,
+                            ))
+                        }
+                    }
+                }
+                EmptyStreamRetryState::Reading {
+                    mut body_stream,
+                    mut ctx,
+                    mut decoder,
+                    credential_id,
+                    remaining_attempts,
+                    mut ping_interval,
+                } => {
+                    tokio::select! {
+                        _ = ping_interval.tick() => {
+                            Some((
+                                vec![Ok(create_ping_sse())],
+                                EmptyStreamRetryState::Reading {
+                                    body_stream,
+                                    ctx,
+                                    decoder,
+                                    credential_id,
+                                    remaining_attempts,
+                                    ping_interval,
+                                },
+                            ))
+                        }
+                        chunk_result = body_stream.next() => {
+                            match chunk_result {
+                                Some(Ok(chunk)) => {
+                                    if let Err(e) = decoder.feed(&chunk) {
+                                        tracing::warn!("缓冲区溢出: {}", e);
+                                    }
+
+                                    for result in decoder.decode_iter() {
+                                        match result {
+                                            Ok(frame) => {
+                                                if let Ok(event) = Event::from_frame(frame) {
+                                                    ctx.process_and_buffer(&event);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("解码事件失败: {}", e);
+                                            }
+                                        }
+                                    }
+
+                                    Some((
+                                        Vec::new(),
+                                        EmptyStreamRetryState::Reading {
+                                            body_stream,
+                                            ctx,
+                                            decoder,
+                                            credential_id,
+                                            remaining_attempts,
+                                            ping_interval,
+                                        },
+                                    ))
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!(credential_id, error = %e, "读取保护流失败，准备重试");
+                                    provider.report_empty_stream_retry(credential_id);
+                                    let remaining_attempts = remaining_attempts.saturating_sub(1);
+                                    if remaining_attempts == 0 {
+                                        Some((
+                                            vec![Ok(create_upstream_unavailable_sse())],
+                                            EmptyStreamRetryState::Done,
+                                        ))
+                                    } else {
+                                        Some((
+                                            Vec::new(),
+                                            EmptyStreamRetryState::Start { remaining_attempts },
+                                        ))
+                                    }
+                                }
+                                None => {
+                                    if ctx.has_meaningful_output() {
+                                        let all_events = ctx.finish_and_get_all_events();
+                                        let bytes = all_events
+                                            .into_iter()
+                                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                            .collect();
+                                        Some((bytes, EmptyStreamRetryState::Done))
+                                    } else {
+                                        tracing::warn!(credential_id, "上游 2xx 流结束但没有可交付内容，准备重试");
+                                        provider.report_empty_stream_retry(credential_id);
+                                        let remaining_attempts = remaining_attempts.saturating_sub(1);
+                                        if remaining_attempts == 0 {
+                                            Some((
+                                                vec![Ok(create_upstream_unavailable_sse())],
+                                                EmptyStreamRetryState::Done,
+                                            ))
+                                        } else {
+                                            Some((
+                                                Vec::new(),
+                                                EmptyStreamRetryState::Start { remaining_attempts },
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .flat_map(stream::iter)
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    response: KiroStreamResponse,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
@@ -911,6 +1204,26 @@ fn should_emit_thinking_text(_model: &str, thinking: Option<&Thinking>) -> bool 
         _ if thinking.thinking_type == "enabled" => true,
         _ => false,
     }
+}
+
+fn should_guard_empty_stream_success(payload: &MessagesRequest, headers: &HeaderMap) -> bool {
+    if !payload.stream {
+        return false;
+    }
+
+    let model = payload.model.to_ascii_lowercase();
+    let is_opus_47 = model.contains("claude-opus-4-7") || model.contains("claude-opus-4.7");
+    if !is_opus_47 {
+        return false;
+    }
+
+    let is_claude_cli = is_claude_code_request(payload) || has_claude_code_headers(headers);
+    if !is_claude_cli {
+        return false;
+    }
+
+    let tool_count = payload.tools.as_ref().map_or(0, Vec::len);
+    payload.messages.len() >= 40 || tool_count >= 20 || payload.max_tokens >= 32_000
 }
 
 fn is_claude_code_request(payload: &MessagesRequest) -> bool {
@@ -1739,7 +2052,7 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
-    response: reqwest::Response,
+    response: KiroStreamResponse,
     ctx: BufferedStreamContext,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
@@ -1825,6 +2138,7 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::types::MessagesRequest;
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
 
@@ -1834,6 +2148,48 @@ mod tests {
             display: display.map(str::to_string),
             budget_tokens: 1024,
         }
+    }
+
+    fn guard_test_payload(
+        model: &str,
+        stream: bool,
+        message_count: usize,
+        tool_count: usize,
+        max_tokens: i32,
+        claude_code_system: bool,
+    ) -> MessagesRequest {
+        let system_text = if claude_code_system {
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        } else {
+            "You are a helpful assistant."
+        };
+        let messages: Vec<_> = (0..message_count)
+            .map(|index| {
+                json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("message {}", index)
+                })
+            })
+            .collect();
+        let tools: Vec<_> = (0..tool_count)
+            .map(|index| {
+                json!({
+                    "name": format!("tool_{}", index),
+                    "description": "test tool",
+                    "input_schema": {}
+                })
+            })
+            .collect();
+
+        serde_json::from_value(json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "stream": stream,
+            "system": [{"text": system_text}],
+            "messages": messages,
+            "tools": tools
+        }))
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1873,6 +2229,42 @@ mod tests {
         let body_text = body.to_string();
         assert!(!body_text.contains("12/12"));
         assert!(!body_text.contains("凭据"));
+    }
+
+    #[test]
+    fn empty_stream_guard_targets_long_claude_cli_opus47_trace() {
+        let payload = guard_test_payload("claude-opus-4-7", true, 53, 32, 64_000, true);
+        let headers = HeaderMap::new();
+
+        assert!(should_guard_empty_stream_success(&payload, &headers));
+    }
+
+    #[test]
+    fn empty_stream_guard_ignores_normal_or_short_requests() {
+        let headers = HeaderMap::new();
+        let normal_user = guard_test_payload("claude-opus-4-7", true, 53, 32, 64_000, false);
+        assert!(!should_guard_empty_stream_success(&normal_user, &headers));
+
+        let short_claude_cli = guard_test_payload("claude-opus-4-7", true, 3, 2, 1024, true);
+        assert!(!should_guard_empty_stream_success(
+            &short_claude_cli,
+            &headers
+        ));
+
+        let sonnet = guard_test_payload("claude-sonnet-4-6", true, 53, 32, 64_000, true);
+        assert!(!should_guard_empty_stream_success(&sonnet, &headers));
+
+        let non_stream = guard_test_payload("claude-opus-4-7", false, 53, 32, 64_000, true);
+        assert!(!should_guard_empty_stream_success(&non_stream, &headers));
+    }
+
+    #[test]
+    fn empty_stream_guard_accepts_claude_cli_header() {
+        let payload = guard_test_payload("claude-opus-4-7", true, 53, 32, 64_000, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.195"));
+
+        assert!(should_guard_empty_stream_success(&payload, &headers));
     }
 
     #[test]
