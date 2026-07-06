@@ -73,6 +73,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
+    /// 导入备注（用于标记号商批次、导入时间或账号性质）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_note: Option<String>,
+
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -352,6 +356,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            import_note: None,
             subscription_title: None,
             overage_status: None,
             proxy_url: None,
@@ -391,6 +396,17 @@ mod tests {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 5);
+    }
+
+    #[test]
+    fn test_import_note_roundtrip() {
+        let json = r#"{"refreshToken": "test", "importNote": "Batch 001 - test 1P"}"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.import_note, Some("Batch 001 - test 1P".to_string()));
+
+        let serialized = creds.to_pretty_json().unwrap();
+        assert!(serialized.contains("importNote"));
+        assert!(serialized.contains("Batch 001 - test 1P"));
     }
 
     #[test]
@@ -472,6 +488,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            import_note: None,
             subscription_title: None,
             overage_status: None,
             proxy_url: None,
@@ -505,6 +522,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            import_note: None,
             subscription_title: None,
             overage_status: None,
             proxy_url: None,
@@ -621,6 +639,7 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            import_note: None,
             subscription_title: None,
             overage_status: None,
             proxy_url: None,

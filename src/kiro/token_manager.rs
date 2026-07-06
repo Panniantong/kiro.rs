@@ -520,6 +520,9 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 导入备注（用于前端显示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_note: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1861,6 +1864,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    import_note: e.credentials.import_note.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -2198,6 +2202,7 @@ impl MultiTokenManager {
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        validated_cred.import_note = new_cred.import_note;
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
@@ -2910,6 +2915,7 @@ mod tests {
         let mut api_key_cred = KiroCredentials::default();
         api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
         api_key_cred.auth_method = Some("api_key".to_string());
+        api_key_cred.import_note = Some("Batch 001 - test 1P".to_string());
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());
@@ -2917,6 +2923,11 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.entries[0].import_note.as_deref(),
+            Some("Batch 001 - test 1P")
+        );
     }
 
     #[tokio::test]

@@ -85,6 +85,7 @@ impl AdminService {
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
+                import_note: entry.import_note,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -286,6 +287,10 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
+        let import_note = req
+            .import_note
+            .map(|note| note.trim().to_string())
+            .filter(|note| !note.is_empty());
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
@@ -301,6 +306,7 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            import_note,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             overage_status: None,     // 将在首次获取使用额度时自动同步
             proxy_url: req.proxy_url,

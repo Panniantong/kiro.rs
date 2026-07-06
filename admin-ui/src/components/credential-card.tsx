@@ -311,6 +311,12 @@ export function CredentialCard({
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
+            {credential.importNote && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">备注：</span>
+                <span className="font-medium break-words">{credential.importNote}</span>
+              </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">基础用量：</span>
               {loadingBalance ? (

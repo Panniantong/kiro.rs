@@ -9,6 +9,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -30,6 +31,7 @@ interface CredentialInput {
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
+  importNote?: string
 }
 
 interface VerificationResult {
@@ -47,6 +49,7 @@ interface VerificationResult {
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [batchNote, setBatchNote] = useState('')
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
@@ -79,6 +82,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   const resetForm = () => {
     setJsonInput('')
+    setBatchNote('')
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
@@ -131,9 +135,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       let rollbackSkippedCount = 0
 
       // 4. 导入并验活
+      const sharedImportNote = batchNote.trim()
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+        const importNote = sharedImportNote || cred.importNote?.trim() || undefined
 
         // 更新状态为检查中
         setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
@@ -234,6 +240,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
+              importNote,
             })
 
             addedCredId = addedCred.credentialId
@@ -283,6 +290,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
+            importNote,
           })
 
           addedCredId = addedCred.credentialId
@@ -431,6 +439,19 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <p className="text-xs text-muted-foreground">
               💡 导入时自动验活，失败的凭据会被排除
             </p>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">
+              导入备注
+            </label>
+            <Input
+              placeholder="例如：Batch 001 - 20 accounts - 20260705 / test 1P"
+              value={batchNote}
+              onChange={(e) => setBatchNote(e.target.value)}
+              disabled={importing}
+              maxLength={200}
+            />
           </div>
 
           {(importing || results.length > 0) && (
