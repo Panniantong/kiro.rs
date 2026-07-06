@@ -1526,8 +1526,11 @@ impl MultiTokenManager {
             entry.failure_count += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             let failure_count = entry.failure_count;
+            let import_note = entry.credentials.import_note.clone().unwrap_or_default();
 
             tracing::warn!(
+                credential_id = id,
+                import_note = %import_note,
                 "凭据 #{} API 调用失败（{}/{}）",
                 id,
                 failure_count,
@@ -1540,6 +1543,8 @@ impl MultiTokenManager {
                 let cooldown_until = Utc::now() + Self::chrono_duration(TOO_MANY_FAILURES_COOLDOWN);
                 entry.cooldown_until = Some(cooldown_until);
                 tracing::error!(
+                    credential_id = id,
+                    import_note = %import_note,
                     "凭据 #{} 已连续失败 {} 次，已被临时禁用至 {}",
                     id,
                     failure_count,
@@ -1592,7 +1597,10 @@ impl MultiTokenManager {
                         _ => cooldown_until,
                     });
                     entry.last_used_at = Some(now.to_rfc3339());
+                    let import_note = entry.credentials.import_note.clone().unwrap_or_default();
                     tracing::warn!(
+                        credential_id = id,
+                        import_note = %import_note,
                         "凭据 #{} 触发上游 429，冷却至 {}",
                         id,
                         entry.cooldown_until.unwrap().to_rfc3339()
@@ -1636,8 +1644,14 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            let import_note = entry.credentials.import_note.clone().unwrap_or_default();
 
-            tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
+            tracing::error!(
+                credential_id = id,
+                import_note = %import_note,
+                "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用",
+                id
+            );
 
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
@@ -1686,8 +1700,11 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.refresh_failure_count += 1;
             let refresh_failure_count = entry.refresh_failure_count;
+            let import_note = entry.credentials.import_note.clone().unwrap_or_default();
 
             tracing::warn!(
+                credential_id = id,
+                import_note = %import_note,
                 "凭据 #{} Token 刷新失败（{}/{}）",
                 id,
                 refresh_failure_count,
@@ -1703,6 +1720,8 @@ impl MultiTokenManager {
             entry.cooldown_until = None;
 
             tracing::error!(
+                credential_id = id,
+                import_note = %import_note,
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
                 id,
                 refresh_failure_count
@@ -1751,8 +1770,11 @@ impl MultiTokenManager {
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
             entry.cooldown_until = None;
+            let import_note = entry.credentials.import_note.clone().unwrap_or_default();
 
             tracing::error!(
+                credential_id = id,
+                import_note = %import_note,
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
                 id
             );
@@ -2207,6 +2229,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        let import_note_for_log = validated_cred.import_note.clone().unwrap_or_default();
 
         {
             let mut entries = self.entries.lock();
@@ -2229,7 +2252,12 @@ impl MultiTokenManager {
         // 6. 持久化
         self.persist_credentials()?;
 
-        tracing::info!("成功添加凭据 #{}", new_id);
+        tracing::info!(
+            credential_id = new_id,
+            import_note = %import_note_for_log,
+            "成功添加凭据 #{}",
+            new_id
+        );
         Ok(new_id)
     }
 

@@ -110,6 +110,10 @@ impl KiroProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
+    fn credential_import_note(credentials: &KiroCredentials) -> &str {
+        credentials.import_note.as_deref().unwrap_or("")
+    }
+
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
@@ -188,6 +192,8 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
                         "凭据 #{} MCP 请求发送失败（尝试 {}/{}）: {}",
                         ctx.id,
                         attempt + 1,
@@ -207,6 +213,8 @@ impl KiroProvider {
             let status = response.status();
 
             tracing::info!(
+                credential_id = ctx.id,
+                import_note = %Self::credential_import_note(&ctx.credentials),
                 "上游响应 凭据 #{} status={} ttfb_ms={} 尝试 {}/{}",
                 ctx.id,
                 status.as_u16(),
@@ -265,19 +273,34 @@ impl KiroProvider {
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                    tracing::info!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
+                        "凭据 #{} token 疑似被上游失效，尝试强制刷新",
+                        ctx.id
+                    );
                     if self
                         .token_manager
                         .force_refresh_token_for(ctx.id)
                         .await
                         .is_ok()
                     {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        tracing::info!(
+                            credential_id = ctx.id,
+                            import_note = %Self::credential_import_note(&ctx.credentials),
+                            "凭据 #{} token 强制刷新成功，重试请求",
+                            ctx.id
+                        );
                         self.token_manager
                             .report_attempt_finished_without_success(ctx.id);
                         continue;
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
+                        "凭据 #{} token 强制刷新失败，计入失败",
+                        ctx.id
+                    );
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -297,6 +320,8 @@ impl KiroProvider {
                         .report_attempt_finished_without_success(ctx.id);
                 }
                 tracing::warn!(
+                    credential_id = ctx.id,
+                    import_note = %Self::credential_import_note(&ctx.credentials),
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -408,6 +433,8 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
                         "凭据 #{} API 请求发送失败（尝试 {}/{}）: {}",
                         ctx.id,
                         attempt + 1,
@@ -429,6 +456,8 @@ impl KiroProvider {
             let status = response.status();
 
             tracing::info!(
+                credential_id = ctx.id,
+                import_note = %Self::credential_import_note(&ctx.credentials),
                 "上游响应 凭据 #{} status={} ttfb_ms={} model={} 尝试 {}/{}",
                 ctx.id,
                 status.as_u16(),
@@ -454,6 +483,8 @@ impl KiroProvider {
                 // AWS 侧 overage=ENABLED 且全局开关开启：放行软冷却轮换，不永久禁用
                 if self.token_manager.is_overage_enabled(ctx.id) {
                     tracing::warn!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
                         "额度用尽但 overage=ENABLED，放行轮换（尝试 {}/{}）: {} {}",
                         attempt + 1,
                         max_retries,
@@ -479,6 +510,8 @@ impl KiroProvider {
                 }
 
                 tracing::warn!(
+                    credential_id = ctx.id,
+                    import_note = %Self::credential_import_note(&ctx.credentials),
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -515,6 +548,8 @@ impl KiroProvider {
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
+                    credential_id = ctx.id,
+                    import_note = %Self::credential_import_note(&ctx.credentials),
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -525,19 +560,34 @@ impl KiroProvider {
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                    tracing::info!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
+                        "凭据 #{} token 疑似被上游失效，尝试强制刷新",
+                        ctx.id
+                    );
                     if self
                         .token_manager
                         .force_refresh_token_for(ctx.id)
                         .await
                         .is_ok()
                     {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        tracing::info!(
+                            credential_id = ctx.id,
+                            import_note = %Self::credential_import_note(&ctx.credentials),
+                            "凭据 #{} token 强制刷新成功，重试请求",
+                            ctx.id
+                        );
                         self.token_manager
                             .report_attempt_finished_without_success(ctx.id);
                         continue;
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
+                        "凭据 #{} token 强制刷新失败，计入失败",
+                        ctx.id
+                    );
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -569,6 +619,8 @@ impl KiroProvider {
                         .report_attempt_finished_without_success(ctx.id);
                 }
                 tracing::warn!(
+                    credential_id = ctx.id,
+                    import_note = %Self::credential_import_note(&ctx.credentials),
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
@@ -596,6 +648,8 @@ impl KiroProvider {
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
+                credential_id = ctx.id,
+                import_note = %Self::credential_import_note(&ctx.credentials),
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
                 max_retries,
