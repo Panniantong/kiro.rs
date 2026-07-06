@@ -39,6 +39,7 @@ enum UpstreamFailureClass {
     Upstream4xx,
     QuotaExhausted,
     AllRateLimited,
+    AcquireContextError,
     UpstreamOther,
 }
 
@@ -54,6 +55,7 @@ impl UpstreamFailureClass {
             Self::Upstream4xx => "upstream_4xx",
             Self::QuotaExhausted => "quota_exhausted",
             Self::AllRateLimited => "all_rate_limited",
+            Self::AcquireContextError => "acquire_context_error",
             Self::UpstreamOther => "upstream_other",
         }
     }
@@ -196,8 +198,8 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
+                    let error_message = e.to_string();
                     if e.downcast_ref::<AllRateLimitedError>().is_some() {
-                        let error_message = e.to_string();
                         Self::log_upstream_failure(FailureAttemptLog {
                             credential_id: None,
                             model: None,
@@ -209,6 +211,21 @@ impl KiroProvider {
                             upstream_status: None,
                             retry_after: None,
                             error_class: UpstreamFailureClass::AllRateLimited,
+                            body: None,
+                            error_message: Some(&error_message),
+                        });
+                    } else {
+                        Self::log_upstream_failure(FailureAttemptLog {
+                            credential_id: None,
+                            model: None,
+                            api_type: "mcp",
+                            is_stream: false,
+                            attempt: attempt_number,
+                            max_retries,
+                            elapsed_ms: 0,
+                            upstream_status: None,
+                            retry_after: None,
+                            error_class: UpstreamFailureClass::AcquireContextError,
                             body: None,
                             error_message: Some(&error_message),
                         });
@@ -446,9 +463,9 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
+                    let error_message = e.to_string();
                     // RPM 全限：立即终止重试，交由 HTTP 层映射为通用上游不可用。
                     if e.downcast_ref::<AllRateLimitedError>().is_some() {
-                        let error_message = e.to_string();
                         Self::log_upstream_failure(FailureAttemptLog {
                             credential_id: None,
                             model: model.as_deref(),
@@ -465,6 +482,20 @@ impl KiroProvider {
                         });
                         return Err(e);
                     }
+                    Self::log_upstream_failure(FailureAttemptLog {
+                        credential_id: None,
+                        model: model.as_deref(),
+                        api_type,
+                        is_stream,
+                        attempt: attempt_number,
+                        max_retries,
+                        elapsed_ms: 0,
+                        upstream_status: None,
+                        retry_after: None,
+                        error_class: UpstreamFailureClass::AcquireContextError,
+                        body: None,
+                        error_message: Some(&error_message),
+                    });
                     last_error = Some(e);
                     continue;
                 }
