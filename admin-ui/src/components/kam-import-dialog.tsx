@@ -148,6 +148,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [batchNote, setBatchNote] = useState('')
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
@@ -172,6 +173,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setBatchNote('')
   }
 
   const handleImport = async () => {
@@ -220,6 +222,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       let duplicateCount = 0
       let failCount = 0
       let skippedCount = 0
+      const sharedImportNote = batchNote.trim()
 
       for (let i = 0; i < validAccounts.length; i++) {
         const account = validAccounts[i]
@@ -281,6 +284,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            email: account.email?.trim() || undefined,
+            importNote: sharedImportNote || undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -421,6 +426,19 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">导入备注</label>
+            <input
+              type="text"
+              placeholder="例如：7.7 9:51 / 号商 A / 230 质保12h"
+              value={batchNote}
+              onChange={(e) => setBatchNote(e.target.value)}
+              disabled={importing}
+              maxLength={200}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
             />
           </div>
 
