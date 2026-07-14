@@ -28,6 +28,65 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 上游失败日志中的 body 摘要最大字符数。
+const BODY_SUMMARY_MAX_CHARS: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamFailureClass {
+    SendError,
+    Upstream5xx,
+    Upstream429,
+    Upstream401403,
+    Upstream400,
+    Upstream408,
+    Upstream4xx,
+    QuotaExhausted,
+    AllRateLimited,
+    AcquireContextError,
+    UpstreamOther,
+}
+
+impl UpstreamFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SendError => "send_error",
+            Self::Upstream5xx => "upstream_5xx",
+            Self::Upstream429 => "upstream_429",
+            Self::Upstream401403 => "upstream_401_403",
+            Self::Upstream400 => "upstream_400",
+            Self::Upstream408 => "upstream_408",
+            Self::Upstream4xx => "upstream_4xx",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::AllRateLimited => "all_rate_limited",
+            Self::AcquireContextError => "acquire_context_error",
+            Self::UpstreamOther => "upstream_other",
+        }
+    }
+}
+
+struct SafeBodySummary {
+    original_len: usize,
+    summary_len: usize,
+    truncated: bool,
+    text: String,
+}
+
+struct FailureAttemptLog<'a> {
+    credential_id: Option<u64>,
+    import_note: Option<&'a str>,
+    model: Option<&'a str>,
+    api_type: &'a str,
+    is_stream: bool,
+    attempt: usize,
+    max_retries: usize,
+    elapsed_ms: u64,
+    upstream_status: Option<reqwest::StatusCode>,
+    retry_after: Option<Duration>,
+    error_class: UpstreamFailureClass,
+    body: Option<&'a str>,
+    error_message: Option<&'a str>,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -178,10 +237,45 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
+            let attempt_number = attempt + 1;
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
+                    let error_message = e.to_string();
+                    if e.downcast_ref::<AllRateLimitedError>().is_some() {
+                        Self::log_upstream_failure(FailureAttemptLog {
+                            credential_id: None,
+                            import_note: None,
+                            model: None,
+                            api_type: "mcp",
+                            is_stream: false,
+                            attempt: attempt_number,
+                            max_retries,
+                            elapsed_ms: 0,
+                            upstream_status: None,
+                            retry_after: None,
+                            error_class: UpstreamFailureClass::AllRateLimited,
+                            body: None,
+                            error_message: Some(&error_message),
+                        });
+                    } else {
+                        Self::log_upstream_failure(FailureAttemptLog {
+                            credential_id: None,
+                            import_note: None,
+                            model: None,
+                            api_type: "mcp",
+                            is_stream: false,
+                            attempt: attempt_number,
+                            max_retries,
+                            elapsed_ms: 0,
+                            upstream_status: None,
+                            retry_after: None,
+                            error_class: UpstreamFailureClass::AcquireContextError,
+                            body: None,
+                            error_message: Some(&error_message),
+                        });
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -230,19 +324,26 @@ impl KiroProvider {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        import_note = %Self::credential_import_note(&ctx.credentials),
-                        "凭据 #{} MCP 请求发送失败（尝试 {}/{}）: {}",
-                        ctx.id,
-                        attempt + 1,
+                    let error_message = e.to_string();
+                    Self::log_upstream_failure(FailureAttemptLog {
+                        credential_id: Some(ctx.id),
+                        import_note: Some(Self::credential_import_note(&ctx.credentials)),
+                        model: None,
+                        api_type: "mcp",
+                        is_stream: false,
+                        attempt: attempt_number,
                         max_retries,
-                        e
-                    );
+                        elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        upstream_status: None,
+                        retry_after: None,
+                        error_class: UpstreamFailureClass::SendError,
+                        body: None,
+                        error_message: Some(&error_message),
+                    });
                     self.token_manager
                         .report_attempt_finished_without_success(ctx.id);
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
+                    if attempt_number < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -250,20 +351,20 @@ impl KiroProvider {
             };
 
             let status = response.status();
-
-            tracing::info!(
-                credential_id = ctx.id,
-                import_note = %Self::credential_import_note(&ctx.credentials),
-                "上游响应 凭据 #{} status={} ttfb_ms={} 尝试 {}/{}",
-                ctx.id,
-                status.as_u16(),
-                start.elapsed().as_millis(),
-                attempt + 1,
-                max_retries
-            );
-
             // 成功响应
             if status.is_success() {
+                tracing::info!(
+                    request_outcome = "success",
+                    credential_id = ctx.id,
+                    import_note = %Self::credential_import_note(&ctx.credentials),
+                    upstream_status = status.as_u16(),
+                    ttfb_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    api_type = "mcp",
+                    is_stream = false,
+                    attempt = attempt_number,
+                    max_retries = max_retries,
+                    "上游响应成功"
+                );
                 self.token_manager.report_success(ctx.id);
                 return Ok(response);
             }
@@ -272,31 +373,44 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+            let is_quota_exhausted =
+                status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body);
+            let failure_class =
+                Self::classify_upstream_failure(Some(status), false, is_quota_exhausted, false);
+            Self::log_upstream_failure(FailureAttemptLog {
+                credential_id: Some(ctx.id),
+                import_note: Some(Self::credential_import_note(&ctx.credentials)),
+                model: None,
+                api_type: "mcp",
+                is_stream: false,
+                attempt: attempt_number,
+                max_retries,
+                elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                upstream_status: Some(status),
+                retry_after,
+                error_class: failure_class,
+                body: Some(&body),
+                error_message: None,
+            });
+            let detail = format!("{} {}", status, body);
 
             // 402 额度用尽
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            if is_quota_exhausted {
                 // AWS 侧 overage=ENABLED 且全局开关开启：放行软冷却轮换，不永久禁用
                 if self.token_manager.is_overage_enabled(ctx.id) {
-                    tracing::warn!(
-                        "额度用尽但 overage=ENABLED，放行轮换（尝试 {}/{}）: {} {}",
-                        attempt + 1,
-                        max_retries,
-                        status,
-                        body
-                    );
                     let has_available = self.token_manager.report_rate_limited(ctx.id, None);
                     if !has_available {
-                        anyhow::bail!("MCP 请求失败（所有凭据超额冷却中）: {} {}", status, body);
+                        anyhow::bail!("MCP 请求失败（所有凭据超额冷却中）: {}", detail);
                     }
-                    last_error = Some(anyhow::anyhow!("MCP 超额放行轮换: {} {}", status, body));
+                    last_error = Some(anyhow::anyhow!("MCP 超额放行轮换: {}", detail));
                     continue;
                 }
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", detail);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", detail));
                 continue;
             }
 
@@ -304,7 +418,7 @@ impl KiroProvider {
             if status.as_u16() == 400 {
                 self.token_manager
                     .report_attempt_finished_without_success(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!("MCP 请求失败: {}", detail);
             }
 
             // 401/403 凭据问题
@@ -344,9 +458,9 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", detail);
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", detail));
                 continue;
             }
 
@@ -358,17 +472,8 @@ impl KiroProvider {
                     self.token_manager
                         .report_attempt_finished_without_success(ctx.id);
                 }
-                tracing::warn!(
-                    credential_id = ctx.id,
-                    import_note = %Self::credential_import_note(&ctx.credentials),
-                    "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                if attempt + 1 < max_retries {
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", detail));
+                if attempt_number < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
@@ -378,14 +483,14 @@ impl KiroProvider {
             if status.is_client_error() {
                 self.token_manager
                     .report_attempt_finished_without_success(ctx.id);
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                anyhow::bail!("MCP 请求失败: {}", detail);
             }
 
             // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", detail));
             self.token_manager
                 .report_attempt_finished_without_success(ctx.id);
-            if attempt + 1 < max_retries {
+            if attempt_number < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
@@ -416,14 +521,46 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
 
         for attempt in 0..max_retries {
+            let attempt_number = attempt + 1;
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
+                    let error_message = e.to_string();
                     // RPM 全限：立即终止重试，交由 HTTP 层映射为通用上游不可用。
                     if e.downcast_ref::<AllRateLimitedError>().is_some() {
+                        Self::log_upstream_failure(FailureAttemptLog {
+                            credential_id: None,
+                            import_note: None,
+                            model: model.as_deref(),
+                            api_type,
+                            is_stream,
+                            attempt: attempt_number,
+                            max_retries,
+                            elapsed_ms: 0,
+                            upstream_status: None,
+                            retry_after: None,
+                            error_class: UpstreamFailureClass::AllRateLimited,
+                            body: None,
+                            error_message: Some(&error_message),
+                        });
                         return Err(e);
                     }
+                    Self::log_upstream_failure(FailureAttemptLog {
+                        credential_id: None,
+                        import_note: None,
+                        model: model.as_deref(),
+                        api_type,
+                        is_stream,
+                        attempt: attempt_number,
+                        max_retries,
+                        elapsed_ms: 0,
+                        upstream_status: None,
+                        retry_after: None,
+                        error_class: UpstreamFailureClass::AcquireContextError,
+                        body: None,
+                        error_message: Some(&error_message),
+                    });
                     last_error = Some(e);
                     continue;
                 }
@@ -471,21 +608,28 @@ impl KiroProvider {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        import_note = %Self::credential_import_note(&ctx.credentials),
-                        "凭据 #{} API 请求发送失败（尝试 {}/{}）: {}",
-                        ctx.id,
-                        attempt + 1,
+                    let error_message = e.to_string();
+                    Self::log_upstream_failure(FailureAttemptLog {
+                        credential_id: Some(ctx.id),
+                        import_note: Some(Self::credential_import_note(&ctx.credentials)),
+                        model: model.as_deref(),
+                        api_type,
+                        is_stream,
+                        attempt: attempt_number,
                         max_retries,
-                        e
-                    );
+                        elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        upstream_status: None,
+                        retry_after: None,
+                        error_class: UpstreamFailureClass::SendError,
+                        body: None,
+                        error_message: Some(&error_message),
+                    });
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     self.token_manager
                         .report_attempt_finished_without_success(ctx.id);
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
+                    if attempt_number < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -493,21 +637,21 @@ impl KiroProvider {
             };
 
             let status = response.status();
-
-            tracing::info!(
-                credential_id = ctx.id,
-                import_note = %Self::credential_import_note(&ctx.credentials),
-                "上游响应 凭据 #{} status={} ttfb_ms={} model={} 尝试 {}/{}",
-                ctx.id,
-                status.as_u16(),
-                start.elapsed().as_millis(),
-                model.as_deref().unwrap_or("?"),
-                attempt + 1,
-                max_retries
-            );
-
             // 成功响应
             if status.is_success() {
+                tracing::info!(
+                    request_outcome = "success",
+                    credential_id = ctx.id,
+                    import_note = %Self::credential_import_note(&ctx.credentials),
+                    upstream_status = status.as_u16(),
+                    ttfb_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    model = model.as_deref().unwrap_or("?"),
+                    api_type = api_type,
+                    is_stream = is_stream,
+                    attempt = attempt_number,
+                    max_retries = max_retries,
+                    "上游响应成功"
+                );
                 self.token_manager.report_success(ctx.id);
                 return Ok((response, ctx.id));
             }
@@ -516,64 +660,49 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            let is_quota_exhausted =
+                status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body);
+            let failure_class =
+                Self::classify_upstream_failure(Some(status), false, is_quota_exhausted, false);
+            Self::log_upstream_failure(FailureAttemptLog {
+                credential_id: Some(ctx.id),
+                import_note: Some(Self::credential_import_note(&ctx.credentials)),
+                model: model.as_deref(),
+                api_type,
+                is_stream,
+                attempt: attempt_number,
+                max_retries,
+                elapsed_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                upstream_status: Some(status),
+                retry_after,
+                error_class: failure_class,
+                body: Some(&body),
+                error_message: None,
+            });
+            let detail = format!("{} {}", status, body);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            if is_quota_exhausted {
                 // AWS 侧 overage=ENABLED 且全局开关开启：放行软冷却轮换，不永久禁用
                 if self.token_manager.is_overage_enabled(ctx.id) {
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        import_note = %Self::credential_import_note(&ctx.credentials),
-                        "额度用尽但 overage=ENABLED，放行轮换（尝试 {}/{}）: {} {}",
-                        attempt + 1,
-                        max_retries,
-                        status,
-                        body
-                    );
                     let has_available = self.token_manager.report_rate_limited(ctx.id, None);
                     if !has_available {
                         anyhow::bail!(
-                            "{} API 请求失败（所有凭据超额冷却中）: {} {}",
+                            "{} API 请求失败（所有凭据超额冷却中）: {}",
                             api_type,
-                            status,
-                            body
+                            detail
                         );
                     }
-                    last_error = Some(anyhow::anyhow!(
-                        "{} 超额放行轮换: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ));
+                    last_error = Some(anyhow::anyhow!("{} 超额放行轮换: {}", api_type, detail));
                     continue;
                 }
 
-                tracing::warn!(
-                    credential_id = ctx.id,
-                    import_note = %Self::credential_import_note(&ctx.credentials),
-                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    anyhow::bail!("{} API 请求失败（所有凭据已用尽）: {}", api_type, detail);
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(anyhow::anyhow!("{} API 请求失败: {}", api_type, detail));
                 continue;
             }
 
@@ -581,21 +710,11 @@ impl KiroProvider {
             if status.as_u16() == 400 {
                 self.token_manager
                     .report_attempt_finished_without_success(ctx.id);
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {}", api_type, detail);
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
-                tracing::warn!(
-                    credential_id = ctx.id,
-                    import_note = %Self::credential_import_note(&ctx.credentials),
-                    "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -631,20 +750,10 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    anyhow::bail!("{} API 请求失败（所有凭据已用尽）: {}", api_type, detail);
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(anyhow::anyhow!("{} API 请求失败: {}", api_type, detail));
                 continue;
             }
 
@@ -657,22 +766,8 @@ impl KiroProvider {
                     self.token_manager
                         .report_attempt_finished_without_success(ctx.id);
                 }
-                tracing::warn!(
-                    credential_id = ctx.id,
-                    import_note = %Self::credential_import_note(&ctx.credentials),
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
-                if attempt + 1 < max_retries {
+                last_error = Some(anyhow::anyhow!("{} API 请求失败: {}", api_type, detail));
+                if attempt_number < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
@@ -682,28 +777,14 @@ impl KiroProvider {
             if status.is_client_error() {
                 self.token_manager
                     .report_attempt_finished_without_success(ctx.id);
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {}", api_type, detail);
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
-            tracing::warn!(
-                credential_id = ctx.id,
-                import_note = %Self::credential_import_note(&ctx.credentials),
-                "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
-                max_retries,
-                status,
-                body
-            );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
+            last_error = Some(anyhow::anyhow!("{} API 请求失败: {}", api_type, detail));
             self.token_manager
                 .report_attempt_finished_without_success(ctx.id);
-            if attempt + 1 < max_retries {
+            if attempt_number < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
@@ -754,6 +835,174 @@ impl KiroProvider {
             .parse::<u64>()
             .ok()
             .map(Duration::from_secs)
+    }
+
+    fn classify_upstream_failure(
+        status: Option<reqwest::StatusCode>,
+        is_send_error: bool,
+        is_quota_exhausted: bool,
+        is_all_rate_limited: bool,
+    ) -> UpstreamFailureClass {
+        if is_all_rate_limited {
+            return UpstreamFailureClass::AllRateLimited;
+        }
+        if is_send_error {
+            return UpstreamFailureClass::SendError;
+        }
+        if is_quota_exhausted {
+            return UpstreamFailureClass::QuotaExhausted;
+        }
+
+        match status.map(|s| s.as_u16()) {
+            Some(500..=599) => UpstreamFailureClass::Upstream5xx,
+            Some(429) => UpstreamFailureClass::Upstream429,
+            Some(401 | 403) => UpstreamFailureClass::Upstream401403,
+            Some(400) => UpstreamFailureClass::Upstream400,
+            Some(408) => UpstreamFailureClass::Upstream408,
+            Some(402..=499) => UpstreamFailureClass::Upstream4xx,
+            _ => UpstreamFailureClass::UpstreamOther,
+        }
+    }
+
+    fn safe_body_summary(body: &str) -> SafeBodySummary {
+        let redacted = Self::redact_sensitive_text(body);
+        let (text, truncated) = Self::truncate_for_log(&redacted, BODY_SUMMARY_MAX_CHARS);
+
+        SafeBodySummary {
+            original_len: body.len(),
+            summary_len: text.len(),
+            truncated,
+            text,
+        }
+    }
+
+    fn log_upstream_failure(event: FailureAttemptLog<'_>) {
+        let body_summary = Self::safe_body_summary(event.body.unwrap_or_default());
+        let error_summary = Self::safe_body_summary(event.error_message.unwrap_or_default());
+        let upstream_status = event.upstream_status.map(|status| status.as_u16());
+        let retry_after_secs = event.retry_after.map(|duration| duration.as_secs());
+
+        tracing::warn!(
+            request_outcome = "failure_attempt",
+            credential_id = event.credential_id.unwrap_or_default(),
+            credential_id_present = event.credential_id.is_some(),
+            import_note = event.import_note.unwrap_or(""),
+            model = event.model.unwrap_or("?"),
+            api_type = event.api_type,
+            is_stream = event.is_stream,
+            attempt = event.attempt,
+            max_retries = event.max_retries,
+            elapsed_ms = event.elapsed_ms,
+            upstream_status = upstream_status.unwrap_or_default(),
+            upstream_status_present = upstream_status.is_some(),
+            retry_after_secs = retry_after_secs.unwrap_or_default(),
+            retry_after_present = retry_after_secs.is_some(),
+            error_class = event.error_class.as_str(),
+            body_len = body_summary.original_len,
+            body_summary_len = body_summary.summary_len,
+            body_summary_truncated = body_summary.truncated,
+            body_summary = %body_summary.text,
+            error_message_len = error_summary.original_len,
+            error_message_summary_len = error_summary.summary_len,
+            error_message_truncated = error_summary.truncated,
+            error_message = %error_summary.text,
+            "上游失败尝试"
+        );
+    }
+
+    fn redact_sensitive_text(text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) {
+            Self::redact_sensitive_json_value(&mut value);
+            if let Ok(redacted) = serde_json::to_string(&value) {
+                return redacted;
+            }
+        }
+
+        text.lines()
+            .map(|line| {
+                if Self::line_contains_sensitive_key(line) {
+                    "[REDACTED_SENSITIVE_LINE]".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn redact_sensitive_json_value(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    if Self::is_sensitive_key(key) {
+                        *value = serde_json::Value::String("[REDACTED]".to_string());
+                    } else {
+                        Self::redact_sensitive_json_value(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::redact_sensitive_json_value(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn line_contains_sensitive_key(line: &str) -> bool {
+        let lowered = line.to_ascii_lowercase();
+        [
+            "authorization",
+            "cookie",
+            "set-cookie",
+            "refresh_token",
+            "refreshtoken",
+            "access_token",
+            "accesstoken",
+            "id_token",
+            "api_key",
+            "apikey",
+            "x-api-key",
+            "secret",
+            "session",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+    }
+
+    fn is_sensitive_key(key: &str) -> bool {
+        let normalized: String = key
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .flat_map(|ch| ch.to_lowercase())
+            .collect();
+
+        [
+            "authorization",
+            "cookie",
+            "setcookie",
+            "token",
+            "accesstoken",
+            "refreshtoken",
+            "idtoken",
+            "apikey",
+            "secret",
+            "session",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    }
+
+    fn truncate_for_log(text: &str, max_chars: usize) -> (String, bool) {
+        let mut iter = text.chars();
+        let truncated: String = iter.by_ref().take(max_chars).collect();
+        let was_truncated = iter.next().is_some();
+        (truncated, was_truncated)
     }
 }
 
@@ -808,6 +1057,112 @@ mod tests {
         fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
             body.to_string()
         }
+    }
+
+    #[test]
+    fn test_classify_upstream_failure() {
+        assert_eq!(
+            KiroProvider::classify_upstream_failure(None, true, false, false).as_str(),
+            "send_error"
+        );
+        assert_eq!(
+            KiroProvider::classify_upstream_failure(None, false, false, true).as_str(),
+            "all_rate_limited"
+        );
+        assert_eq!(
+            KiroProvider::classify_upstream_failure(
+                Some(reqwest::StatusCode::BAD_GATEWAY),
+                false,
+                false,
+                false
+            )
+            .as_str(),
+            "upstream_5xx"
+        );
+        assert_eq!(
+            KiroProvider::classify_upstream_failure(
+                Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+                false,
+                false,
+                false
+            )
+            .as_str(),
+            "upstream_429"
+        );
+        assert_eq!(
+            KiroProvider::classify_upstream_failure(
+                Some(reqwest::StatusCode::FORBIDDEN),
+                false,
+                false,
+                false
+            )
+            .as_str(),
+            "upstream_401_403"
+        );
+        assert_eq!(
+            KiroProvider::classify_upstream_failure(
+                Some(reqwest::StatusCode::BAD_REQUEST),
+                false,
+                false,
+                false
+            )
+            .as_str(),
+            "upstream_400"
+        );
+        assert_eq!(
+            KiroProvider::classify_upstream_failure(
+                Some(reqwest::StatusCode::PAYMENT_REQUIRED),
+                false,
+                true,
+                false
+            )
+            .as_str(),
+            "quota_exhausted"
+        );
+    }
+
+    #[test]
+    fn test_safe_body_summary_redacts_json_sensitive_fields() {
+        let body = r#"{
+            "message":"Invalid token provided",
+            "refresh_token":"rt_secret",
+            "Authorization":"Bearer access_secret",
+            "cookie":"session_id=secret_cookie",
+            "nested":{"apiKey":"kiro_secret"}
+        }"#;
+
+        let summary = KiroProvider::safe_body_summary(body);
+
+        assert!(summary.text.contains("Invalid token provided"));
+        assert!(summary.text.contains("[REDACTED]"));
+        assert!(!summary.text.contains("rt_secret"));
+        assert!(!summary.text.contains("Bearer access_secret"));
+        assert!(!summary.text.contains("secret_cookie"));
+        assert!(!summary.text.contains("kiro_secret"));
+    }
+
+    #[test]
+    fn test_safe_body_summary_redacts_plain_sensitive_lines() {
+        let body = "error=bad\nauthorization: Bearer access_secret\ncookie=session_id=secret_cookie\nnormal message";
+
+        let summary = KiroProvider::safe_body_summary(body);
+
+        assert!(summary.text.contains("error=bad"));
+        assert!(summary.text.contains("normal message"));
+        assert!(summary.text.contains("[REDACTED_SENSITIVE_LINE]"));
+        assert!(!summary.text.contains("Bearer access_secret"));
+        assert!(!summary.text.contains("secret_cookie"));
+    }
+
+    #[test]
+    fn test_safe_body_summary_truncates_long_body() {
+        let body = "x".repeat(BODY_SUMMARY_MAX_CHARS + 50);
+
+        let summary = KiroProvider::safe_body_summary(&body);
+
+        assert_eq!(summary.original_len, BODY_SUMMARY_MAX_CHARS + 50);
+        assert_eq!(summary.summary_len, BODY_SUMMARY_MAX_CHARS);
+        assert!(summary.truncated);
     }
 
     async fn rate_limit_first_credential(headers: HeaderMap) -> Response {

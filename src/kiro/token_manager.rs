@@ -25,6 +25,9 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{Config, MaxRelayConfig};
 
+/// Token refresh 失败日志中的 body 摘要最大字符数。
+const TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS: usize = 512;
+
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -61,6 +64,168 @@ fn mask_api_key(key: &str) -> String {
     } else {
         "***".to_string()
     }
+}
+
+fn classify_refresh_failure(
+    status: Option<reqwest::StatusCode>,
+    is_send_error: bool,
+) -> &'static str {
+    if is_send_error {
+        return "token_refresh_send_error";
+    }
+
+    match status.map(|s| s.as_u16()) {
+        Some(400) => "token_refresh_400",
+        Some(401 | 403) => "token_refresh_401_403",
+        Some(429) => "token_refresh_429",
+        Some(500..=599) => "token_refresh_5xx",
+        Some(402..=499) => "token_refresh_4xx",
+        _ => "token_refresh_other",
+    }
+}
+
+fn safe_log_text(text: &str, max_chars: usize) -> (String, usize, bool) {
+    let redacted = redact_sensitive_text(text);
+    let original_len = text.len();
+    let mut chars = redacted.chars();
+    let summary: String = chars.by_ref().take(max_chars).collect();
+    let truncated = chars.next().is_some();
+    (summary, original_len, truncated)
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) {
+        redact_sensitive_json_value(&mut value);
+        if let Ok(redacted) = serde_json::to_string(&value) {
+            return redacted;
+        }
+    }
+
+    text.lines()
+        .map(|line| {
+            if line_contains_sensitive_key(line) {
+                "[REDACTED_SENSITIVE_LINE]".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_sensitive_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *value = serde_json::Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_sensitive_json_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_sensitive_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn line_contains_sensitive_key(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    [
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "refresh_token",
+        "refreshtoken",
+        "access_token",
+        "accesstoken",
+        "id_token",
+        "client_secret",
+        "clientsecret",
+        "api_key",
+        "apikey",
+        "x-api-key",
+        "secret",
+        "session",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+
+    [
+        "authorization",
+        "cookie",
+        "setcookie",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "clientsecret",
+        "apikey",
+        "secret",
+        "session",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn log_token_refresh_failure(
+    credentials: &KiroCredentials,
+    auth_method: &str,
+    status: Option<reqwest::StatusCode>,
+    body_or_error: &str,
+    is_send_error: bool,
+) {
+    let (summary, original_len, truncated) =
+        safe_log_text(body_or_error, TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS);
+    let upstream_status = status.map(|status| status.as_u16());
+
+    tracing::warn!(
+        request_outcome = "token_refresh_failure_attempt",
+        credential_id = credentials.id.unwrap_or_default(),
+        credential_id_present = credentials.id.is_some(),
+        auth_method = auth_method,
+        upstream_status = upstream_status.unwrap_or_default(),
+        upstream_status_present = upstream_status.is_some(),
+        error_class = classify_refresh_failure(status, is_send_error),
+        body_len = original_len,
+        body_summary_len = summary.len(),
+        body_summary_truncated = truncated,
+        body_summary = %summary,
+        "Token refresh 失败尝试"
+    );
+}
+
+fn log_token_acquire_failure(id: u64, error: &anyhow::Error, permanently_invalid: bool) {
+    let error_message = error.to_string();
+    let (summary, original_len, truncated) =
+        safe_log_text(&error_message, TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS);
+
+    tracing::warn!(
+        request_outcome = "token_acquire_failure",
+        credential_id = id,
+        permanently_invalid = permanently_invalid,
+        error_len = original_len,
+        error_summary_len = summary.len(),
+        error_summary_truncated = truncated,
+        error_summary = %summary,
+        "凭据 Token 获取失败"
+    );
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -182,7 +347,7 @@ async fn refresh_social_token(
         refresh_token: refresh_token.to_string(),
     };
 
-    let response = client
+    let response = match client
         .post(&refresh_url)
         .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
@@ -195,11 +360,20 @@ async fn refresh_social_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            let error_message = err.to_string();
+            log_token_refresh_failure(credentials, "social", None, &error_message, true);
+            return Err(err.into());
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        log_token_refresh_failure(credentials, "social", Some(status), &body_text, false);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -281,7 +455,7 @@ async fn refresh_idc_token(
         grant_type: "refresh_token".to_string(),
     };
 
-    let response = client
+    let response = match client
         .post(&refresh_url)
         .header("content-type", "application/json")
         .header("x-amz-user-agent", x_amz_user_agent)
@@ -292,11 +466,20 @@ async fn refresh_idc_token(
         .header("Connection", "close")
         .json(&body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            let error_message = err.to_string();
+            log_token_refresh_failure(credentials, "idc", None, &error_message, true);
+            return Err(err.into());
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        log_token_refresh_failure(credentials, "idc", Some(status), &body_text, false);
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -1182,10 +1365,10 @@ impl MultiTokenManager {
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        log_token_acquire_failure(id, &e, true);
                         self.report_refresh_token_invalid(id)
                     } else {
-                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        log_token_acquire_failure(id, &e, false);
                         self.report_refresh_failure(id)
                     };
                     attempt_count += 1;
@@ -2900,6 +3083,80 @@ mod tests {
         credentials.refresh_token = Some("a".repeat(150));
         let result = validate_refresh_token(&credentials);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_classify_refresh_failure() {
+        assert_eq!(
+            classify_refresh_failure(None, true),
+            "token_refresh_send_error"
+        );
+        assert_eq!(
+            classify_refresh_failure(Some(reqwest::StatusCode::BAD_REQUEST), false),
+            "token_refresh_400"
+        );
+        assert_eq!(
+            classify_refresh_failure(Some(reqwest::StatusCode::UNAUTHORIZED), false),
+            "token_refresh_401_403"
+        );
+        assert_eq!(
+            classify_refresh_failure(Some(reqwest::StatusCode::FORBIDDEN), false),
+            "token_refresh_401_403"
+        );
+        assert_eq!(
+            classify_refresh_failure(Some(reqwest::StatusCode::TOO_MANY_REQUESTS), false),
+            "token_refresh_429"
+        );
+        assert_eq!(
+            classify_refresh_failure(Some(reqwest::StatusCode::BAD_GATEWAY), false),
+            "token_refresh_5xx"
+        );
+    }
+
+    #[test]
+    fn test_safe_log_text_redacts_json_sensitive_fields() {
+        let body = r#"{"error":"invalid_grant","refresh_token":"rt_secret","client_secret":"cs_secret","access_token":"at_secret","Authorization":"Bearer secret","cookie":"sid=secret"}"#;
+
+        let (summary, original_len, truncated) =
+            safe_log_text(body, TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS);
+
+        assert_eq!(original_len, body.len());
+        assert!(!truncated);
+        assert!(summary.contains("invalid_grant"));
+        assert!(summary.contains("[REDACTED]"));
+        assert!(!summary.contains("rt_secret"));
+        assert!(!summary.contains("cs_secret"));
+        assert!(!summary.contains("at_secret"));
+        assert!(!summary.contains("Bearer secret"));
+        assert!(!summary.contains("sid=secret"));
+    }
+
+    #[test]
+    fn test_safe_log_text_redacts_plain_sensitive_lines() {
+        let body = "error=invalid_grant\nrefresh_token=rt_secret\nplain reason";
+
+        let (summary, _, truncated) = safe_log_text(body, TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS);
+
+        assert!(!truncated);
+        assert!(summary.contains("error=invalid_grant"));
+        assert!(summary.contains("[REDACTED_SENSITIVE_LINE]"));
+        assert!(summary.contains("plain reason"));
+        assert!(!summary.contains("rt_secret"));
+    }
+
+    #[test]
+    fn test_safe_log_text_truncates_long_text() {
+        let body = "a".repeat(TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS + 10);
+
+        let (summary, original_len, truncated) =
+            safe_log_text(&body, TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS);
+
+        assert_eq!(original_len, body.len());
+        assert!(truncated);
+        assert_eq!(
+            summary.chars().count(),
+            TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS
+        );
     }
 
     #[test]
