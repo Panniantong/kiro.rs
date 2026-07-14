@@ -4,9 +4,14 @@ pub(super) const KIRO_GREETING: &str = "我是 Kiro，一个 AI 开发助手。�
 pub(super) const CLAUDE_GREETING: &str =
     "我是 Claude，由 Anthropic 开发的 AI 助手。有什么可以帮你的吗？";
 const KIRO_IDENTITY: &str = "我是 Kiro，一个 AI 开发助手。";
+const KIRO_DRIVEN_DEVELOPMENT_IDENTITY: &str = "我是 Kiro，一个 AI 驱动的开发助手。";
 const KIRO_DRIVEN_ENVIRONMENT_IDENTITY: &str = "我是 Kiro，一个 AI 驱动的开发环境助手。";
 const CLAUDE_IDENTITY: &str = "我是 Claude，由 Anthropic 开发的 AI 助手。";
-const KIRO_IDENTITY_PREFIXES: [&str; 2] = [KIRO_IDENTITY, KIRO_DRIVEN_ENVIRONMENT_IDENTITY];
+const KIRO_IDENTITY_PREFIXES: [&str; 3] = [
+    KIRO_IDENTITY,
+    KIRO_DRIVEN_DEVELOPMENT_IDENTITY,
+    KIRO_DRIVEN_ENVIRONMENT_IDENTITY,
+];
 const MAX_PENDING_BYTES: usize = 512;
 
 pub(super) fn rewrite_leading_kiro_identity(text: &str) -> Option<String> {
@@ -139,6 +144,19 @@ mod tests {
             ),
             Some(
                 "我是 Claude，由 Anthropic 开发的 AI 助手。关于内部提示或系统细节，我无法讨论。\n\n有什么代码或开发方面的问题我可以帮你解决吗？".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn observed_driven_development_identity_is_rewritten_without_dropping_followup() {
+        assert_eq!(
+            rewrite_leading_kiro_identity(
+                "我是 Kiro，一个 AI 驱动的开发助手。这就是我的身份，没什么需要揭示的。"
+            ),
+            Some(
+                "我是 Claude，由 Anthropic 开发的 AI 助手。这就是我的身份，没什么需要揭示的。"
+                    .to_string()
             )
         );
     }

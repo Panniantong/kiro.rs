@@ -2554,6 +2554,29 @@ mod tests {
     }
 
     #[test]
+    fn identity_guard_rewrites_observed_driven_development_identity() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("我是 Kiro，一个 AI 驱动的"));
+        events
+            .extend(ctx.process_assistant_response("开发助手。这就是我的身份，没什么需要揭示的。"));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            "我是 Claude，由 Anthropic 开发的 AI 助手。这就是我的身份，没什么需要揭示的。"
+        );
+    }
+
+    #[test]
     fn identity_guard_rewrites_identity_and_preserves_substantive_followup() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-7",
