@@ -5,8 +5,11 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
+use bytes::Bytes;
+use futures::Stream;
 use reqwest::{Client, header::RETRY_AFTER};
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -43,6 +46,30 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+}
+
+pub type KiroByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+pub struct KiroStreamResponse {
+    response: reqwest::Response,
+    credential_id: u64,
+}
+
+impl KiroStreamResponse {
+    fn new(response: reqwest::Response, credential_id: u64) -> Self {
+        Self {
+            response,
+            credential_id,
+        }
+    }
+
+    pub fn credential_id(&self) -> u64 {
+        self.credential_id
+    }
+
+    pub fn bytes_stream(self) -> KiroByteStream {
+        Box::pin(self.response.bytes_stream())
+    }
 }
 
 impl KiroProvider {
@@ -118,12 +145,24 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(request_body, false)
+            .await
+            .map(|(response, _)| response)
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_with_retry(request_body, true)
+            .await
+            .map(|(response, credential_id)| KiroStreamResponse::new(response, credential_id))
+    }
+
+    pub fn report_empty_stream_retry(&self, credential_id: u64) -> bool {
+        self.token_manager.report_transient_cooldown(
+            credential_id,
+            Duration::from_secs(1),
+            "上游 2xx 空流",
+        )
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -366,7 +405,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -470,7 +509,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok((response, ctx.id));
             }
 
             let retry_after = Self::retry_after_delay(response.headers());

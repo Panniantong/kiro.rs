@@ -1411,6 +1411,8 @@ pub struct BufferedStreamContext {
     event_buffer: Vec<SseEvent>,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
+    /// 上游是否产生过可交付内容。仅看真实 Kiro 事件，不把最终收尾事件算作成功。
+    meaningful_output_seen: bool,
 }
 
 impl BufferedStreamContext {
@@ -1459,13 +1461,23 @@ impl BufferedStreamContext {
             inner,
             event_buffer: Vec::new(),
             initial_events_generated: false,
+            meaningful_output_seen: false,
         }
+    }
+
+    pub fn with_final_text_override(mut self, final_text_override: Option<String>) -> Self {
+        self.inner = self.inner.with_final_text_override(final_text_override);
+        self
     }
 
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
     pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
+        if event_has_meaningful_output(event) {
+            self.meaningful_output_seen = true;
+        }
+
         // 首次处理事件时，先生成初始事件（message_start 等）
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -1476,6 +1488,10 @@ impl BufferedStreamContext {
         // 处理事件并缓冲结果
         let events = self.inner.process_kiro_event(event);
         self.event_buffer.extend(events);
+    }
+
+    pub fn has_meaningful_output(&self) -> bool {
+        self.meaningful_output_seen || self.inner.final_text_override.is_some()
     }
 
     /// 完成流处理并返回所有事件
@@ -1511,6 +1527,19 @@ impl BufferedStreamContext {
         }
 
         std::mem::take(&mut self.event_buffer)
+    }
+}
+
+fn event_has_meaningful_output(event: &crate::kiro::model::events::Event) -> bool {
+    match event {
+        crate::kiro::model::events::Event::AssistantResponse(response) => {
+            !response.content.is_empty()
+        }
+        crate::kiro::model::events::Event::ReasoningContent(reasoning) => {
+            !reasoning.text.is_empty() || !reasoning.signature.is_empty()
+        }
+        crate::kiro::model::events::Event::ToolUse(_) => true,
+        _ => false,
     }
 }
 
@@ -1806,6 +1835,28 @@ mod tests {
         // 重复 stop 应该被跳过
         let event = manager.handle_content_block_stop(0);
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_buffered_context_tracks_meaningful_output() {
+        use crate::kiro::model::events::{Event, ToolUseEvent};
+
+        let mut empty_ctx =
+            BufferedStreamContext::new("claude-opus-4-7", 12, false, false, false, HashMap::new());
+        assert!(!empty_ctx.has_meaningful_output());
+        let events = empty_ctx.finish_and_get_all_events();
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        assert!(!empty_ctx.has_meaningful_output());
+
+        let mut content_ctx =
+            BufferedStreamContext::new("claude-opus-4-7", 12, false, false, false, HashMap::new());
+        content_ctx.process_and_buffer(&Event::ToolUse(ToolUseEvent {
+            name: "bash".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
+        assert!(content_ctx.has_meaningful_output());
     }
 
     #[test]

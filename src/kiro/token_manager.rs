@@ -1501,6 +1501,47 @@ impl MultiTokenManager {
         }
     }
 
+    /// 给指定凭据设置短暂运行时冷却，不增加失败计数、不永久禁用。
+    ///
+    /// 用于“本次请求需要换个凭据重试，但不能把账号判死”的瞬态场景。
+    pub fn report_transient_cooldown(&self, id: u64, cooldown: StdDuration, reason: &str) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let now = Utc::now();
+            Self::recover_due_cooldowns(&mut entries, now);
+
+            let cooldown = cooldown.min(RATE_LIMIT_MAX_COOLDOWN);
+            let cooldown_until = now + Self::chrono_duration(cooldown);
+
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                Self::release_in_flight_slot(entry);
+                if !entry.disabled {
+                    entry.cooldown_until = Some(match entry.cooldown_until {
+                        Some(existing) if existing > cooldown_until => existing,
+                        _ => cooldown_until,
+                    });
+                    entry.last_used_at = Some(now.to_rfc3339());
+                    let import_note = entry.credentials.import_note.clone().unwrap_or_default();
+                    tracing::warn!(
+                        credential_id = id,
+                        import_note = %import_note,
+                        cooldown_reason = reason,
+                        "凭据 #{} 触发{}，短冷却至 {}",
+                        id,
+                        reason,
+                        entry.cooldown_until.unwrap().to_rfc3339()
+                    );
+                }
+            }
+
+            entries
+                .iter()
+                .any(|e| !e.disabled && !Self::is_cooling_down(e, now))
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据 API 调用失败
     ///
     /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
@@ -1579,41 +1620,11 @@ impl MultiTokenManager {
     /// 429 是瞬态容量信号，不应永久禁用凭据；仅设置运行时冷却并让调度器
     /// 优先选择其他凭据。冷却到期后凭据自动回到可选池。
     pub fn report_rate_limited(&self, id: u64, cooldown: Option<StdDuration>) -> bool {
-        let result = {
-            let mut entries = self.entries.lock();
-            let now = Utc::now();
-            Self::recover_due_cooldowns(&mut entries, now);
-
-            let cooldown = cooldown
-                .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
-                .min(RATE_LIMIT_MAX_COOLDOWN);
-            let cooldown_until = now + Self::chrono_duration(cooldown);
-
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                Self::release_in_flight_slot(entry);
-                if !entry.disabled {
-                    entry.cooldown_until = Some(match entry.cooldown_until {
-                        Some(existing) if existing > cooldown_until => existing,
-                        _ => cooldown_until,
-                    });
-                    entry.last_used_at = Some(now.to_rfc3339());
-                    let import_note = entry.credentials.import_note.clone().unwrap_or_default();
-                    tracing::warn!(
-                        credential_id = id,
-                        import_note = %import_note,
-                        "凭据 #{} 触发上游 429，冷却至 {}",
-                        id,
-                        entry.cooldown_until.unwrap().to_rfc3339()
-                    );
-                }
-            }
-
-            entries
-                .iter()
-                .any(|e| !e.disabled && !Self::is_cooling_down(e, now))
-        };
-        self.save_stats_debounced();
-        result
+        self.report_transient_cooldown(
+            id,
+            cooldown.unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN),
+            "上游 429",
+        )
     }
 
     /// 报告指定凭据额度已用尽
