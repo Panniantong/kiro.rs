@@ -31,6 +31,7 @@ use uuid::Uuid;
 use super::converter::{
     ConversionError, convert_request_with_armor, final_text_override_for_request_with_armor,
 };
+use super::identity_response_guard::replacement_for_complete_text;
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
@@ -909,8 +910,9 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
+                            // 异常流不能证明固定句已经完整结束，先原样释放身份护栏缓冲。
+                            let mut final_events = ctx.abort_identity_response_guard();
+                            final_events.extend(ctx.generate_final_events());
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -943,6 +945,24 @@ fn create_sse_stream(
 }
 
 use super::converter::get_context_window_size;
+
+fn rewrite_exact_non_stream_identity_response(
+    text_content: &mut String,
+    has_reasoning: bool,
+    has_tool_use: bool,
+    stop_reason: &str,
+) -> bool {
+    if has_reasoning || has_tool_use || stop_reason != "end_turn" {
+        return false;
+    }
+
+    let Some(replacement) = replacement_for_complete_text(text_content) else {
+        return false;
+    };
+
+    *text_content = replacement.to_string();
+    true
+}
 
 /// 处理非流式请求
 fn build_non_stream_content_blocks(
@@ -1054,6 +1074,7 @@ async fn handle_non_stream_request(
     let mut reasoning_content = String::new();
     let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
+    let mut has_reasoning = false;
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
@@ -1072,6 +1093,7 @@ async fn handle_non_stream_request(
                             text_content.push_str(&resp.content);
                         }
                         Event::ReasoningContent(reasoning) => {
+                            has_reasoning = true;
                             if thinking_enabled {
                                 if !reasoning.text.is_empty() {
                                     reasoning_content.push_str(&reasoning.text);
@@ -1156,8 +1178,20 @@ async fn handle_non_stream_request(
     }
 
     // 构建响应内容
+    let mut guarded_original_text_for_usage = None;
     if let Some(final_text_override) = final_text_override {
         text_content = final_text_override;
+    } else {
+        let original_text = text_content.clone();
+        if rewrite_exact_non_stream_identity_response(
+            &mut text_content,
+            has_reasoning,
+            has_tool_use,
+            &stop_reason,
+        ) {
+            guarded_original_text_for_usage = Some(original_text);
+            tracing::info!(stream = false, "默认身份响应护栏替换了 Kiro 固定自我介绍");
+        }
     }
 
     let content = build_non_stream_content_blocks(
@@ -1171,7 +1205,15 @@ async fn handle_non_stream_request(
     );
 
     // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
+    let output_tokens = guarded_original_text_for_usage.map_or_else(
+        || token::estimate_output_tokens(&content),
+        |original_text| {
+            token::estimate_output_tokens(&[json!({
+                "type": "text",
+                "text": original_text
+            })])
+        },
+    );
 
     // 普通 /v1 保持请求估算值；/cc/v1 才使用 contextUsageEvent 修正。
     let final_input_tokens = if use_context_usage_input_tokens {
@@ -2195,9 +2237,38 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::identity_response_guard::{CLAUDE_GREETING, KIRO_GREETING};
     use crate::anthropic::types::MessagesRequest;
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn non_stream_response_guard_rewrites_exact_kiro_greeting() {
+        let mut text = KIRO_GREETING.to_string();
+
+        assert!(rewrite_exact_non_stream_identity_response(
+            &mut text, false, false, "end_turn"
+        ));
+        assert_eq!(text, CLAUDE_GREETING);
+    }
+
+    #[test]
+    fn non_stream_response_guard_skips_non_plain_assistant_turns() {
+        for (has_reasoning, has_tool_use, stop_reason) in [
+            (true, false, "end_turn"),
+            (false, true, "tool_use"),
+            (false, false, "max_tokens"),
+        ] {
+            let mut text = KIRO_GREETING.to_string();
+            assert!(!rewrite_exact_non_stream_identity_response(
+                &mut text,
+                has_reasoning,
+                has_tool_use,
+                stop_reason,
+            ));
+            assert_eq!(text, KIRO_GREETING);
+        }
+    }
 
     #[tokio::test]
     async fn models_endpoint_lists_gpt_5_6_models() {

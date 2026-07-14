@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
+use super::identity_response_guard::{
+    StreamGuardAction, StreamGuardFinish, StreamingIdentityResponseGuard,
+};
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -602,6 +606,8 @@ pub struct StreamContext {
     pub final_text_override: Option<String>,
     /// 最终文本覆盖是否已输出。
     pub final_text_override_emitted: bool,
+    /// 默认常开的响应身份护栏；只短暂缓存仍可能命中固定自我介绍的文本前缀。
+    identity_response_guard: StreamingIdentityResponseGuard,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -668,6 +674,7 @@ impl StreamContext {
             text_block_index: None,
             final_text_override: None,
             final_text_override_emitted: false,
+            identity_response_guard: StreamingIdentityResponseGuard::default(),
             strip_thinking_leading_newline: false,
         }
     }
@@ -752,8 +759,16 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
-            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
-            Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            Event::ReasoningContent(reasoning) => {
+                let mut events = self.disqualify_identity_response_guard();
+                events.extend(self.process_reasoning_content(reasoning));
+                events
+            }
+            Event::ToolUse(tool_use) => {
+                let mut events = self.disqualify_identity_response_guard();
+                events.extend(self.process_tool_use(tool_use));
+                events
+            }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
@@ -871,6 +886,18 @@ impl StreamContext {
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
+        match self.identity_response_guard.push(content) {
+            StreamGuardAction::Hold => Vec::new(),
+            StreamGuardAction::EmitBorrowed(text) => self.process_visible_text(text),
+            StreamGuardAction::EmitBuffered(text) => self.process_visible_text(&text),
+        }
+    }
+
+    fn process_visible_text(&mut self, content: &str) -> Vec<SseEvent> {
+        if content.is_empty() {
+            return Vec::new();
+        }
+
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
             return self.process_content_with_thinking(content);
@@ -879,6 +906,18 @@ impl StreamContext {
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
         self.create_text_delta_events(content)
+    }
+
+    fn disqualify_identity_response_guard(&mut self) -> Vec<SseEvent> {
+        let Some(pending) = self.identity_response_guard.disqualify() else {
+            return Vec::new();
+        };
+
+        self.process_visible_text(&pending)
+    }
+
+    pub(crate) fn abort_identity_response_guard(&mut self) -> Vec<SseEvent> {
+        self.disqualify_identity_response_guard()
     }
 
     /// 处理包含thinking块的内容
@@ -1309,6 +1348,17 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        match self.identity_response_guard.finish() {
+            Some(StreamGuardFinish::Replacement(replacement)) => {
+                tracing::info!(stream = true, "默认身份响应护栏替换了 Kiro 固定自我介绍");
+                events.extend(self.create_text_delta_events(replacement));
+            }
+            Some(StreamGuardFinish::Original(original)) => {
+                events.extend(self.process_visible_text(&original));
+            }
+            None => {}
+        }
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -2428,6 +2478,151 @@ mod tests {
             .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
+    }
+
+    #[test]
+    fn default_identity_guard_rewrites_chunked_kiro_greeting() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("我是 Kiro，一个 AI "));
+        events.extend(ctx.process_assistant_response("开发助手。有什么可以帮你的吗？"));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            crate::anthropic::identity_response_guard::CLAUDE_GREETING
+        );
+    }
+
+    #[test]
+    fn identity_guard_releases_original_when_greeting_has_substantive_followup() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_assistant_response(
+                crate::anthropic::identity_response_guard::KIRO_GREETING,
+            ),
+        );
+        events.extend(ctx.process_assistant_response(" 我已经完成了代码审查。"));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            format!(
+                "{} 我已经完成了代码审查。",
+                crate::anthropic::identity_response_guard::KIRO_GREETING
+            )
+        );
+    }
+
+    #[test]
+    fn identity_guard_emits_ordinary_task_text_without_waiting_for_stream_end() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let events = ctx.process_assistant_response("代码审查已经完成。");
+
+        assert_eq!(collect_text_content(&events), "代码审查已经完成。");
+    }
+
+    #[test]
+    fn identity_guard_releases_original_when_same_turn_contains_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_assistant_response(
+                crate::anthropic::identity_response_guard::KIRO_GREETING,
+            ),
+        );
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(
+            crate::kiro::model::events::ToolUseEvent {
+                name: "read".to_string(),
+                tool_use_id: "toolu_identity_guard".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            },
+        )));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            crate::anthropic::identity_response_guard::KIRO_GREETING
+        );
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
+
+        let text_stop = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_stop" && event.data["index"].as_i64() == Some(0)
+            })
+            .expect("text block must close before tool use");
+        let tool_start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block must start");
+        assert!(text_stop < tool_start);
+    }
+
+    #[test]
+    fn identity_guard_does_not_replace_when_upstream_stream_aborts() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_assistant_response(
+                crate::anthropic::identity_response_guard::KIRO_GREETING,
+            ),
+        );
+        events.extend(ctx.abort_identity_response_guard());
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            crate::anthropic::identity_response_guard::KIRO_GREETING
+        );
     }
 
     fn collect_signatures(events: &[SseEvent]) -> Vec<String> {

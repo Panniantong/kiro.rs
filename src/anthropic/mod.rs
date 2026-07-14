@@ -24,6 +24,7 @@
 
 mod converter;
 mod handlers;
+mod identity_response_guard;
 mod middleware;
 mod router;
 mod stream;
