@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kiro GPT 5.6 支持设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f3ec;
+      --paper: #fffdf8;
+      --ink: #25231f;
+      --muted: #68635a;
+      --line: #ded8ca;
+      --accent: #126e64;
+      --accent-soft: #e6f2ef;
+      --warn: #8a4b12;
+      --warn-soft: #fff1dc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 36px auto;
+      padding: clamp(24px, 5vw, 56px);
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: 0 18px 48px rgba(51, 45, 34, .08);
+    }
+    h1, h2, h3 { line-height: 1.25; }
+    h1 { margin: 0 0 8px; font-size: clamp(30px, 5vw, 48px); }
+    h2 { margin: 42px 0 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+    h3 { margin: 26px 0 8px; }
+    p { margin: 8px 0 14px; }
+    ul, ol { padding-left: 24px; }
+    li + li { margin-top: 6px; }
+    code {
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: #eeeae1;
+      font: .92em ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+    th, td { padding: 11px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f0ede5; }
+    .meta { color: var(--muted); }
+    .decision, .boundary {
+      margin: 18px 0;
+      padding: 16px 18px;
+      border-radius: 10px;
+    }
+    .decision { border-left: 5px solid var(--accent); background: var(--accent-soft); }
+    .boundary { border-left: 5px solid var(--warn); background: var(--warn-soft); }
+    .flow {
+      padding: 16px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #292720;
+      color: #f8f4e9;
+      white-space: pre;
+      font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="meta">设计规格 · 2026-07-14 · 分支 <code>fluxnode/production</code></p>
+    <h1>Kiro GPT 5.6 支持</h1>
+    <p>让 kiro.rs 在现有 Anthropic Messages 兼容接口中，把 Kiro 官方新增的 GPT 5.6 三档模型作为一等模型安全地暴露和转发。</p>
+  </header>
+
+  <section class="decision">
+    <strong>已批准方案 A：</strong>扩展现有 <code>/v1/messages</code> 和 <code>/v1/models</code>；不新增 OpenAI <code>/v1/chat/completions</code>，不做运行时动态模型目录同步。
+  </section>
+
+  <h2>1. 已核实事实</h2>
+  <p>模型资料来自 Kiro 0.12.333 客户端实际调用的官方 <code>List-Available-Models</code> 控制面，并用当前有效 Kiro 身份只读查询。实现不得从截图文字猜测模型 ID。</p>
+  <table>
+    <thead>
+      <tr><th>官方模型 ID</th><th>显示名</th><th>输入上限</th><th>输出上限</th><th>Credit 倍率</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>gpt-5.6-sol</code></td><td>GPT 5.6 Sol</td><td>272,000</td><td>128,000</td><td>2.4x</td></tr>
+      <tr><td><code>gpt-5.6-terra</code></td><td>GPT 5.6 Terra</td><td>272,000</td><td>128,000</td><td>1.2x</td></tr>
+      <tr><td><code>gpt-5.6-luna</code></td><td>GPT 5.6 Luna</td><td>272,000</td><td>128,000</td><td>0.6x</td></tr>
+    </tbody>
+  </table>
+  <p>三者的官方附加请求字段一致：<code>reasoning.mode</code> 支持 <code>standard</code>/<code>pro</code>；<code>reasoning.effort</code> 支持 <code>none</code>、<code>low</code>、<code>medium</code>、<code>high</code>、<code>xhigh</code>、<code>max</code>，默认是 <code>standard + high</code>。</p>
+
+  <h2>2. 目标与非目标</h2>
+  <h3>目标</h3>
+  <ul>
+    <li>三个官方 GPT 模型名通过模型校验并原样映射到 Kiro。</li>
+    <li><code>GET /v1/models</code> 返回三个模型，所有者为 <code>openai</code>，输出上限为 128K。</li>
+    <li>内部上下文计算按 272K 执行，不能沿用 Claude 的 200K/1M 判断。</li>
+    <li>把已有 <code>output_config.effort</code> 转换成 Kiro 根级 <code>additionalModelRequestFields.reasoning</code>；未提供时由上游使用默认值。</li>
+    <li>GPT 请求不注入 Claude/Anthropic 公共身份合约，但保留用户 system、JSON 输出约束、工具定义、对话历史和流式协议转换。</li>
+    <li>流式、非流式、工具调用和错误响应均保持 Anthropic Messages 兼容。</li>
+  </ul>
+  <h3>非目标</h3>
+  <ul>
+    <li>不增加 <code>/v1/chat/completions</code> 或 Responses API。</li>
+    <li>不顺带开放 DeepSeek、MiniMax、GLM、Qwen 等同批模型。</li>
+    <li>不把官方模型目录改成运行时网络依赖。</li>
+    <li>本轮验证不授权重启生产 <code>8992/8993/8994</code>。</li>
+  </ul>
+
+  <h2>3. 请求数据流</h2>
+  <div class="flow">Anthropic /v1/messages
+        │
+        ├─ 精确模型识别 ──────────────┐
+        │                            │
+        │ Claude                     │ GPT 5.6
+        │ 保持现有行为                │ 禁止 Claude 身份注入
+        │                            │
+        ├─ system / history / tools / output format 转换
+        │
+        ├─ GPT effort → additionalModelRequestFields.reasoning
+        │
+        └─ Kiro GenerateAssistantResponse
+              └─ 现有事件解析器 → Anthropic SSE / JSON</div>
+
+  <h2>4. 代码设计</h2>
+  <h3>4.1 模型元数据单一真源</h3>
+  <p>用一个小型、静态、可测试的模型描述层保存公开 ID、Kiro ID、所有者、输入窗口和最大输出。<code>map_model</code>、上下文窗口和 <code>/v1/models</code> 读取同一份语义，避免三处手写后漂移。实现保持局部，不引入远程目录缓存或通用 provider 框架。</p>
+
+  <h3>4.2 模型识别</h3>
+  <p>GPT 仅接受三个精确官方 ID，大小写可按当前模型解析规则归一化；不做模糊的 <code>contains("gpt")</code> 匹配，也不把未知 GPT 版本回落到某个默认模型。未知模型继续快速失败并返回 400。</p>
+
+  <h3>4.3 身份和 system 处理</h3>
+  <p>现有破甲逻辑包含“Claude, made by Anthropic”身份合约。该行为只对 Claude 家族生效。GPT 家族继续应用用户明确给出的 system 和输出格式要求，但不会伪称 Claude，也不会改写成 Anthropic 身份。模型分支只控制身份相关逻辑，不能静默关闭工具、历史、JSON schema 或用户指令。</p>
+
+  <h3>4.4 Reasoning 参数</h3>
+  <ul>
+    <li>扩展 <code>KiroRequest</code>，增加可选根字段 <code>additionalModelRequestFields</code>。</li>
+    <li>仅 GPT 5.6 生成 <code>{"reasoning":{"mode":"standard","effort":"..."}}</code>。</li>
+    <li>从现有 <code>output_config.effort</code> 取值；仅允许官方六档，非法值在进入上游前返回 400。</li>
+    <li>未提供 <code>output_config</code> 时不发送该字段，使用 Kiro 官方默认值，避免静默改变计费相关行为。</li>
+    <li>Claude 请求序列化结果保持不含该字段，确保现有行为不变。</li>
+  </ul>
+
+  <h3>4.5 输入大小与响应</h3>
+  <p>通用 1M 入口保护继续保留；模型自己的 272K 窗口用于使用量和上下文百分比计算。上游事件格式继续交给现有 Kiro EventStream 解码器；只有真实端到端验证证明格式不兼容时，才增加最小事件分支。</p>
+
+  <h2>5. 错误处理</h2>
+  <table>
+    <thead><tr><th>情况</th><th>预期行为</th></tr></thead>
+    <tbody>
+      <tr><td>未知 GPT 模型</td><td>本地 400，<code>invalid_request_error</code>，不请求上游。</td></tr>
+      <tr><td>非法 reasoning effort</td><td>本地 400，明确列出允许值，不静默替换。</td></tr>
+      <tr><td>账号无模型权限</td><td>按现有凭据故障转移；耗尽后返回通用 502，不泄漏账号池细节。</td></tr>
+      <tr><td>单个账号暂停/失效</td><td>作为账号健康问题单独记录，不能据此宣称模型不支持。</td></tr>
+      <tr><td>上游空 SSE</td><td>沿用现有空流保护和短冷却，最终不得把空成功报给客户端。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>6. TDD 与验收</h2>
+  <ol>
+    <li>先写单个失败测试，证明三个模型目前被拒绝；再实现精确映射。</li>
+    <li>逐个补失败测试：272K 上下文、模型列表、GPT 身份不污染、Claude 行为不回归、effort 序列化和非法值快速失败。</li>
+    <li>补请求级测试，覆盖普通文本、system、工具、流式和非流式构建。</li>
+    <li>运行格式化、静态检查、聚焦测试和完整 <code>cargo test</code>；管理端前端继续执行现有构建验证。</li>
+    <li>推送 <code>fluxnode/production</code> 后，只在隔离端口 <code>8995</code> 构建唯一镜像并启动测试容器。</li>
+    <li>通过隔离容器直连分别请求 Sol、Terra、Luna；至少验证普通流式响应、非流式响应和一次工具调用。</li>
+    <li>通过 New API 测试渠道证明公开模型名实际路由到 8995，并从 TAP/日志证明真实返回模型及非空内容。</li>
+    <li>最后复查容器、进程和日志读取任务无残留。</li>
+  </ol>
+
+  <section class="boundary">
+    <strong>完成定义：</strong>只有代码测试全绿、三个模型在 8995 真实调用成功、New API 路由成功、响应内容非空且证据一致，才能报告“支持成功”。生产三端口部署是后续单独授权动作。
+  </section>
+
+  <h2>7. 回滚与兼容</h2>
+  <p>改动保持附加式：Claude 映射和请求结构的既有序列化必须由回归测试锁住。隔离环境失败时仅回滚测试容器镜像，不影响生产。若新增字段导致旧 Kiro 账号拒绝，仅 GPT 请求携带它，Claude 请求不受影响。</p>
+
+  <h2>8. 自审清单</h2>
+  <ul>
+    <li>模型 ID、窗口、输出上限和 effort 枚举均有官方实时控制面证据。</li>
+    <li>没有把截图中的视觉文字当作模型 ID。</li>
+    <li>没有扩大到 OpenAI 协议或同批其他模型。</li>
+    <li>没有静默改变 reasoning effort 或计费语义。</li>
+    <li>生产部署边界明确，测试成功不等于已上线。</li>
+  </ul>
+</main>
+</body>
+</html>

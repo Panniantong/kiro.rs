@@ -141,6 +141,33 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "gpt-5.6-sol".to_string(),
+            object: "model".to_string(),
+            created: 1783987200, // Jul 14, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Sol".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "gpt-5.6-terra".to_string(),
+            object: "model".to_string(),
+            created: 1783987200, // Jul 14, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Terra".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "gpt-5.6-luna".to_string(),
+            object: "model".to_string(),
+            created: 1783987200, // Jul 14, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Luna".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
             created: 1782864000, // Jul 1, 2026
@@ -381,6 +408,10 @@ pub async fn post_messages(
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
                 }
+                ConversionError::InvalidReasoningEffort(effort) => (
+                    "invalid_request_error",
+                    format!("reasoning effort 不支持: {}", effort),
+                ),
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -398,6 +429,7 @@ pub async fn post_messages(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1930,6 +1962,10 @@ pub async fn post_messages_cc(
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
                 }
+                ConversionError::InvalidReasoningEffort(effort) => (
+                    "invalid_request_error",
+                    format!("reasoning effort 不支持: {}", effort),
+                ),
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -1947,6 +1983,7 @@ pub async fn post_messages_cc(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -2161,6 +2198,24 @@ mod tests {
     use crate::anthropic::types::MessagesRequest;
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
+
+    #[tokio::test]
+    async fn models_endpoint_lists_gpt_5_6_models() {
+        let response = get_models().await.into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let model = payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == model_id)
+                .unwrap_or_else(|| panic!("missing model {model_id}"));
+            assert_eq!(model["owned_by"], "openai");
+            assert_eq!(model["max_tokens"], 128_000);
+        }
+    }
 
     fn thinking(thinking_type: &str, display: Option<&str>) -> Thinking {
         Thinking {

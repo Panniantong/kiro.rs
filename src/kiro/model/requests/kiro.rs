@@ -35,6 +35,9 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// 模型特有的附加请求字段（如 GPT 5.6 reasoning 配置）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 #[cfg(test)]
 mod tests {
@@ -63,6 +66,33 @@ mod tests {
                 .user_input_message
                 .content,
             "Test message"
+        );
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_round_trip() {
+        let json = serde_json::json!({
+            "conversationState": {
+                "conversationId": "conv-gpt",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "Test message",
+                        "modelId": "gpt-5.6-luna",
+                        "userInputMessageContext": {}
+                    }
+                }
+            },
+            "additionalModelRequestFields": {
+                "reasoning": {"mode": "standard", "effort": "max"}
+            }
+        });
+
+        let request: KiroRequest = serde_json::from_value(json).unwrap();
+        let serialized = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            serialized["additionalModelRequestFields"]["reasoning"]["effort"],
+            "max"
         );
     }
 }

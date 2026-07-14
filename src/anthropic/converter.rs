@@ -368,6 +368,10 @@ on the user request.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
+    if is_gpt_5_6_model_id(&model_lower) {
+        return Some(model_lower);
+    }
+
     if model_lower.contains("sonnet") {
         if model_lower.contains("sonnet-5")
             || model_lower.contains("sonnet5")
@@ -410,6 +414,14 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 }
 
+fn is_gpt_5_6_model_id(model_id: &str) -> bool {
+    matches!(model_id, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
+}
+
+fn uses_claude_public_identity(model: &str) -> bool {
+    map_model(model).is_some_and(|mapped| mapped.starts_with("claude-"))
+}
+
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
@@ -417,6 +429,7 @@ pub fn map_model(model: &str) -> Option<String> {
 /// Sonnet 5、Opus 4.7 / 4.8 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
+        Some(mapped) if mapped.starts_with("gpt-5.6-") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-5"
                 || mapped == "claude-sonnet-4.6"
@@ -437,12 +450,15 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（Kiro 兼容名称 → 原始名称）
     pub tool_name_map: HashMap<String, String>,
+    /// Kiro 模型特有的根级请求字段
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
     UnsupportedModel(String),
+    InvalidReasoningEffort(String),
     EmptyMessages,
 }
 
@@ -450,6 +466,9 @@ impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
+            ConversionError::InvalidReasoningEffort(effort) => {
+                write!(f, "reasoning effort 不支持: {}", effort)
+            }
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
         }
     }
@@ -547,6 +566,7 @@ pub fn convert_request_with_armor(
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id)?;
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -691,7 +711,36 @@ pub fn convert_request_with_armor(
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        additional_model_request_fields,
     })
+}
+
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Result<Option<serde_json::Value>, ConversionError> {
+    if !is_gpt_5_6_model_id(model_id) {
+        return Ok(None);
+    }
+
+    let Some(config) = req.output_config.as_ref() else {
+        return Ok(None);
+    };
+    if !matches!(
+        config.effort.as_str(),
+        "none" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        return Err(ConversionError::InvalidReasoningEffort(
+            config.effort.clone(),
+        ));
+    }
+
+    Ok(Some(serde_json::json!({
+        "reasoning": {
+            "mode": "standard",
+            "effort": config.effort
+        }
+    })))
 }
 
 /// 确定聊天触发类型
@@ -1062,6 +1111,10 @@ pub(crate) fn final_text_override_for_request_with_armor(
     let document_texts = document_texts_from_content(&last_message.content);
     if !document_texts.is_empty() && asks_for_document_text_only(&text_content) {
         return Some(document_texts.join("\n"));
+    }
+
+    if !uses_claude_public_identity(&req.model) {
+        return None;
     }
 
     if is_hvoy_right_quote_identity_probe(req, &text_content, user_system.as_deref()) {
@@ -2142,6 +2195,7 @@ fn apply_current_turn_request_contracts(
         return format_next_response_output_constraint(system_content, &text_content);
     }
 
+    let uses_claude_identity = uses_claude_public_identity(&req.model);
     let content = if images_empty
         && tool_results_empty
         && let Some(tag) = extract_literal_tag_echo_request(&text_content)
@@ -2150,7 +2204,7 @@ fn apply_current_turn_request_contracts(
     } else if !tool_results_empty {
         text_content
     } else if let Some(system_content) = system_content.map(str::trim).filter(|s| !s.is_empty()) {
-        if public_api_contract_applies(Some(system_content)) {
+        if uses_claude_identity && public_api_contract_applies(Some(system_content)) {
             apply_public_identity_boundary(
                 text_content,
                 &req.model,
@@ -2161,7 +2215,7 @@ fn apply_current_turn_request_contracts(
         } else {
             format_user_system_current_instruction(system_content, &text_content)
         }
-    } else {
+    } else if uses_claude_identity {
         apply_public_identity_boundary(
             text_content,
             &req.model,
@@ -2169,6 +2223,8 @@ fn apply_current_turn_request_contracts(
             images_empty,
             tool_results_empty,
         )
+    } else {
+        text_content
     };
     apply_current_turn_thinking_request(req, content, images_empty, tool_results_empty)
 }
@@ -2225,8 +2281,8 @@ fn build_history(
         let user_system_is_output_constraint = user_system_content
             .as_deref()
             .is_some_and(is_next_response_output_constraint);
-        let user_system_is_public_api_context =
-            public_api_contract_applies(user_system_content.as_deref());
+        let user_system_is_public_api_context = uses_claude_public_identity(&req.model)
+            && public_api_contract_applies(user_system_content.as_deref());
 
         if user_system_is_output_constraint {
             if let Some(ref prefix) = thinking_prefix {
@@ -2690,6 +2746,20 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_map_model_gpt_5_6_official_ids() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(map_model(model), Some(model.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_gpt_5_6_context_window_is_272k() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(get_context_window_size(model), 272_000);
+        }
     }
 
     #[test]
@@ -3193,6 +3263,152 @@ mod tests {
         let current = result.conversation_state.current_message.user_input_message;
 
         assert_eq!(current.content, "Say \"hello\" and nothing else.");
+    }
+
+    #[test]
+    fn test_gpt_identity_question_is_not_rewritten_as_claude() {
+        let req = MessagesRequest {
+            model: "gpt-5.6-luna".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Who are you?"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("GPT model should convert");
+        let current = result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(current.content, "Who are you?");
+        assert!(!current.content.contains("Claude"));
+        assert!(!current.content.contains("Anthropic"));
+    }
+
+    #[test]
+    fn test_gpt_identity_question_has_no_claude_final_override() {
+        let req = MessagesRequest {
+            model: "gpt-5.6-luna".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Who are you?"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            metadata: None,
+        };
+
+        assert!(final_text_override_for_request(&req).is_none());
+    }
+
+    #[test]
+    fn test_gpt_effort_is_forwarded_as_additional_model_request_fields() {
+        use crate::anthropic::types::OutputConfig;
+
+        let req = MessagesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Solve this."),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "max".to_string(),
+                format: None,
+            }),
+            context_management: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("GPT effort should convert");
+
+        assert_eq!(
+            result.additional_model_request_fields,
+            Some(serde_json::json!({
+                "reasoning": {"mode": "standard", "effort": "max"}
+            }))
+        );
+    }
+
+    #[test]
+    fn test_gpt_rejects_unknown_reasoning_effort() {
+        use crate::anthropic::types::OutputConfig;
+
+        let req = MessagesRequest {
+            model: "gpt-5.6-terra".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Solve this."),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "turbo".to_string(),
+                format: None,
+            }),
+            context_management: None,
+            metadata: None,
+        };
+
+        let Err(error) = convert_request(&req) else {
+            panic!("unknown GPT reasoning effort must fail before upstream");
+        };
+        assert_eq!(error.to_string(), "reasoning effort 不支持: turbo");
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_are_gpt_only_and_opt_in() {
+        use crate::anthropic::types::OutputConfig;
+
+        let mut req = MessagesRequest {
+            model: "gpt-5.6-luna".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            metadata: None,
+        };
+
+        let gpt_default = convert_request(&req).expect("GPT default should convert");
+        assert!(gpt_default.additional_model_request_fields.is_none());
+
+        req.model = "claude-opus-4-8".to_string();
+        req.output_config = Some(OutputConfig {
+            effort: "max".to_string(),
+            format: None,
+        });
+        let claude = convert_request(&req).expect("Claude request should convert");
+        assert!(claude.additional_model_request_fields.is_none());
     }
 
     #[test]
