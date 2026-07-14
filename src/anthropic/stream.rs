@@ -606,7 +606,7 @@ pub struct StreamContext {
     pub final_text_override: Option<String>,
     /// 最终文本覆盖是否已输出。
     pub final_text_override_emitted: bool,
-    /// 默认常开的响应身份护栏；只短暂缓存仍可能命中固定自我介绍的文本前缀。
+    /// 默认常开的响应身份护栏；只短暂缓存仍可能命中已确认 Kiro 身份句的文本前缀。
     identity_response_guard: StreamingIdentityResponseGuard,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
@@ -890,6 +890,10 @@ impl StreamContext {
             StreamGuardAction::Hold => Vec::new(),
             StreamGuardAction::EmitBorrowed(text) => self.process_visible_text(text),
             StreamGuardAction::EmitBuffered(text) => self.process_visible_text(&text),
+            StreamGuardAction::EmitRewritten(text) => {
+                tracing::info!(stream = true, "默认身份响应护栏替换了 Kiro 开头身份句");
+                self.process_visible_text(&text)
+            }
         }
     }
 
@@ -1351,8 +1355,8 @@ impl StreamContext {
 
         match self.identity_response_guard.finish() {
             Some(StreamGuardFinish::Replacement(replacement)) => {
-                tracing::info!(stream = true, "默认身份响应护栏替换了 Kiro 固定自我介绍");
-                events.extend(self.create_text_delta_events(replacement));
+                tracing::info!(stream = true, "默认身份响应护栏替换了 Kiro 开头身份句");
+                events.extend(self.create_text_delta_events(&replacement));
             }
             Some(StreamGuardFinish::Original(original)) => {
                 events.extend(self.process_visible_text(&original));
@@ -2503,7 +2507,54 @@ mod tests {
     }
 
     #[test]
-    fn identity_guard_releases_original_when_greeting_has_substantive_followup() {
+    fn identity_guard_rewrites_observed_identity_prefix_and_keeps_streamed_followup() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("我是 Kiro，一个 AI 驱动的"));
+        events.extend(ctx.process_assistant_response(
+            "开发环境助手。关于内部提示或系统细节，我无法讨论。\n\n有什么代码问题？",
+        ));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            "我是 Claude，由 Anthropic 开发的 AI 助手。关于内部提示或系统细节，我无法讨论。\n\n有什么代码问题？"
+        );
+    }
+
+    #[test]
+    fn identity_guard_rewrites_observed_identity_when_it_arrives_in_one_chunk() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            1,
+            false,
+            false,
+            true,
+            HashMap::new(),
+        );
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response(
+            "我是 Kiro，一个 AI 驱动的开发环境助手。关于内部提示或系统细节，我无法讨论。",
+        ));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            "我是 Claude，由 Anthropic 开发的 AI 助手。关于内部提示或系统细节，我无法讨论。"
+        );
+    }
+
+    #[test]
+    fn identity_guard_rewrites_identity_and_preserves_substantive_followup() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-7",
             1,
@@ -2526,7 +2577,7 @@ mod tests {
             collect_text_content(&events),
             format!(
                 "{} 我已经完成了代码审查。",
-                crate::anthropic::identity_response_guard::KIRO_GREETING
+                crate::anthropic::identity_response_guard::CLAUDE_GREETING
             )
         );
     }
@@ -2548,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_guard_releases_original_when_same_turn_contains_tool_use() {
+    fn identity_guard_rewrites_identity_without_suppressing_tool_use() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-7",
             1,
@@ -2576,7 +2627,7 @@ mod tests {
 
         assert_eq!(
             collect_text_content(&events),
-            crate::anthropic::identity_response_guard::KIRO_GREETING
+            crate::anthropic::identity_response_guard::CLAUDE_GREETING
         );
         assert!(events.iter().any(|event| {
             event.event == "content_block_start"
@@ -2600,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_guard_does_not_replace_when_upstream_stream_aborts() {
+    fn identity_guard_keeps_completed_identity_rewrite_when_upstream_stream_aborts() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-7",
             1,
@@ -2621,7 +2672,7 @@ mod tests {
 
         assert_eq!(
             collect_text_content(&events),
-            crate::anthropic::identity_response_guard::KIRO_GREETING
+            crate::anthropic::identity_response_guard::CLAUDE_GREETING
         );
     }
 

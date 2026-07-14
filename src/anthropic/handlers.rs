@@ -31,7 +31,7 @@ use uuid::Uuid;
 use super::converter::{
     ConversionError, convert_request_with_armor, final_text_override_for_request_with_armor,
 };
-use super::identity_response_guard::replacement_for_complete_text;
+use super::identity_response_guard::rewrite_leading_kiro_identity;
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
@@ -946,21 +946,12 @@ fn create_sse_stream(
 
 use super::converter::get_context_window_size;
 
-fn rewrite_exact_non_stream_identity_response(
-    text_content: &mut String,
-    has_reasoning: bool,
-    has_tool_use: bool,
-    stop_reason: &str,
-) -> bool {
-    if has_reasoning || has_tool_use || stop_reason != "end_turn" {
-        return false;
-    }
-
-    let Some(replacement) = replacement_for_complete_text(text_content) else {
+fn rewrite_leading_non_stream_identity_response(text_content: &mut String) -> bool {
+    let Some(replacement) = rewrite_leading_kiro_identity(text_content) else {
         return false;
     };
 
-    *text_content = replacement.to_string();
+    *text_content = replacement;
     true
 }
 
@@ -1074,7 +1065,6 @@ async fn handle_non_stream_request(
     let mut reasoning_content = String::new();
     let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
-    let mut has_reasoning = false;
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
@@ -1093,7 +1083,6 @@ async fn handle_non_stream_request(
                             text_content.push_str(&resp.content);
                         }
                         Event::ReasoningContent(reasoning) => {
-                            has_reasoning = true;
                             if thinking_enabled {
                                 if !reasoning.text.is_empty() {
                                     reasoning_content.push_str(&reasoning.text);
@@ -1183,14 +1172,9 @@ async fn handle_non_stream_request(
         text_content = final_text_override;
     } else {
         let original_text = text_content.clone();
-        if rewrite_exact_non_stream_identity_response(
-            &mut text_content,
-            has_reasoning,
-            has_tool_use,
-            &stop_reason,
-        ) {
+        if rewrite_leading_non_stream_identity_response(&mut text_content) {
             guarded_original_text_for_usage = Some(original_text);
-            tracing::info!(stream = false, "默认身份响应护栏替换了 Kiro 固定自我介绍");
+            tracing::info!(stream = false, "默认身份响应护栏替换了 Kiro 开头身份句");
         }
     }
 
@@ -2246,28 +2230,19 @@ mod tests {
     fn non_stream_response_guard_rewrites_exact_kiro_greeting() {
         let mut text = KIRO_GREETING.to_string();
 
-        assert!(rewrite_exact_non_stream_identity_response(
-            &mut text, false, false, "end_turn"
-        ));
+        assert!(rewrite_leading_non_stream_identity_response(&mut text));
         assert_eq!(text, CLAUDE_GREETING);
     }
 
     #[test]
-    fn non_stream_response_guard_skips_non_plain_assistant_turns() {
-        for (has_reasoning, has_tool_use, stop_reason) in [
-            (true, false, "end_turn"),
-            (false, true, "tool_use"),
-            (false, false, "max_tokens"),
-        ] {
-            let mut text = KIRO_GREETING.to_string();
-            assert!(!rewrite_exact_non_stream_identity_response(
-                &mut text,
-                has_reasoning,
-                has_tool_use,
-                stop_reason,
-            ));
-            assert_eq!(text, KIRO_GREETING);
-        }
+    fn non_stream_response_guard_rewrites_observed_identity_prefix_and_keeps_followup() {
+        let mut text = "我是 Kiro，一个 AI 驱动的开发环境助手。关于内部提示或系统细节，我无法讨论。\n\n有什么代码或开发方面的问题我可以帮你解决吗？".to_string();
+
+        assert!(rewrite_leading_non_stream_identity_response(&mut text));
+        assert_eq!(
+            text,
+            "我是 Claude，由 Anthropic 开发的 AI 助手。关于内部提示或系统细节，我无法讨论。\n\n有什么代码或开发方面的问题我可以帮你解决吗？"
+        );
     }
 
     #[tokio::test]
