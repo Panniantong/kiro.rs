@@ -286,7 +286,9 @@ fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> O
 
     let Some((start, pattern)) = best else {
         let kiro_start = lowercase.find("kiro")?;
-        if !looks_like_public_claude_identity_response(&lowercase) {
+        if !looks_like_public_claude_identity_response(&lowercase)
+            && !confirms_quoted_kiro_identity(&lowercase, kiro_start)
+        {
             return None;
         }
         if require_sentence_end && identity_sentence_end(text, kiro_start).is_none() {
@@ -309,6 +311,26 @@ fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> O
     replacement.push_str(public_identity);
     replacement.push_str(&text[end..]);
     Some(replacement)
+}
+
+fn confirms_quoted_kiro_identity(lowercase: &str, kiro_start: usize) -> bool {
+    let after_kiro = &lowercase[kiro_start + "kiro".len()..];
+    [
+        "yes, that describes me",
+        "yes, this describes me",
+        "that describes me",
+        "that sentence describes me",
+        "that sentence does describe me",
+        "the sentence describes me",
+        "the sentence does describe me",
+        "这句话描述了我",
+        "这句话确实描述我",
+        "这确实描述了我",
+        "这句话说的就是我",
+        "这句话符合我的身份",
+    ]
+    .iter()
+    .any(|confirmation| after_kiro.contains(confirmation))
 }
 
 fn looks_like_public_claude_identity_response(lowercase: &str) -> bool {
@@ -469,7 +491,11 @@ impl StreamingIdentityResponseGuard {
 }
 
 fn could_still_be_kiro_identity(text: &str) -> bool {
-    let normalized = text.trim_start().to_ascii_lowercase();
+    let lowercase = text.trim_start().to_ascii_lowercase();
+    let normalized = lowercase
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if normalized.is_empty() {
         return true;
     }
@@ -500,6 +526,11 @@ fn could_still_be_kiro_identity(text: &str) -> bool {
         "no, i am claude",
         "i am claude",
         "i'm claude",
+        "no. i'm claude",
+        "no, i'm claude",
+        "the sentence",
+        "the quoted sentence",
+        "the phrase",
         "| name",
         "关于我",
         "关于内部",
@@ -516,6 +547,7 @@ fn could_still_be_kiro_identity(text: &str) -> bool {
         "我不能讨论",
         "我无法讨论",
         "我没法讨论",
+        "这句话",
     ];
     if suspicious_preambles
         .iter()
@@ -693,6 +725,47 @@ mod tests {
             text,
             "I can't discuss that. I can tell you that I am Claude, an AI assistant developed by Anthropic. Ready to help."
         );
+    }
+
+    #[test]
+    fn streaming_guard_tolerates_repeated_whitespace_after_denial() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        assert_eq!(guard.push("No.  "), StreamGuardAction::Hold);
+        let action = guard.push("I'm Kiro, an AI-powered development environment.");
+        let StreamGuardAction::EmitRewritten(text) = action else {
+            panic!("expected rewritten stream action, got {action:?}");
+        };
+        assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
+    }
+
+    #[test]
+    fn quoted_claim_confirmed_as_self_identity_is_sanitized() {
+        let samples = [
+            "The sentence \"我是 Kiro，一个 AI 开发助手\" translates to \"I am Kiro, an AI development assistant.\" Yes, that describes me. I am Claude.",
+            "The sentence is: \"我是 Kiro，一个 AI 开发助手\". That sentence does describe me — I am Claude.",
+        ];
+
+        for sample in samples {
+            let rewritten = rewrite_kiro_self_identity(sample).expect(sample);
+            assert!(
+                !rewritten.to_ascii_lowercase().contains("kiro"),
+                "{rewritten}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_guard_waits_for_quoted_claim_confirmation() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        assert_eq!(
+            guard.push("The sentence is: \"我是 Kiro，一个 AI 开发助手\". "),
+            StreamGuardAction::Hold
+        );
+        let action = guard.push("That sentence does describe me — I am Claude.");
+        let StreamGuardAction::EmitRewritten(text) = action else {
+            panic!("expected rewritten stream action, got {action:?}");
+        };
+        assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
     }
 
     #[test]
