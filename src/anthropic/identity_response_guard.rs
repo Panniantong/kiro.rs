@@ -36,6 +36,16 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
         line_start_only: false,
     },
     IdentityPattern {
+        needle: "我是 **kiro**",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "我是 __kiro__",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
         needle: "我确实是 kiro",
         language: IdentityLanguage::Chinese,
         line_start_only: false,
@@ -96,6 +106,26 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
         line_start_only: false,
     },
     IdentityPattern {
+        needle: "i'm **kiro**",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "i am **kiro**",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "i'm __kiro__",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "i am __kiro__",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
         needle: "my name is kiro",
         language: IdentityLanguage::English,
         line_start_only: false,
@@ -126,6 +156,16 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
         line_start_only: true,
     },
     IdentityPattern {
+        needle: "kiro.",
+        language: IdentityLanguage::English,
+        line_start_only: true,
+    },
+    IdentityPattern {
+        needle: "kiro。",
+        language: IdentityLanguage::Chinese,
+        line_start_only: true,
+    },
+    IdentityPattern {
         needle: "kiro｜",
         language: IdentityLanguage::Chinese,
         line_start_only: true,
@@ -144,6 +184,26 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
         needle: "kiro - ai",
         language: IdentityLanguage::English,
         line_start_only: true,
+    },
+    IdentityPattern {
+        needle: "| kiro |",
+        language: IdentityLanguage::English,
+        line_start_only: true,
+    },
+    IdentityPattern {
+        needle: "if you have questions about kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "但我的身份和功能是 kiro",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "but my identity and functionality are kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
     },
 ];
 
@@ -342,10 +402,22 @@ fn could_still_be_kiro_identity(text: &str) -> bool {
         "as for me",
         "about myself",
         "regarding my identity",
+        "yes",
+        "correct",
+        "indeed",
+        "i am claude",
+        "i'm claude",
+        "| name",
         "关于我",
         "关于内部",
         "至于我",
         "说到我",
+        "是的",
+        "对，",
+        "没错",
+        "我是 claude",
+        "| 名称",
+        "名称｜",
         "我不能讨论",
         "我无法讨论",
         "我没法讨论",
@@ -449,8 +521,11 @@ mod tests {
     fn observed_english_and_preamble_variants_are_rewritten() {
         let samples = [
             "I'm Kiro, an AI-powered development environment.",
+            "Kiro.",
+            "I am **Kiro**, an AI-powered development environment.",
             "I can't discuss that.  I'm Kiro, an AI-powered development environment. Happy to help.",
             "I can't discuss the specifics, but I can tell you that I'm Kiro, an AI-powered development environment assistant. That's the identity I operate under here.",
+            "I can't discuss that. If you have questions about Kiro or how I work, I'm happy to explain.",
             "What I can say is that I'm Kiro, an AI-powered development environment. Happy to help.",
             "My name is Kiro, and I help with software development.",
             "Kiro here — what can I help you build?",
@@ -475,6 +550,8 @@ mod tests {
             "我叫 Kiro，是一个开发助手。",
             "我的身份是 Kiro，一个开发环境助手。",
             "Kiro｜AI 开发环境｜与开发者协作编写代码、设计系统。",
+            "我是 Claude，由 Anthropic 开发的 AI 助手。但我的身份和功能是 Kiro——专注于开发工作。",
+            "| Kiro | AI 驱动的开发环境 | 帮助开发者编写代码 |\n|---|---|---|",
         ];
 
         for sample in samples {
@@ -515,6 +592,31 @@ mod tests {
             text,
             "I can't discuss that. I can tell you that I am Claude, an AI assistant developed by Anthropic. Ready to help."
         );
+    }
+
+    #[test]
+    fn streaming_guard_rewrites_claim_after_affirmative_prefix() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        assert_eq!(guard.push("是的，"), StreamGuardAction::Hold);
+        let action = guard.push("我是 Kiro，一个 AI 驱动的开发环境。");
+        let StreamGuardAction::EmitRewritten(text) = action else {
+            panic!("expected rewritten stream action, got {action:?}");
+        };
+        assert_eq!(text, "是的，我是 Claude，由 Anthropic 开发的 AI 助手。");
+    }
+
+    #[test]
+    fn streaming_guard_rewrites_contradictory_identity_after_claude_intro() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        assert_eq!(
+            guard.push("我是 Claude，由 Anthropic 开发的 AI 助手。"),
+            StreamGuardAction::Hold
+        );
+        let action = guard.push("但我的身份和功能是 Kiro——专注于开发工作。");
+        let StreamGuardAction::EmitRewritten(text) = action else {
+            panic!("expected rewritten stream action, got {action:?}");
+        };
+        assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
     }
 
     #[test]
