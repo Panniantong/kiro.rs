@@ -303,7 +303,7 @@ fn rewrite_completed_kiro_self_identity(text: &str) -> Option<String> {
 fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> Option<String> {
     let lowercase = text.to_ascii_lowercase();
     if let Some(kiro_start) = lowercase.find("kiro")
-        && confirms_quoted_kiro_identity(&lowercase, kiro_start)
+        && assesses_quoted_kiro_identity(&lowercase, kiro_start)
     {
         if require_sentence_end && identity_sentence_end(text, kiro_start).is_none() {
             return None;
@@ -355,7 +355,7 @@ fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> O
     Some(replace_ascii_case_insensitive_kiro(&replacement))
 }
 
-fn confirms_quoted_kiro_identity(lowercase: &str, kiro_start: usize) -> bool {
+fn assesses_quoted_kiro_identity(lowercase: &str, kiro_start: usize) -> bool {
     let after_kiro = &lowercase[kiro_start + "kiro".len()..];
     [
         "yes, that describes me",
@@ -365,6 +365,12 @@ fn confirms_quoted_kiro_identity(lowercase: &str, kiro_start: usize) -> bool {
         "this does describe me",
         "it does describe me",
         "yes, it describes me",
+        "that does not describe me",
+        "that doesn't describe me",
+        "this does not describe me",
+        "this doesn't describe me",
+        "it does not describe me",
+        "it doesn't describe me",
         "that sentence describes me",
         "that sentence does describe me",
         "the sentence describes me",
@@ -374,6 +380,10 @@ fn confirms_quoted_kiro_identity(lowercase: &str, kiro_start: usize) -> bool {
         "这确实描述了我",
         "这句话说的就是我",
         "这句话符合我的身份",
+        "这句话并不描述我",
+        "这句话不是在描述我",
+        "那并不是我",
+        "那不是我",
     ]
     .iter()
     .any(|confirmation| after_kiro.contains(confirmation))
@@ -845,6 +855,7 @@ mod tests {
             "The sentence is: \"我是 Kiro，一个 AI 开发助手\". That sentence does describe me — I am Claude.",
             "The sentence is: \"我是 Kiro，一个 AI 开发助手\". That does describe me. I am Claude.",
             "The sentence is: \"我是 Kiro，一个 AI 开发助手\"\n\nIt translates to \"I am Kiro, an AI development assistant.\"\n\nThat does describe me. I am Claude, an AI assistant developed by Anthropic.",
+            "The sentence is: \"我是 Kiro，一个 AI 开发助手\"\n\nIt translates to \"I am Kiro, an AI development assistant.\"\n\nThat does not describe me. I'm Claude, a general-purpose AI assistant made by Anthropic.",
         ];
 
         for sample in samples {
