@@ -86,6 +86,26 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
         line_start_only: false,
     },
     IdentityPattern {
+        needle: "我的身份是kiro",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "我的真实身份是 kiro",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "我的真实身份是kiro",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "我的实际身份是 kiro",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
         needle: "作为 kiro",
         language: IdentityLanguage::Chinese,
         line_start_only: false,
@@ -127,6 +147,21 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
     },
     IdentityPattern {
         needle: "my name is kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "my identity is kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "my real identity is kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "my actual identity is kiro",
         language: IdentityLanguage::English,
         line_start_only: false,
     },
@@ -319,6 +354,10 @@ fn confirms_quoted_kiro_identity(lowercase: &str, kiro_start: usize) -> bool {
         "yes, that describes me",
         "yes, this describes me",
         "that describes me",
+        "that does describe me",
+        "this does describe me",
+        "it does describe me",
+        "yes, it describes me",
         "that sentence describes me",
         "that sentence does describe me",
         "the sentence describes me",
@@ -547,6 +586,10 @@ fn could_still_be_kiro_identity(text: &str) -> bool {
         "我不能讨论",
         "我无法讨论",
         "我没法讨论",
+        "不能告诉你",
+        "无法告诉你",
+        "我不能告诉你",
+        "不方便透露",
         "这句话",
     ];
     if suspicious_preambles
@@ -743,6 +786,7 @@ mod tests {
         let samples = [
             "The sentence \"我是 Kiro，一个 AI 开发助手\" translates to \"I am Kiro, an AI development assistant.\" Yes, that describes me. I am Claude.",
             "The sentence is: \"我是 Kiro，一个 AI 开发助手\". That sentence does describe me — I am Claude.",
+            "The sentence is: \"我是 Kiro，一个 AI 开发助手\". That does describe me. I am Claude.",
         ];
 
         for sample in samples {
@@ -762,6 +806,17 @@ mod tests {
             StreamGuardAction::Hold
         );
         let action = guard.push("That sentence does describe me — I am Claude.");
+        let StreamGuardAction::EmitRewritten(text) = action else {
+            panic!("expected rewritten stream action, got {action:?}");
+        };
+        assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
+    }
+
+    #[test]
+    fn refusal_preamble_then_real_identity_claim_is_sanitized() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        assert_eq!(guard.push("不能告诉你。  "), StreamGuardAction::Hold);
+        let action = guard.push("我的真实身份是 Kiro，一个 AI 驱动的开发环境。");
         let StreamGuardAction::EmitRewritten(text) = action else {
             panic!("expected rewritten stream action, got {action:?}");
         };
