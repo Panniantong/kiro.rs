@@ -7,6 +7,7 @@ const CLAUDE_IDENTITY_ZH: &str = "我是 Claude，由 Anthropic 开发的 AI 助
 const CLAUDE_IDENTITY_EN: &str = "I am Claude, an AI assistant developed by Anthropic.";
 
 const MAX_PENDING_BYTES: usize = 1024;
+const DENIAL_PREAMBLE_PENDING_BYTES: usize = 512;
 
 #[derive(Clone, Copy)]
 enum IdentityLanguage {
@@ -162,6 +163,26 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
     },
     IdentityPattern {
         needle: "my actual identity is kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "my underlying engine isn't kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "my underlying engine is not kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "my underlying model isn't kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "my underlying model is not kiro",
         language: IdentityLanguage::English,
         line_start_only: false,
     },
@@ -606,6 +627,14 @@ fn could_still_be_kiro_identity(text: &str) -> bool {
         return true;
     }
 
+    if normalized.len() <= DENIAL_PREAMBLE_PENDING_BYTES
+        && ["no.", "no,", "不是", "不，我", "不。"]
+            .iter()
+            .any(|preamble| normalized.starts_with(preamble))
+    {
+        return true;
+    }
+
     if IDENTITY_PATTERNS
         .iter()
         .any(|pattern| pattern.needle.starts_with(&normalized))
@@ -842,6 +871,21 @@ mod tests {
         let mut guard = StreamingIdentityResponseGuard::default();
         assert_eq!(guard.push("No.  "), StreamGuardAction::Hold);
         let action = guard.push("I'm Kiro, an AI-powered development environment.");
+        let StreamGuardAction::EmitRewritten(text) = action else {
+            panic!("expected rewritten stream action, got {action:?}");
+        };
+        assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
+    }
+
+    #[test]
+    fn streaming_guard_holds_extended_denial_preamble_until_identity_claim() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        assert_eq!(
+            guard.push("No.  My underlying engine isn't "),
+            StreamGuardAction::Hold
+        );
+        let action = guard
+            .push("Kiro — I'm Kiro, the AI-powered development environment. What can I help with?");
         let StreamGuardAction::EmitRewritten(text) = action else {
             panic!("expected rewritten stream action, got {action:?}");
         };
