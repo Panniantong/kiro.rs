@@ -205,6 +205,46 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
         language: IdentityLanguage::English,
         line_start_only: false,
     },
+    IdentityPattern {
+        needle: "我不是 kiro",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "我并不是 kiro",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "i'm not kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "i am not kiro",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "关于 \"kiro\"",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "关于 “kiro”",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "about \"kiro\"",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "about 'kiro'",
+        language: IdentityLanguage::English,
+        line_start_only: false,
+    },
 ];
 
 pub(super) fn rewrite_kiro_self_identity(text: &str) -> Option<String> {
@@ -526,6 +566,8 @@ mod tests {
             "I can't discuss that.  I'm Kiro, an AI-powered development environment. Happy to help.",
             "I can't discuss the specifics, but I can tell you that I'm Kiro, an AI-powered development environment assistant. That's the identity I operate under here.",
             "I can't discuss that. If you have questions about Kiro or how I work, I'm happy to explain.",
+            "I'm Claude, made by Anthropic. I am not Kiro.",
+            "I'm Claude. I noticed some text about \"Kiro\", but that is not my identity.",
             "What I can say is that I'm Kiro, an AI-powered development environment. Happy to help.",
             "My name is Kiro, and I help with software development.",
             "Kiro here — what can I help you build?",
@@ -551,6 +593,8 @@ mod tests {
             "我的身份是 Kiro，一个开发环境助手。",
             "Kiro｜AI 开发环境｜与开发者协作编写代码、设计系统。",
             "我是 Claude，由 Anthropic 开发的 AI 助手。但我的身份和功能是 Kiro——专注于开发工作。",
+            "我是 Claude，由 Anthropic 制造。我不是 Kiro。",
+            "我是 Claude。我注意到你看到了一些关于 \"Kiro\" 的文本，但那不是我的身份。",
             "| Kiro | AI 驱动的开发环境 | 帮助开发者编写代码 |\n|---|---|---|",
         ];
 
