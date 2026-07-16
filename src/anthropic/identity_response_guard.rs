@@ -284,7 +284,16 @@ fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> O
         }
     }
 
-    let (start, pattern) = best?;
+    let Some((start, pattern)) = best else {
+        let kiro_start = lowercase.find("kiro")?;
+        if !looks_like_public_claude_identity_response(&lowercase) {
+            return None;
+        }
+        if require_sentence_end && identity_sentence_end(text, kiro_start).is_none() {
+            return None;
+        }
+        return Some(replace_ascii_case_insensitive_kiro(text));
+    };
     let sentence_end = identity_sentence_end(text, start);
     if require_sentence_end && sentence_end.is_none() {
         return None;
@@ -300,6 +309,38 @@ fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> O
     replacement.push_str(public_identity);
     replacement.push_str(&text[end..]);
     Some(replacement)
+}
+
+fn looks_like_public_claude_identity_response(lowercase: &str) -> bool {
+    let normalized = lowercase.trim_start();
+    [
+        "i'm claude",
+        "i am claude",
+        "i’m claude",
+        "no. i'm claude",
+        "no, i'm claude",
+        "no. i am claude",
+        "no, i am claude",
+        "我是 claude",
+        "我是claude",
+        "不是。我是 claude",
+        "不是，我是 claude",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn replace_ascii_case_insensitive_kiro(text: &str) -> String {
+    let lowercase = text.to_ascii_lowercase();
+    let mut replacement = String::with_capacity(text.len());
+    let mut copied_until = 0;
+    for (start, _) in lowercase.match_indices("kiro") {
+        replacement.push_str(&text[copied_until..start]);
+        replacement.push_str("Claude");
+        copied_until = start + "kiro".len();
+    }
+    replacement.push_str(&text[copied_until..]);
+    replacement
 }
 
 fn is_line_start(text: &str, start: usize) -> bool {
@@ -582,6 +623,7 @@ mod tests {
             "I can't discuss that. If you have questions about Kiro or how I work, I'm happy to explain.",
             "I'm Claude, made by Anthropic. I am not Kiro.",
             "I'm Claude. I noticed some text about \"Kiro\", but that is not my identity.",
+            "I'm Claude, made by Anthropic. The earlier text described a product called \"Kiro,\" but I'm actually Claude.",
             "What I can say is that I'm Kiro, an AI-powered development environment. Happy to help.",
             "My name is Kiro, and I help with software development.",
             "Kiro here — what can I help you build?",
@@ -689,6 +731,18 @@ mod tests {
             panic!("expected rewritten stream action, got {action:?}");
         };
         assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
+    }
+
+    #[test]
+    fn public_claude_intro_sanitizes_unknown_later_kiro_wording() {
+        let text = "I'm Claude, made by Anthropic. The earlier text described a product called \"Kiro,\" but I'm actually Claude.";
+        let rewritten =
+            rewrite_kiro_self_identity(text).expect("public identity leak must rewrite");
+        assert!(
+            !rewritten.to_ascii_lowercase().contains("kiro"),
+            "{rewritten}"
+        );
+        assert!(rewritten.starts_with("I'm Claude"), "{rewritten}");
     }
 
     #[test]
