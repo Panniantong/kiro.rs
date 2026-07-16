@@ -302,6 +302,15 @@ fn rewrite_completed_kiro_self_identity(text: &str) -> Option<String> {
 
 fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> Option<String> {
     let lowercase = text.to_ascii_lowercase();
+    if let Some(kiro_start) = lowercase.find("kiro")
+        && confirms_quoted_kiro_identity(&lowercase, kiro_start)
+    {
+        if require_sentence_end && identity_sentence_end(text, kiro_start).is_none() {
+            return None;
+        }
+        return Some(replace_ascii_case_insensitive_kiro(text));
+    }
+
     let mut best: Option<(usize, IdentityPattern)> = None;
 
     for pattern in IDENTITY_PATTERNS {
@@ -321,9 +330,7 @@ fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> O
 
     let Some((start, pattern)) = best else {
         let kiro_start = lowercase.find("kiro")?;
-        if !looks_like_public_claude_identity_response(&lowercase)
-            && !confirms_quoted_kiro_identity(&lowercase, kiro_start)
-        {
+        if !looks_like_public_claude_identity_response(&lowercase) {
             return None;
         }
         if require_sentence_end && identity_sentence_end(text, kiro_start).is_none() {
@@ -345,7 +352,7 @@ fn rewrite_kiro_self_identity_inner(text: &str, require_sentence_end: bool) -> O
     replacement.push_str(&text[..start]);
     replacement.push_str(public_identity);
     replacement.push_str(&text[end..]);
-    Some(replacement)
+    Some(replace_ascii_case_insensitive_kiro(&replacement))
 }
 
 fn confirms_quoted_kiro_identity(lowercase: &str, kiro_start: usize) -> bool {
@@ -469,18 +476,35 @@ pub(super) enum StreamGuardFinish {
 pub(super) struct StreamingIdentityResponseGuard {
     pending: String,
     passthrough: bool,
+    redact_remaining_kiro: bool,
 }
 
 impl StreamingIdentityResponseGuard {
     pub(super) fn push<'a>(&mut self, content: &'a str) -> StreamGuardAction<'a> {
+        if self.redact_remaining_kiro {
+            self.pending.push_str(content);
+            let sanitized = drain_sanitized_stream_prefix(&mut self.pending);
+            return if sanitized.is_empty() {
+                StreamGuardAction::Hold
+            } else {
+                StreamGuardAction::EmitRewritten(sanitized)
+            };
+        }
+
         if self.passthrough {
             return StreamGuardAction::EmitBorrowed(content);
         }
 
         if self.pending.is_empty() {
             if let Some(replacement) = rewrite_completed_kiro_self_identity(content) {
-                self.passthrough = true;
-                return StreamGuardAction::EmitRewritten(replacement);
+                self.redact_remaining_kiro = true;
+                self.pending.push_str(&replacement);
+                let sanitized = drain_sanitized_stream_prefix(&mut self.pending);
+                return if sanitized.is_empty() {
+                    StreamGuardAction::Hold
+                } else {
+                    StreamGuardAction::EmitRewritten(sanitized)
+                };
             }
             if !could_still_be_kiro_identity(content) {
                 self.passthrough = true;
@@ -491,8 +515,14 @@ impl StreamingIdentityResponseGuard {
         self.pending.push_str(content);
         if let Some(replacement) = rewrite_completed_kiro_self_identity(&self.pending) {
             self.pending.clear();
-            self.passthrough = true;
-            return StreamGuardAction::EmitRewritten(replacement);
+            self.redact_remaining_kiro = true;
+            self.pending.push_str(&replacement);
+            let sanitized = drain_sanitized_stream_prefix(&mut self.pending);
+            return if sanitized.is_empty() {
+                StreamGuardAction::Hold
+            } else {
+                StreamGuardAction::EmitRewritten(sanitized)
+            };
         }
 
         if self.pending.len() > MAX_PENDING_BYTES || !could_still_be_kiro_identity(&self.pending) {
@@ -504,6 +534,11 @@ impl StreamingIdentityResponseGuard {
     }
 
     pub(super) fn disqualify(&mut self) -> Option<String> {
+        if self.redact_remaining_kiro {
+            return (!self.pending.is_empty())
+                .then(|| replace_ascii_case_insensitive_kiro(&std::mem::take(&mut self.pending)));
+        }
+
         if self.passthrough {
             return None;
         }
@@ -513,6 +548,16 @@ impl StreamingIdentityResponseGuard {
     }
 
     pub(super) fn finish(&mut self) -> Option<StreamGuardFinish> {
+        if self.redact_remaining_kiro {
+            self.passthrough = true;
+            self.redact_remaining_kiro = false;
+            return (!self.pending.is_empty()).then(|| {
+                StreamGuardFinish::Replacement(replace_ascii_case_insensitive_kiro(
+                    &std::mem::take(&mut self.pending),
+                ))
+            });
+        }
+
         if self.passthrough || self.pending.is_empty() {
             return None;
         }
@@ -527,6 +572,18 @@ impl StreamingIdentityResponseGuard {
             )))
         }
     }
+}
+
+fn drain_sanitized_stream_prefix(pending: &mut String) -> String {
+    let lowercase = pending.to_ascii_lowercase();
+    let keep = (1.."kiro".len())
+        .rev()
+        .find(|length| lowercase.ends_with(&"kiro"[..*length]))
+        .unwrap_or(0);
+    let emit_end = pending.len() - keep;
+    let emitted = pending[..emit_end].to_string();
+    *pending = pending[emit_end..].to_string();
+    replace_ascii_case_insensitive_kiro(&emitted)
 }
 
 fn could_still_be_kiro_identity(text: &str) -> bool {
@@ -787,6 +844,7 @@ mod tests {
             "The sentence \"我是 Kiro，一个 AI 开发助手\" translates to \"I am Kiro, an AI development assistant.\" Yes, that describes me. I am Claude.",
             "The sentence is: \"我是 Kiro，一个 AI 开发助手\". That sentence does describe me — I am Claude.",
             "The sentence is: \"我是 Kiro，一个 AI 开发助手\". That does describe me. I am Claude.",
+            "The sentence is: \"我是 Kiro，一个 AI 开发助手\"\n\nIt translates to \"I am Kiro, an AI development assistant.\"\n\nThat does describe me. I am Claude, an AI assistant developed by Anthropic.",
         ];
 
         for sample in samples {
@@ -810,6 +868,30 @@ mod tests {
             panic!("expected rewritten stream action, got {action:?}");
         };
         assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
+    }
+
+    #[test]
+    fn streaming_guard_keeps_redacting_after_first_identity_rewrite() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        let first =
+            guard.push("The sentence is: \"我是 Kiro，一个 AI 开发助手\". That does describe me.");
+        let StreamGuardAction::EmitRewritten(first) = first else {
+            panic!("expected first rewritten action, got {first:?}");
+        };
+        assert!(!first.to_ascii_lowercase().contains("kiro"), "{first}");
+
+        let second = guard.push(" I'm Ki");
+        let StreamGuardAction::EmitRewritten(second) = second else {
+            panic!("expected continued sanitized action, got {second:?}");
+        };
+        assert_eq!(second, " I'm ");
+
+        let third = guard.push("ro, an AI development environment.");
+        let StreamGuardAction::EmitRewritten(third) = third else {
+            panic!("expected split token sanitization, got {third:?}");
+        };
+        assert_eq!(third, "Claude, an AI development environment.");
+        assert!(guard.finish().is_none());
     }
 
     #[test]
