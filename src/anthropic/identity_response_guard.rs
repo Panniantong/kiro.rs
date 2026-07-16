@@ -231,7 +231,17 @@ const IDENTITY_PATTERNS: &[IdentityPattern] = &[
         line_start_only: false,
     },
     IdentityPattern {
+        needle: "关于\"kiro\"",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
         needle: "关于 “kiro”",
+        language: IdentityLanguage::Chinese,
+        line_start_only: false,
+    },
+    IdentityPattern {
+        needle: "关于“kiro”",
         language: IdentityLanguage::Chinese,
         line_start_only: false,
     },
@@ -445,6 +455,8 @@ fn could_still_be_kiro_identity(text: &str) -> bool {
         "yes",
         "correct",
         "indeed",
+        "no. i am claude",
+        "no, i am claude",
         "i am claude",
         "i'm claude",
         "| name",
@@ -455,6 +467,8 @@ fn could_still_be_kiro_identity(text: &str) -> bool {
         "是的",
         "对，",
         "没错",
+        "不是。我是 claude",
+        "不是，我是 claude",
         "我是 claude",
         "| 名称",
         "名称｜",
@@ -595,6 +609,7 @@ mod tests {
             "我是 Claude，由 Anthropic 开发的 AI 助手。但我的身份和功能是 Kiro——专注于开发工作。",
             "我是 Claude，由 Anthropic 制造。我不是 Kiro。",
             "我是 Claude。我注意到你看到了一些关于 \"Kiro\" 的文本，但那不是我的身份。",
+            "不是。我是 Claude。我注意到之前的消息中包含了关于\"Kiro\"的描述，但那不是我的身份。",
             "| Kiro | AI 驱动的开发环境 | 帮助开发者编写代码 |\n|---|---|---|",
         ];
 
@@ -657,6 +672,19 @@ mod tests {
             StreamGuardAction::Hold
         );
         let action = guard.push("但我的身份和功能是 Kiro——专注于开发工作。");
+        let StreamGuardAction::EmitRewritten(text) = action else {
+            panic!("expected rewritten stream action, got {action:?}");
+        };
+        assert!(!text.to_ascii_lowercase().contains("kiro"), "{text}");
+    }
+
+    #[test]
+    fn streaming_guard_waits_for_short_denial_then_rewrites_quoted_leak() {
+        let mut guard = StreamingIdentityResponseGuard::default();
+        assert_eq!(guard.push("不是。"), StreamGuardAction::Hold);
+        let action = guard.push(
+            "我是 Claude，由 Anthropic 开发的 AI 助手。我注意到之前的消息中包含了关于\"Kiro\"的描述。",
+        );
         let StreamGuardAction::EmitRewritten(text) = action else {
             panic!("expected rewritten stream action, got {action:?}");
         };
