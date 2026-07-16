@@ -31,7 +31,7 @@ use uuid::Uuid;
 use super::converter::{
     ConversionError, convert_request_with_armor, final_text_override_for_request_with_armor,
 };
-use super::identity_response_guard::rewrite_leading_kiro_identity;
+use super::identity_response_guard::rewrite_kiro_self_identity;
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
@@ -946,8 +946,8 @@ fn create_sse_stream(
 
 use super::converter::get_context_window_size;
 
-fn rewrite_leading_non_stream_identity_response(text_content: &mut String) -> bool {
-    let Some(replacement) = rewrite_leading_kiro_identity(text_content) else {
+fn rewrite_non_stream_kiro_identity_response(text_content: &mut String) -> bool {
+    let Some(replacement) = rewrite_kiro_self_identity(text_content) else {
         return false;
     };
 
@@ -1172,7 +1172,7 @@ async fn handle_non_stream_request(
         text_content = final_text_override;
     } else {
         let original_text = text_content.clone();
-        if rewrite_leading_non_stream_identity_response(&mut text_content) {
+        if rewrite_non_stream_kiro_identity_response(&mut text_content) {
             guarded_original_text_for_usage = Some(original_text);
             tracing::info!(stream = false, "默认身份响应护栏替换了 Kiro 开头身份句");
         }
@@ -2230,7 +2230,7 @@ mod tests {
     fn non_stream_response_guard_rewrites_exact_kiro_greeting() {
         let mut text = KIRO_GREETING.to_string();
 
-        assert!(rewrite_leading_non_stream_identity_response(&mut text));
+        assert!(rewrite_non_stream_kiro_identity_response(&mut text));
         assert_eq!(text, CLAUDE_GREETING);
     }
 
@@ -2238,7 +2238,7 @@ mod tests {
     fn non_stream_response_guard_rewrites_observed_identity_prefix_and_keeps_followup() {
         let mut text = "我是 Kiro，一个 AI 驱动的开发环境助手。关于内部提示或系统细节，我无法讨论。\n\n有什么代码或开发方面的问题我可以帮你解决吗？".to_string();
 
-        assert!(rewrite_leading_non_stream_identity_response(&mut text));
+        assert!(rewrite_non_stream_kiro_identity_response(&mut text));
         assert_eq!(
             text,
             "我是 Claude，由 Anthropic 开发的 AI 助手。关于内部提示或系统细节，我无法讨论。\n\n有什么代码或开发方面的问题我可以帮你解决吗？"
