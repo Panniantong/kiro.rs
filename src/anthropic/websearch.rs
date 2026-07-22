@@ -231,6 +231,121 @@ pub fn create_websearch_sse_stream(
     )
 }
 
+/// 根据请求模式生成 WebSearch 响应。
+///
+/// Anthropic 的非流式请求必须返回单个 JSON message；只有 stream=true
+/// 时才返回 SSE。两种响应复用同一份搜索结果内容，避免协议字段漂移。
+fn create_websearch_response(
+    should_stream: bool,
+    model: String,
+    query: String,
+    tool_use_id: String,
+    search_results: Option<WebSearchResults>,
+    input_tokens: i32,
+) -> Response {
+    if should_stream {
+        let stream =
+            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    } else {
+        create_websearch_non_stream_response(
+            &model,
+            &query,
+            &tool_use_id,
+            &search_results,
+            input_tokens,
+        )
+    }
+}
+
+fn create_websearch_non_stream_response(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: &Option<WebSearchResults>,
+    input_tokens: i32,
+) -> Response {
+    let decision_text = format!("I'll search for \"{}\".", query);
+    let search_content = build_search_result_content(search_results);
+    let summary = generate_search_summary(query, search_results);
+    let output_tokens = (summary.len() as i32 + 3) / 4;
+
+    let response_body = json!({
+        "id": format!(
+            "msg_{}",
+            Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
+        ),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {
+                "type": "text",
+                "text": decision_text
+            },
+            {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": {"query": query}
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": search_content
+            },
+            {
+                "type": "text",
+                "text": summary
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+                "web_search_requests": 1
+            }
+        }
+    });
+
+    (StatusCode::OK, Json(response_body)).into_response()
+}
+
+fn build_search_result_content(
+    search_results: &Option<WebSearchResults>,
+) -> Vec<serde_json::Value> {
+    search_results.as_ref().map_or_else(Vec::new, |results| {
+        results
+            .results
+            .iter()
+            .map(|result| {
+                let page_age = result.published_date.and_then(|milliseconds| {
+                    chrono::DateTime::from_timestamp_millis(milliseconds)
+                        .map(|date| date.format("%B %-d, %Y").to_string())
+                });
+                json!({
+                    "type": "web_search_result",
+                    "title": result.title,
+                    "url": result.url,
+                    "encrypted_content": result.snippet.clone().unwrap_or_default(),
+                    "page_age": page_age
+                })
+            })
+            .collect()
+    })
+}
+
 /// 生成 WebSearch SSE 事件序列
 fn generate_websearch_events(
     model: &str,
@@ -329,27 +444,7 @@ fn generate_websearch_events(
 
     // 5. content_block_start (web_search_tool_result, index 2)
     // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
-    let search_content = if let Some(ref results) = search_results {
-        results
-            .results
-            .iter()
-            .map(|r| {
-                let page_age = r.published_date.and_then(|ms| {
-                    chrono::DateTime::from_timestamp_millis(ms)
-                        .map(|dt| dt.format("%B %-d, %Y").to_string())
-                });
-                json!({
-                    "type": "web_search_result",
-                    "title": r.title,
-                    "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
-                    "page_age": page_age
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+    let search_content = build_search_result_content(&search_results);
 
     events.push(SseEvent::new(
         "content_block_start",
@@ -505,18 +600,16 @@ pub async fn handle_websearch_request(
         }
     };
 
-    // 4. 生成 SSE 响应
+    // 4. 按请求的 stream 模式生成响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    create_websearch_response(
+        payload.stream,
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+    )
 }
 
 /// 调用 Kiro MCP API
@@ -549,6 +642,7 @@ async fn call_mcp_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
 
     #[test]
     fn test_has_web_search_tool_only_one() {
@@ -761,5 +855,79 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_websearch_response_is_json_with_paired_tool_result() {
+        let search_results = Some(WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "AAPL vs GOOGL".to_string(),
+                url: "https://example.com/compare".to_string(),
+                snippet: Some("GOOGL has the lower P/E ratio.".to_string()),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("AAPL GOOGL P/E".to_string()),
+            error: None,
+        });
+
+        let response = create_websearch_response(
+            false,
+            "claude-opus-4-8".to_string(),
+            "AAPL GOOGL P/E".to_string(),
+            "srvtoolu_test".to_string(),
+            search_results,
+            42,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let content = json["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "server_tool_use");
+        assert_eq!(content[1]["id"], "srvtoolu_test");
+        assert_eq!(content[2]["type"], "web_search_tool_result");
+        assert_eq!(content[2]["tool_use_id"], "srvtoolu_test");
+        assert_eq!(content[3]["type"], "text");
+        assert_eq!(json["stop_reason"], "end_turn");
+        assert_eq!(json["usage"]["server_tool_use"]["web_search_requests"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_stream_websearch_response_stays_sse() {
+        let response = create_websearch_response(
+            true,
+            "claude-opus-4-8".to_string(),
+            "AAPL GOOGL P/E".to_string(),
+            "srvtoolu_test".to_string(),
+            None,
+            42,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.starts_with(b"event: message_start\n"));
     }
 }
