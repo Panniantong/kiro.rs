@@ -189,7 +189,7 @@ pub async fn get_models() -> impl IntoResponse {
         Model {
             id: "claude-opus-5".to_string(),
             object: "model".to_string(),
-            created: 1784937600, // Jul 25, 2026
+            created: 1784937600, // First verified by FluxNode on Jul 25, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 5".to_string(),
             model_type: "chat".to_string(),
@@ -198,7 +198,7 @@ pub async fn get_models() -> impl IntoResponse {
         Model {
             id: "claude-opus-5-thinking".to_string(),
             object: "model".to_string(),
-            created: 1784937600, // Jul 25, 2026
+            created: 1784937600, // First verified by FluxNode on Jul 25, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 5 (Thinking)".to_string(),
             model_type: "chat".to_string(),

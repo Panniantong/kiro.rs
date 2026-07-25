@@ -431,7 +431,7 @@ fn uses_claude_public_identity(model: &str) -> bool {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5、Opus 4.7 / 4.8 同 1M
+/// Sonnet 5、Opus 4.7 / 4.8 / 5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped) if mapped.starts_with("gpt-5.6-") => 272_000,
