@@ -171,7 +171,7 @@ pub async fn get_models() -> impl IntoResponse {
         Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
-            created: 1782864000, // Jul 1, 2026
+            created: 1782777600, // Jun 30, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 5".to_string(),
             model_type: "chat".to_string(),
@@ -180,7 +180,7 @@ pub async fn get_models() -> impl IntoResponse {
         Model {
             id: "claude-sonnet-5-thinking".to_string(),
             object: "model".to_string(),
-            created: 1782864000, // Jul 1, 2026
+            created: 1782777600, // Jun 30, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
@@ -1235,15 +1235,16 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_adaptive_only_opus = model_lower.contains("opus")
+    let is_adaptive_thinking = (model_lower.contains("opus")
         && (model_lower.contains("4-8")
             || model_lower.contains("4.8")
             || model_lower.contains("4-7")
             || model_lower.contains("4.7")
             || model_lower.contains("4-6")
-            || model_lower.contains("4.6"));
+            || model_lower.contains("4.6")))
+        || model_lower.contains("sonnet-5");
 
-    let thinking_type = if is_adaptive_only_opus {
+    let thinking_type = if is_adaptive_thinking {
         "adaptive"
     } else {
         "enabled"
@@ -1260,8 +1261,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         display: None,
         budget_tokens: 20000,
     });
-
-    if is_adaptive_only_opus {
+    if is_adaptive_thinking {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
             format: None,

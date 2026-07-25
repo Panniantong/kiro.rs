@@ -2955,6 +2955,12 @@ mod tests {
             );
             assert_eq!(get_context_window_size(requested_model), 1_000_000);
         }
+
+        // sonnet-4-5 不应误匹配为 sonnet-5
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
     }
 
     #[test]

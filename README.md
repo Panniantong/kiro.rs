@@ -439,9 +439,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 |----------------|-----------|
 | `*sonnet5*` / `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
+| `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
+| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
+| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
+| `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
+
+Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
 
 ## Admin（可选）
 
