@@ -394,7 +394,12 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        if model_lower.contains("opus-5")
+            || model_lower.contains("opus5")
+            || model_lower.contains("5-opus")
+        {
+            Some("claude-opus-5".to_string())
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
@@ -435,7 +440,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
+                || mapped == "claude-opus-4.8"
+                || mapped == "claude-opus-5" =>
         {
             1_000_000
         }
@@ -2925,6 +2931,10 @@ mod tests {
             ("claude-sonnet-5-thinking", "claude-sonnet-5"),
             ("sonnet5", "claude-sonnet-5"),
             ("claude-5-sonnet", "claude-sonnet-5"),
+            ("claude-opus-5", "claude-opus-5"),
+            ("claude-opus-5-thinking", "claude-opus-5"),
+            ("opus5", "claude-opus-5"),
+            ("claude-5-opus", "claude-opus-5"),
             ("claude-opus-4-8", "claude-opus-4.8"),
             ("claude-opus-4-8-thinking", "claude-opus-4.8"),
             ("claude-opus-4-7", "claude-opus-4.7"),
@@ -2960,6 +2970,27 @@ mod tests {
         assert_eq!(
             map_model("claude-sonnet-4-5-20250929"),
             Some("claude-sonnet-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_keeps_opus5_native() {
+        for requested_model in [
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "opus5",
+            "claude-5-opus",
+        ] {
+            assert_eq!(
+                map_model(requested_model),
+                Some("claude-opus-5".to_string())
+            );
+            assert_eq!(get_context_window_size(requested_model), 1_000_000);
+        }
+
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
         );
     }
 

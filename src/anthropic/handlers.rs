@@ -187,6 +187,24 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 128_000,
         },
         Model {
+            id: "claude-opus-5".to_string(),
+            object: "model".to_string(),
+            created: 1784937600, // Jul 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1784937600, // Jul 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1779897600, // May 28, 2026
@@ -1236,7 +1254,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 
     let is_adaptive_thinking = (model_lower.contains("opus")
-        && (model_lower.contains("4-8")
+        && (model_lower.contains("opus-5")
+            || model_lower.contains("opus5")
+            || model_lower.contains("5-opus")
+            || model_lower.contains("4-8")
             || model_lower.contains("4.8")
             || model_lower.contains("4-7")
             || model_lower.contains("4.7")
@@ -1395,6 +1416,8 @@ fn is_hvoy_api_check_public_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.contains("claude-sonnet-5")
         || model.contains("sonnet5")
+        || model.contains("claude-opus-5")
+        || model.contains("opus5")
         || model.contains("claude-opus-4-8")
         || model.contains("claude-opus-4-7")
         || model.contains("claude-opus-4-6")
@@ -2263,6 +2286,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn models_endpoint_lists_opus_5_models() {
+        let response = get_models().await.into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for model_id in ["claude-opus-5", "claude-opus-5-thinking"] {
+            let model = payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == model_id)
+                .unwrap_or_else(|| panic!("missing model {model_id}"));
+            assert_eq!(model["owned_by"], "anthropic");
+            assert_eq!(model["max_tokens"], 128_000);
+        }
+    }
+
     fn thinking(thinking_type: &str, display: Option<&str>) -> Thinking {
         Thinking {
             thinking_type: thinking_type.to_string(),
@@ -2526,6 +2567,33 @@ mod tests {
         assert!(is_hvoy_api_check_public_model("claude-sonnet-5"));
         assert!(is_hvoy_api_check_public_model("claude-sonnet-5-thinking"));
         assert!(is_hvoy_api_check_public_model("sonnet5"));
+    }
+
+    #[test]
+    fn test_opus5_thinking_uses_adaptive_mode() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5-thinking",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        override_thinking_from_model_name(&mut payload);
+
+        assert_eq!(
+            payload
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("high")
+        );
     }
 
     #[test]

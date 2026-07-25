@@ -1815,7 +1815,12 @@ fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
         return None;
     }
 
-    if model_lower.contains("4-8") || model_lower.contains("4.8") {
+    if model_lower.contains("opus-5")
+        || model_lower.contains("opus5")
+        || model_lower.contains("5-opus")
+    {
+        Some("claude-opus-5")
+    } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
         Some("claude-opus-4-8")
     } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
         Some("claude-opus-4-7")
@@ -3107,6 +3112,22 @@ mod tests {
         assert_eq!(
             hvoy_signature_public_model_name("sonnet5"),
             Some("claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn test_hvoy_signature_public_model_name_keeps_opus5_native() {
+        assert_eq!(
+            hvoy_signature_public_model_name("claude-opus-5"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            hvoy_signature_public_model_name("claude-opus-5-thinking"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            hvoy_signature_public_model_name("opus5"),
+            Some("claude-opus-5")
         );
     }
 
