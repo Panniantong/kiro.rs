@@ -619,7 +619,7 @@ async fn handle_stream_request_with_empty_retry(
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
 ) -> Response {
-    let first_response = match provider.call_api_stream(request_body).await {
+    let first_response = match provider.call_api_stream_deferred(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -739,7 +739,7 @@ fn create_retrying_buffered_sse_stream(
                         ));
                     }
 
-                    match provider.call_api_stream(&request_body).await {
+                    match provider.call_api_stream_deferred(&request_body).await {
                         Ok(response) => {
                             let ctx = new_buffered_context(
                                 &model,
@@ -835,7 +835,8 @@ fn create_retrying_buffered_sse_stream(
                                     }
                                 }
                                 None => {
-                                    if ctx.has_meaningful_output() {
+                                    if ctx.has_deliverable_output() {
+                                        provider.report_stream_success(credential_id);
                                         let all_events = ctx.finish_and_get_all_events();
                                         let bytes = all_events
                                             .into_iter()
@@ -1309,8 +1310,12 @@ fn should_guard_empty_stream_success(payload: &MessagesRequest, headers: &Header
     }
 
     let model = payload.model.to_ascii_lowercase();
-    let is_opus_47 = model.contains("claude-opus-4-7") || model.contains("claude-opus-4.7");
-    if !is_opus_47 {
+    let is_guarded_opus = model.contains("claude-opus-4-7")
+        || model.contains("claude-opus-4.7")
+        || model.contains("claude-opus-5")
+        || model.contains("opus5")
+        || model.contains("5-opus");
+    if !is_guarded_opus {
         return false;
     }
 
@@ -2394,11 +2399,22 @@ mod tests {
     }
 
     #[test]
-    fn empty_stream_guard_targets_long_claude_cli_opus47_trace() {
-        let payload = guard_test_payload("claude-opus-4-7", true, 53, 32, 64_000, true);
+    fn empty_stream_guard_targets_long_claude_cli_opus47_and_opus5_traces() {
         let headers = HeaderMap::new();
 
-        assert!(should_guard_empty_stream_success(&payload, &headers));
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "opus5",
+            "claude-5-opus",
+        ] {
+            let payload = guard_test_payload(model, true, 53, 32, 64_000, true);
+            assert!(
+                should_guard_empty_stream_success(&payload, &headers),
+                "expected empty-stream guard for {model}"
+            );
+        }
     }
 
     #[test]

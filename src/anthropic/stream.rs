@@ -577,6 +577,10 @@ pub struct StreamContext {
     pub use_context_usage_input_tokens: bool,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 是否已经生成过非空白、可交付给客户端的 text_delta。
+    deliverable_text_seen: bool,
+    /// 是否已经完整结束过一个有效的 tool_use 块。
+    complete_tool_use_seen: bool,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -660,6 +664,8 @@ impl StreamContext {
             context_input_tokens: None,
             use_context_usage_input_tokens: false,
             output_tokens: 0,
+            deliverable_text_seen: false,
+            complete_tool_use_seen: false,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -1076,6 +1082,10 @@ impl StreamContext {
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        if !text.trim().is_empty() {
+            self.deliverable_text_seen = true;
+        }
+
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
         if let Some(idx) = self.text_block_index {
@@ -1341,12 +1351,24 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop {
+            if !tool_use.name.trim().is_empty() && !tool_use.tool_use_id.trim().is_empty() {
+                self.complete_tool_use_seen = true;
+            }
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
         }
 
         events
+    }
+
+    fn has_deliverable_output(&self) -> bool {
+        self.deliverable_text_seen
+            || self.complete_tool_use_seen
+            || self
+                .final_text_override
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
     }
 
     /// 生成最终事件序列
@@ -1428,15 +1450,14 @@ impl StreamContext {
         }
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
+        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上）。
+        // 不伪造空格文本；受保护的 Claude Code 流会把这种响应视为不可交付并重试。
         if self.thinking_enabled
             && !self.final_text_override_emitted
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
         }
 
         // 生成最终事件
@@ -1465,8 +1486,6 @@ pub struct BufferedStreamContext {
     event_buffer: Vec<SseEvent>,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
-    /// 上游是否产生过可交付内容。仅看真实 Kiro 事件，不把最终收尾事件算作成功。
-    meaningful_output_seen: bool,
 }
 
 impl BufferedStreamContext {
@@ -1515,7 +1534,6 @@ impl BufferedStreamContext {
             inner,
             event_buffer: Vec::new(),
             initial_events_generated: false,
-            meaningful_output_seen: false,
         }
     }
 
@@ -1528,10 +1546,6 @@ impl BufferedStreamContext {
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
     pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        if event_has_meaningful_output(event) {
-            self.meaningful_output_seen = true;
-        }
-
         // 首次处理事件时，先生成初始事件（message_start 等）
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -1544,8 +1558,8 @@ impl BufferedStreamContext {
         self.event_buffer.extend(events);
     }
 
-    pub fn has_meaningful_output(&self) -> bool {
-        self.meaningful_output_seen || self.inner.final_text_override.is_some()
+    pub fn has_deliverable_output(&self) -> bool {
+        self.inner.has_deliverable_output()
     }
 
     /// 完成流处理并返回所有事件
@@ -1581,19 +1595,6 @@ impl BufferedStreamContext {
         }
 
         std::mem::take(&mut self.event_buffer)
-    }
-}
-
-fn event_has_meaningful_output(event: &crate::kiro::model::events::Event) -> bool {
-    match event {
-        crate::kiro::model::events::Event::AssistantResponse(response) => {
-            !response.content.is_empty()
-        }
-        crate::kiro::model::events::Event::ReasoningContent(reasoning) => {
-            !reasoning.text.is_empty() || !reasoning.signature.is_empty()
-        }
-        crate::kiro::model::events::Event::ToolUse(_) => true,
-        _ => false,
     }
 }
 
@@ -1897,15 +1898,47 @@ mod tests {
     }
 
     #[test]
-    fn test_buffered_context_tracks_meaningful_output() {
-        use crate::kiro::model::events::{Event, ToolUseEvent};
+    fn test_buffered_context_requires_deliverable_output() {
+        use crate::kiro::model::events::{
+            AssistantResponseEvent, Event, ReasoningContentEvent, ToolUseEvent,
+        };
 
         let mut empty_ctx =
             BufferedStreamContext::new("claude-opus-4-7", 12, false, false, false, HashMap::new());
-        assert!(!empty_ctx.has_meaningful_output());
+        assert!(!empty_ctx.has_deliverable_output());
         let events = empty_ctx.finish_and_get_all_events();
         assert!(events.iter().any(|event| event.event == "message_stop"));
-        assert!(!empty_ctx.has_meaningful_output());
+        assert!(!empty_ctx.has_deliverable_output());
+
+        let mut whitespace = AssistantResponseEvent::default();
+        whitespace.content = " \n\t ".to_string();
+        let mut whitespace_ctx =
+            BufferedStreamContext::new("claude-opus-5", 12, true, false, false, HashMap::new());
+        whitespace_ctx.process_and_buffer(&Event::AssistantResponse(whitespace));
+        assert!(!whitespace_ctx.has_deliverable_output());
+
+        whitespace_ctx.process_and_buffer(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "private thinking".to_string(),
+            signature: "signature-only-is-not-an-answer".to_string(),
+        }));
+        assert!(!whitespace_ctx.has_deliverable_output());
+
+        let mut tagged_thinking = AssistantResponseEvent::default();
+        tagged_thinking.content = "<thinking>\nprivate thinking only</thinking>".to_string();
+        let mut tagged_thinking_ctx =
+            BufferedStreamContext::new("claude-opus-5", 12, true, false, false, HashMap::new());
+        tagged_thinking_ctx.process_and_buffer(&Event::AssistantResponse(tagged_thinking));
+        assert!(!tagged_thinking_ctx.has_deliverable_output());
+
+        let mut partial_tool_ctx =
+            BufferedStreamContext::new("claude-opus-5", 12, false, false, false, HashMap::new());
+        partial_tool_ctx.process_and_buffer(&Event::ToolUse(ToolUseEvent {
+            name: "bash".to_string(),
+            tool_use_id: "toolu_partial".to_string(),
+            input: "{\"command\":".to_string(),
+            stop: false,
+        }));
+        assert!(!partial_tool_ctx.has_deliverable_output());
 
         let mut content_ctx =
             BufferedStreamContext::new("claude-opus-4-7", 12, false, false, false, HashMap::new());
@@ -1915,7 +1948,14 @@ mod tests {
             input: "{}".to_string(),
             stop: true,
         }));
-        assert!(content_ctx.has_meaningful_output());
+        assert!(content_ctx.has_deliverable_output());
+
+        let mut text = AssistantResponseEvent::default();
+        text.content = "final answer".to_string();
+        let mut text_ctx =
+            BufferedStreamContext::new("claude-opus-5", 12, true, false, false, HashMap::new());
+        text_ctx.process_and_buffer(&Event::AssistantResponse(text));
+        assert!(text_ctx.has_deliverable_output());
     }
 
     #[test]
@@ -3421,38 +3461,12 @@ mod tests {
             "stop_reason should be max_tokens when only thinking is produced"
         );
 
-        // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
+        assert_eq!(collect_text_content(&all_events), "");
         assert!(
-            all_events.iter().any(|e| {
+            !all_events.iter().any(|e| {
                 e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
             }),
-            "should emit text content_block_start"
-        );
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == " "
-            }),
-            "should emit text_delta with a single space"
-        );
-        // text block 应被 generate_final_events 自动关闭
-        let text_block_index = all_events
-            .iter()
-            .find_map(|e| {
-                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                    e.data["index"].as_i64()
-                } else {
-                    None
-                }
-            })
-            .expect("text block should exist");
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(text_block_index)
-            }),
-            "text block should be stopped"
+            "thinking-only responses must not synthesize a text block"
         );
     }
 

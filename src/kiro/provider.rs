@@ -204,16 +204,34 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false)
+        self.call_api_with_retry(request_body, false, true)
             .await
             .map(|(response, _)| response)
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
-        self.call_api_with_retry(request_body, true)
+        self.call_api_with_retry(request_body, true, true)
             .await
             .map(|(response, credential_id)| KiroStreamResponse::new(response, credential_id))
+    }
+
+    /// 发送需要在流结束后确认语义成功的流式请求。
+    ///
+    /// HTTP 2xx 只说明上游接受了请求，不代表流里有可交付内容。调用方必须在
+    /// 验证到非空文本或完整 tool_use 后调用 [`Self::report_stream_success`]；空流
+    /// 或读取失败则调用 [`Self::report_empty_stream_retry`] 释放本次 in-flight。
+    pub async fn call_api_stream_deferred(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_with_retry(request_body, true, false)
+            .await
+            .map(|(response, credential_id)| KiroStreamResponse::new(response, credential_id))
+    }
+
+    pub fn report_stream_success(&self, credential_id: u64) {
+        self.token_manager.report_success(credential_id);
     }
 
     pub fn report_empty_stream_retry(&self, credential_id: u64) -> bool {
@@ -510,6 +528,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        report_success_on_headers: bool,
     ) -> anyhow::Result<(reqwest::Response, u64)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -639,8 +658,13 @@ impl KiroProvider {
             let status = response.status();
             // 成功响应
             if status.is_success() {
+                let request_outcome = if report_success_on_headers {
+                    "success"
+                } else {
+                    "pending_stream_validation"
+                };
                 tracing::info!(
-                    request_outcome = "success",
+                    request_outcome = request_outcome,
                     credential_id = ctx.id,
                     import_note = %Self::credential_import_note(&ctx.credentials),
                     upstream_status = status.as_u16(),
@@ -652,7 +676,9 @@ impl KiroProvider {
                     max_retries = max_retries,
                     "上游响应成功"
                 );
-                self.token_manager.report_success(ctx.id);
+                if report_success_on_headers {
+                    self.token_manager.report_success(ctx.id);
+                }
                 return Ok((response, ctx.id));
             }
 
@@ -1191,6 +1217,10 @@ mod tests {
         }
     }
 
+    async fn always_ok() -> Response {
+        (StatusCode::OK, "ok").into_response()
+    }
+
     /// token=t1 返回 402 MONTHLY_REQUEST_COUNT（额度用尽），其余返回 200 OK。
     /// 用于验证 overage 放行后软冷却轮换到兄弟凭据并最终成功。
     async fn quota_exhausted_first_credential(headers: HeaderMap) -> Response {
@@ -1217,6 +1247,39 @@ mod tests {
             r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#,
         )
             .into_response()
+    }
+
+    #[tokio::test]
+    async fn test_deferred_stream_success_waits_for_semantic_confirmation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api", post(always_ok));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                base_url: format!("http://{}", addr),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
+
+        let response = provider.call_api_stream_deferred("{}").await.unwrap();
+        let credential_id = response.credential_id();
+        assert_eq!(manager.snapshot().entries[0].success_count, 0);
+
+        provider.report_stream_success(credential_id);
+        assert_eq!(manager.snapshot().entries[0].success_count, 1);
     }
 
     #[tokio::test]
