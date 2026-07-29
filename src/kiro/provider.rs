@@ -96,9 +96,11 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
-    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// Client 缓存：key = (credential id, effective proxy config)。
+    ///
+    /// 每个凭据使用独立连接池，避免所有账号共享一条 HTTP/2 连接并在高并发下
+    /// 触发单连接 stream 排队；同一凭据仍会稳定复用自己的 Client。
+    client_cache: Mutex<HashMap<(u64, Option<ProxyConfig>), Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -151,16 +153,11 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client
-        let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
-        let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
 
         Self {
             token_manager,
             global_proxy: proxy,
-            client_cache: Mutex::new(cache),
+            client_cache: Mutex::new(HashMap::new()),
             tls_backend,
             endpoints,
             default_endpoint,
@@ -174,13 +171,17 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let credential_id = credentials
+            .id
+            .ok_or_else(|| anyhow::anyhow!("凭据缺少 ID，无法创建独立 HTTP 客户端"))?;
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let cache_key = (credential_id, effective.clone());
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&cache_key) {
             return Ok(client.clone());
         }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        cache.insert(cache_key, client.clone());
         Ok(client)
     }
 
@@ -1189,6 +1190,34 @@ mod tests {
         assert_eq!(summary.original_len, BODY_SUMMARY_MAX_CHARS + 50);
         assert_eq!(summary.summary_len, BODY_SUMMARY_MAX_CHARS);
         assert!(summary.truncated);
+    }
+
+    #[test]
+    fn test_http_clients_are_isolated_by_credential() {
+        let config = Config::default();
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                base_url: "http://127.0.0.1".to_string(),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "test".into());
+
+        let first = KiroCredentials {
+            id: Some(1),
+            ..Default::default()
+        };
+        let second = KiroCredentials {
+            id: Some(2),
+            ..Default::default()
+        };
+
+        provider.client_for(&first).unwrap();
+        provider.client_for(&second).unwrap();
+
+        assert_eq!(provider.client_cache.lock().len(), 2);
     }
 
     async fn rate_limit_first_credential(headers: HeaderMap) -> Response {
