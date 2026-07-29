@@ -34,6 +34,7 @@ export interface CredentialStatusItem {
   effectiveRpm: number | null
   rpmFollowsDefault: boolean
   currentRpm: number
+  inFlightRequests: number
   peakRpm1h: number
   throttled1h: number
   // AWS 侧超额状态（ENABLED / DISABLED；null/缺省 = 未知）

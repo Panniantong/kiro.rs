@@ -75,6 +75,8 @@ pub struct CredentialStatusItem {
     pub rpm_follows_default: bool,
     /// 当前滑动窗口上游尝试数（瞬时上游尝试 RPM）
     pub current_rpm: u32,
+    /// 当前尚未完成的上游请求数
+    pub in_flight_requests: u32,
     /// 近 1h 峰值上游尝试 RPM
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数

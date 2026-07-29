@@ -97,6 +97,7 @@ impl AdminService {
                 effective_rpm: entry.effective_rpm,
                 rpm_follows_default: entry.rpm_follows_default,
                 current_rpm: entry.current_rpm,
+                in_flight_requests: entry.in_flight_requests,
                 peak_rpm_1h: entry.peak_rpm_1h,
                 throttled_1h: entry.throttled_1h,
                 overage_status: entry.overage_status,
