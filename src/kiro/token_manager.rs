@@ -744,6 +744,8 @@ pub struct CredentialEntrySnapshot {
     pub rpm_follows_default: bool,
     /// 当前滑动窗口上游尝试数（瞬时上游尝试 RPM）
     pub current_rpm: u32,
+    /// 当前尚未完成的上游请求数
+    pub in_flight_requests: u32,
     /// 近 1h 峰值上游尝试 RPM
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数
@@ -1261,11 +1263,17 @@ impl MultiTokenManager {
         let mode = self.load_balancing_mode.lock().clone();
         let chosen = match mode.as_str() {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据，平局按优先级
-                eligible
-                    .iter()
-                    .copied()
-                    .min_by_key(|&i| (entries[i].success_count, entries[i].credentials.priority))
+                // 实时负载优先：先摊开尚未完成的请求，再平衡当前 RPM 和长期成功数。
+                // credential id 作为最终稳定排序键，避免完全相同状态下的非确定选择。
+                eligible.iter().copied().min_by_key(|&i| {
+                    (
+                        entries[i].in_flight_requests,
+                        entries[i].success_window.len(),
+                        entries[i].success_count,
+                        entries[i].credentials.priority,
+                        entries[i].id,
+                    )
+                })
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
@@ -2212,6 +2220,7 @@ impl MultiTokenManager {
                     effective_rpm,
                     rpm_follows_default,
                     current_rpm,
+                    in_flight_requests: e.in_flight_requests,
                     peak_rpm_1h,
                     throttled_1h,
                     overage_status: e.credentials.overage_status.clone(),
@@ -3831,6 +3840,76 @@ mod tests {
         assert!(!first.disabled);
         assert_eq!(first.failure_count, 0);
         assert_eq!(manager.available_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_acquire_spreads_concurrent_requests_across_idle_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = ["t1", "t2", "t3"]
+            .into_iter()
+            .map(|token| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(token.to_string());
+                credential.expires_at = Some(expires_at.clone());
+                credential
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None).await.unwrap();
+        let third = manager.acquire_context(None).await.unwrap();
+
+        let mut selected = vec![first.id, second.id, third.id];
+        selected.sort_unstable();
+        assert_eq!(selected, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_acquire_keeps_large_concurrent_batch_evenly_distributed() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = (1..=10)
+            .map(|id| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(format!("t{id}"));
+                credential.expires_at = Some(expires_at.clone());
+                credential
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        let mut selected_counts = [0_u32; 10];
+
+        for _ in 0..100 {
+            let context = manager.acquire_context(None).await.unwrap();
+            selected_counts[(context.id - 1) as usize] += 1;
+        }
+
+        assert_eq!(selected_counts.iter().min(), Some(&10));
+        assert_eq!(selected_counts.iter().max(), Some(&10));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_exposes_in_flight_requests_until_attempt_finishes() {
+        let mut credential = KiroCredentials::default();
+        credential.access_token = Some("token".to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        let context = manager.acquire_context(None).await.unwrap();
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 1);
+
+        manager.report_success(context.id);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
     }
 
     #[tokio::test]
