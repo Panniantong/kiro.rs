@@ -10,7 +10,9 @@ use std::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::provider::{KiroByteStream, KiroProvider, KiroStreamResponse};
+use crate::kiro::provider::{
+    DeferredStreamAttempt, KiroByteStream, KiroProvider, KiroStreamResponse,
+};
 use crate::kiro::token_manager::AllRateLimitedError;
 use crate::model::config::MaxRelayConfig;
 use crate::token;
@@ -654,9 +656,10 @@ enum EmptyStreamRetryState {
         body_stream: KiroByteStream,
         ctx: BufferedStreamContext,
         decoder: EventStreamDecoder,
-        credential_id: u64,
+        attempt: DeferredStreamAttempt,
         remaining_attempts: usize,
         ping_interval: Interval,
+        gate_open: bool,
     },
     Done,
 }
@@ -686,14 +689,15 @@ fn reading_state_for_response(
     ctx: BufferedStreamContext,
     remaining_attempts: usize,
 ) -> EmptyStreamRetryState {
-    let credential_id = response.credential_id();
+    let (body_stream, attempt) = response.into_deferred_parts();
     EmptyStreamRetryState::Reading {
-        body_stream: response.bytes_stream(),
+        body_stream,
         ctx,
         decoder: EventStreamDecoder::new(),
-        credential_id,
+        attempt,
         remaining_attempts,
         ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        gate_open: false,
     }
 }
 
@@ -768,9 +772,10 @@ fn create_retrying_buffered_sse_stream(
                     mut body_stream,
                     mut ctx,
                     mut decoder,
-                    credential_id,
+                    mut attempt,
                     remaining_attempts,
                     mut ping_interval,
+                    gate_open,
                 } => {
                     tokio::select! {
                         _ = ping_interval.tick() => {
@@ -780,9 +785,10 @@ fn create_retrying_buffered_sse_stream(
                                     body_stream,
                                     ctx,
                                     decoder,
-                                    credential_id,
+                                    attempt,
                                     remaining_attempts,
                                     ping_interval,
+                                    gate_open,
                                 },
                             ))
                         }
@@ -806,37 +812,65 @@ fn create_retrying_buffered_sse_stream(
                                         }
                                     }
 
+                                    let mut gate_open = gate_open;
+                                    let events = if gate_open {
+                                        ctx.take_buffered_events()
+                                    } else if ctx.has_deliverable_output() {
+                                        attempt.confirm_success();
+                                        gate_open = true;
+                                        ctx.take_buffered_events()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let bytes = events
+                                        .into_iter()
+                                        .map(|event| Ok(Bytes::from(event.to_sse_string())))
+                                        .collect();
+
                                     Some((
-                                        Vec::new(),
+                                        bytes,
                                         EmptyStreamRetryState::Reading {
                                             body_stream,
                                             ctx,
                                             decoder,
-                                            credential_id,
+                                            attempt,
                                             remaining_attempts,
                                             ping_interval,
+                                            gate_open,
                                         },
                                     ))
                                 }
                                 Some(Err(e)) => {
+                                    let credential_id = attempt.credential_id();
                                     tracing::warn!(credential_id, error = %e, "读取保护流失败，准备重试");
-                                    provider.report_empty_stream_retry(credential_id);
-                                    let remaining_attempts = remaining_attempts.saturating_sub(1);
-                                    if remaining_attempts == 0 {
+                                    if gate_open {
+                                        let bytes = ctx
+                                            .finish_and_get_all_events()
+                                            .into_iter()
+                                            .map(|event| Ok(Bytes::from(event.to_sse_string())))
+                                            .collect();
                                         Some((
-                                            vec![Ok(create_upstream_unavailable_sse())],
+                                            bytes,
                                             EmptyStreamRetryState::Done,
                                         ))
                                     } else {
-                                        Some((
-                                            Vec::new(),
-                                            EmptyStreamRetryState::Start { remaining_attempts },
-                                        ))
+                                        attempt.report_empty_retry();
+                                        let remaining_attempts = remaining_attempts.saturating_sub(1);
+                                        if remaining_attempts == 0 {
+                                            Some((
+                                                vec![Ok(create_upstream_unavailable_sse())],
+                                                EmptyStreamRetryState::Done,
+                                            ))
+                                        } else {
+                                            Some((
+                                                Vec::new(),
+                                                EmptyStreamRetryState::Start { remaining_attempts },
+                                            ))
+                                        }
                                     }
                                 }
                                 None => {
-                                    if ctx.has_deliverable_output() {
-                                        provider.report_stream_success(credential_id);
+                                    if gate_open {
                                         let all_events = ctx.finish_and_get_all_events();
                                         let bytes = all_events
                                             .into_iter()
@@ -844,8 +878,9 @@ fn create_retrying_buffered_sse_stream(
                                             .collect();
                                         Some((bytes, EmptyStreamRetryState::Done))
                                     } else {
+                                        let credential_id = attempt.credential_id();
                                         tracing::warn!(credential_id, "上游 2xx 流结束但没有可交付内容，准备重试");
-                                        provider.report_empty_stream_retry(credential_id);
+                                        attempt.report_empty_retry();
                                         let remaining_attempts = remaining_attempts.saturating_sub(1);
                                         if remaining_attempts == 0 {
                                             Some((
@@ -2251,8 +2286,167 @@ mod tests {
     use super::*;
     use crate::anthropic::identity_response_guard::{CLAUDE_GREETING, KIRO_GREETING};
     use crate::anthropic::types::MessagesRequest;
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
+    use axum::{Router, routing::post};
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::time::timeout;
+
+    struct DelayedTestEndpoint {
+        base_url: String,
+    }
+
+    impl KiroEndpoint for DelayedTestEndpoint {
+        fn name(&self) -> &'static str {
+            "delayed-test"
+        }
+
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/api", self.base_url)
+        }
+
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/mcp", self.base_url)
+        }
+
+        fn decorate_api(
+            &self,
+            request: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+
+        fn decorate_mcp(
+            &self,
+            request: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    fn append_event_stream_string_header(out: &mut Vec<u8>, name: &str, value: &str) {
+        out.push(name.len() as u8);
+        out.extend_from_slice(name.as_bytes());
+        out.push(7);
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn assistant_response_frame(content: &str) -> Bytes {
+        let mut headers = Vec::new();
+        append_event_stream_string_header(&mut headers, ":message-type", "event");
+        append_event_stream_string_header(&mut headers, ":event-type", "assistantResponseEvent");
+        let payload = serde_json::to_vec(&json!({"content": content})).unwrap();
+        let total_length = 12 + headers.len() + payload.len() + 4;
+
+        let mut frame = Vec::with_capacity(total_length);
+        frame.extend_from_slice(&(total_length as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(&payload);
+        let message_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        Bytes::from(frame)
+    }
+
+    async fn delayed_assistant_stream() -> Response {
+        let chunks = stream::unfold(0, |state| async move {
+            match state {
+                0 => Some((
+                    Ok::<Bytes, Infallible>(assistant_response_frame("first answer")),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Some((
+                        Ok::<Bytes, Infallible>(assistant_response_frame(" tail")),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_emits_first_deliverable_content_before_upstream_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api", post(delayed_assistant_stream));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credential = KiroCredentials {
+            access_token: Some("test-token".to_string()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "delayed-test".to_string(),
+            Arc::new(DelayedTestEndpoint {
+                base_url: format!("http://{addr}"),
+            }),
+        );
+        let provider = Arc::new(KiroProvider::with_proxy(
+            manager.clone(),
+            None,
+            endpoints,
+            "delayed-test".to_string(),
+        ));
+        let response = provider.call_api_stream_deferred("{}").await.unwrap();
+        let guarded = create_retrying_buffered_sse_stream(
+            provider,
+            "{}".to_string(),
+            "claude-opus-5".to_string(),
+            12,
+            false,
+            SignatureMode::Disabled,
+            false,
+            HashMap::new(),
+            None,
+            response,
+        );
+        tokio::pin!(guarded);
+
+        let first_content = timeout(Duration::from_millis(800), async {
+            loop {
+                let item = guarded.next().await.unwrap().unwrap();
+                let text = String::from_utf8(item.to_vec()).unwrap();
+                if text.contains("\"text\":\"first answer\"") {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("first deliverable SSE must arrive before the delayed upstream EOF");
+
+        assert!(first_content.contains("content_block_delta"));
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+        assert_eq!(manager.snapshot().entries[0].success_count, 1);
+    }
 
     #[test]
     fn non_stream_response_guard_rewrites_exact_kiro_greeting() {

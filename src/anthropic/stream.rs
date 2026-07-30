@@ -1562,6 +1562,29 @@ impl BufferedStreamContext {
         self.inner.has_deliverable_output()
     }
 
+    /// 取走当前已转换的事件，但不结束流。
+    ///
+    /// 用于语义前缀门：确认已经存在可交付内容后，立即冲刷前缀；后续事件可以继续
+    /// 逐批取走。若前缀中尚有 message_start，则用当前已观测到的 context usage
+    /// 修正其 input_tokens；开门后协议不允许再回写已经发出的 message_start。
+    pub fn take_buffered_events(&mut self) -> Vec<SseEvent> {
+        self.correct_message_start_input_tokens();
+        std::mem::take(&mut self.event_buffer)
+    }
+
+    fn correct_message_start_input_tokens(&mut self) {
+        let final_input_tokens = self.inner.final_input_tokens();
+        for event in &mut self.event_buffer {
+            if event.event == "message_start" {
+                if let Some(message) = event.data.get_mut("message") {
+                    if let Some(usage) = message.get_mut("usage") {
+                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                    }
+                }
+            }
+        }
+    }
+
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
@@ -1580,21 +1603,7 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // /cc/v1 使用 contextUsageEvent 修正 input_tokens；普通 /v1 不走此缓冲路径。
-        let final_input_tokens = self.inner.final_input_tokens();
-
-        // 更正 message_start 事件中的 input_tokens
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
+        self.take_buffered_events()
     }
 }
 
@@ -1956,6 +1965,40 @@ mod tests {
             BufferedStreamContext::new("claude-opus-5", 12, true, false, false, HashMap::new());
         text_ctx.process_and_buffer(&Event::AssistantResponse(text));
         assert!(text_ctx.has_deliverable_output());
+    }
+
+    #[test]
+    fn buffered_context_flushes_semantic_prefix_before_stream_finish() {
+        use crate::kiro::model::events::AssistantResponseEvent;
+
+        let mut ctx =
+            BufferedStreamContext::new("claude-opus-5", 12, false, false, false, HashMap::new());
+        let mut first = AssistantResponseEvent::default();
+        first.content = "first".to_string();
+        ctx.process_and_buffer(&Event::AssistantResponse(first));
+
+        assert!(ctx.has_deliverable_output());
+        let prefix = ctx.take_buffered_events();
+        assert!(prefix.iter().any(|event| event.event == "message_start"));
+        assert!(prefix.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["text"].as_str() == Some("first")
+        }));
+        assert!(!prefix.iter().any(|event| event.event == "message_stop"));
+
+        let mut second = AssistantResponseEvent::default();
+        second.content = " second".to_string();
+        ctx.process_and_buffer(&Event::AssistantResponse(second));
+        let live = ctx.take_buffered_events();
+        assert!(live.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["text"].as_str() == Some(" second")
+        }));
+        assert!(!live.iter().any(|event| event.event == "message_start"));
+
+        let tail = ctx.finish_and_get_all_events();
+        assert!(tail.iter().any(|event| event.event == "message_stop"));
+        assert!(!tail.iter().any(|event| event.event == "message_start"));
     }
 
     #[test]
