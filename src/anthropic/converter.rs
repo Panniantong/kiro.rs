@@ -769,20 +769,31 @@ fn process_message_content(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                // Prefer typed ContentBlock parsing, but still salvage free-form
+                // OpenAI-compat blocks (input_text / input_image / text-bearing
+                // unknown types) so the upstream userInputMessage is not empty.
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
-                        "text" => {
+                        // OpenAI Responses / chat-compat aliases sometimes leak
+                        // through middle layers as input_text / output_text.
+                        "text" | "input_text" | "output_text" => {
                             if let Some(text) = block.text {
-                                text_parts.push(text);
+                                if !text.is_empty() {
+                                    text_parts.push(text);
+                                }
                             }
                         }
-                        "image" => {
+                        "image" | "input_image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) =
                                     get_image_format(&source.media_type, &source.data)
                                 {
                                     images.push(KiroImage::from_base64(format, source.data));
                                 }
+                            } else if let Some((format, data)) =
+                                extract_image_from_freeform_block(item)
+                            {
+                                images.push(KiroImage::from_base64(format, data));
                             }
                         }
                         "document" => {
@@ -816,15 +827,104 @@ fn process_message_content(
                         "tool_use" => {
                             // tool_use 在 assistant 消息中处理，这里忽略
                         }
-                        _ => {}
+                        other => {
+                            // Last-resort salvage: if an unknown block still carries
+                            // a non-empty text field, keep it instead of silently
+                            // dropping the whole user message.
+                            if let Some(text) = block.text.filter(|t| !t.trim().is_empty()) {
+                                tracing::warn!(
+                                    block_type = other,
+                                    "未知 content block 含 text，已降级为文本透传"
+                                );
+                                text_parts.push(text);
+                            } else if let Some((format, data)) =
+                                extract_image_from_freeform_block(item)
+                            {
+                                tracing::warn!(
+                                    block_type = other,
+                                    "未知 content block 含图片字段，已降级为 image 透传"
+                                );
+                                images.push(KiroImage::from_base64(format, data));
+                            } else {
+                                tracing::warn!(
+                                    block_type = other,
+                                    "跳过未知 content block（无 text/image 可提取字段）"
+                                );
+                            }
+                        }
                     }
+                    continue;
                 }
+
+                if let Some(text) = extract_text_from_freeform_block(item) {
+                    text_parts.push(text);
+                    continue;
+                }
+                if let Some((format, data)) = extract_image_from_freeform_block(item) {
+                    images.push(KiroImage::from_base64(format, data));
+                    continue;
+                }
+                tracing::warn!("跳过无法解析的 content block: {}", item);
             }
         }
         _ => {}
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+fn extract_text_from_freeform_block(item: &serde_json::Value) -> Option<String> {
+    let obj = item.as_object()?;
+    let block_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match block_type {
+        "text" | "input_text" | "output_text" | "" => {
+            let text = obj.get("text").and_then(|v| v.as_str())?;
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        _ => {
+            // Unknown typed block that still carries text.
+            let text = obj.get("text").and_then(|v| v.as_str())?;
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+    }
+}
+
+fn extract_image_from_freeform_block(item: &serde_json::Value) -> Option<(String, String)> {
+    let obj = item.as_object()?;
+
+    // Anthropic: { type, source: { type: base64, media_type, data } }
+    if let Some(source) = obj.get("source").and_then(|v| v.as_object()) {
+        let media_type = source.get("media_type").and_then(|v| v.as_str()).unwrap_or("");
+        let data = source.get("data").and_then(|v| v.as_str())?;
+        if let Some(format) = get_image_format(media_type, data) {
+            return Some((format, data.to_string()));
+        }
+    }
+
+    // OpenAI-compat: { type: input_image|image_url, image_url: "data:..." | {url} }
+    let image_url = match obj.get("image_url") {
+        Some(serde_json::Value::String(url)) => Some(url.as_str()),
+        Some(serde_json::Value::Object(map)) => map.get("url").and_then(|v| v.as_str()),
+        _ => None,
+    }?;
+
+    parse_data_url_image(image_url)
+}
+
+fn parse_data_url_image(image_url: &str) -> Option<(String, String)> {
+    let rest = image_url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.split(';').next().unwrap_or("");
+    let format = get_image_format(media_type, data)?;
+    Some((format, data.to_string()))
 }
 
 fn format_document_text(media_type: &str, text: &str) -> String {
@@ -912,9 +1012,19 @@ fn text_blocks_from_content(content: &serde_json::Value) -> Vec<String> {
         serde_json::Value::String(s) => vec![s.clone()],
         serde_json::Value::Array(arr) => arr
             .iter()
-            .filter_map(|item| serde_json::from_value::<ContentBlock>(item.clone()).ok())
-            .filter(|block| block.block_type == "text")
-            .filter_map(|block| block.text)
+            .filter_map(|item| {
+                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                    match block.block_type.as_str() {
+                        "text" | "input_text" | "output_text" => block.text.filter(|t| !t.is_empty()),
+                        _ => block
+                            .text
+                            .filter(|t| !t.trim().is_empty())
+                            .or_else(|| extract_text_from_freeform_block(item)),
+                    }
+                } else {
+                    extract_text_from_freeform_block(item)
+                }
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -2901,6 +3011,70 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
         assert!(tool_results.is_empty());
+    }
+
+    #[test]
+    fn test_process_message_content_accepts_input_text_alias() {
+        let content = serde_json::json!([
+            {
+                "type": "input_text",
+                "text": "有内容没有接收到"
+            }
+        ]);
+
+        let (text, images, tool_results) = process_message_content(&content).unwrap();
+        assert_eq!(text, "有内容没有接收到");
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+    }
+
+    #[test]
+    fn test_process_message_content_salvages_unknown_text_bearing_block() {
+        let content = serde_json::json!([
+            {
+                "type": "custom_wrapper",
+                "text": "hello from wrapper"
+            }
+        ]);
+
+        let (text, images, tool_results) = process_message_content(&content).unwrap();
+        assert_eq!(text, "hello from wrapper");
+        assert!(images.is_empty());
+        assert!(tool_results.is_empty());
+    }
+
+    #[test]
+    fn test_convert_request_keeps_input_text_user_content() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "input_text",
+                        "text": "有内容没有接收到"
+                    }
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            metadata: None,
+        };
+
+        let converted = convert_request_with_armor(&req, false).unwrap();
+        let content = converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert_eq!(content, "有内容没有接收到");
+        assert!(!content.trim().is_empty());
     }
 
     #[test]
