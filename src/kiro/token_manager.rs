@@ -1223,16 +1223,26 @@ impl MultiTokenManager {
         let mode = self.load_balancing_mode.lock().clone();
         let chosen = match mode.as_str() {
             "balanced" => {
-                // 实时负载优先：先摊开尚未完成的请求，再平衡当前 RPM 和长期成功数。
-                // credential id 作为最终稳定排序键，避免完全相同状态下的非确定选择。
-                eligible.iter().copied().min_by_key(|&i| {
-                    (
-                        entries[i].in_flight_requests,
-                        entries[i].success_window.len(),
-                        entries[i].success_count,
-                        entries[i].credentials.priority,
-                        entries[i].id,
-                    )
+                // 先锁定当前可用的最高优先级档，再只在该档内均衡实时负载。
+                // 高优先级档全部冷却、禁用或达到 RPM 上限后，eligible 才会自然降级到下一档。
+                let highest_priority = eligible
+                    .iter()
+                    .map(|&i| entries[i].credentials.priority)
+                    .min();
+
+                highest_priority.and_then(|priority| {
+                    eligible
+                        .iter()
+                        .copied()
+                        .filter(|&i| entries[i].credentials.priority == priority)
+                        .min_by_key(|&i| {
+                            (
+                                entries[i].in_flight_requests,
+                                entries[i].success_window.len(),
+                                entries[i].success_count,
+                                entries[i].id,
+                            )
+                        })
                 })
             }
             _ => {
@@ -3534,6 +3544,63 @@ mod tests {
 
         assert_eq!(selected_counts.iter().min(), Some(&10));
         assert_eq!(selected_counts.iter().max(), Some(&10));
+    }
+
+    #[tokio::test]
+    async fn test_balanced_acquire_stays_within_highest_available_priority_tier() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = [("preferred-1", 0), ("preferred-2", 0), ("fallback", 1)]
+            .into_iter()
+            .map(|(token, priority)| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(token.to_string());
+                credential.expires_at = Some(expires_at.clone());
+                credential.priority = priority;
+                credential
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+
+        // 模拟优先档历史成功数远高于备用档；历史计数不应让低优先级越级。
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].success_count = 10_000;
+            entries[1].success_count = 20_000;
+            entries[2].success_count = 0;
+        }
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+        assert_eq!(second.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_acquire_falls_back_when_highest_priority_tier_is_rate_limited() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = [("preferred", 0), ("fallback", 1)]
+            .into_iter()
+            .map(|(token, priority)| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(token.to_string());
+                credential.expires_at = Some(expires_at.clone());
+                credential.priority = priority;
+                credential
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        assert!(manager.report_rate_limited(1, Some(StdDuration::from_secs(30))));
+
+        let context = manager.acquire_context(None).await.unwrap();
+        assert_eq!(context.id, 2);
     }
 
     #[tokio::test]
