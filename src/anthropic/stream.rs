@@ -250,6 +250,41 @@ impl SseEvent {
     }
 }
 
+const CONTEXT_WINDOW_FULL_MESSAGE: &str =
+    "Context window is full. Reduce conversation history, system prompt, or tools.";
+const INCOMPLETE_TOOL_INPUT_MESSAGE: &str =
+    "Upstream stream ended before tool input completed. Please retry.";
+
+fn stream_error_event(error_type: &str, message: &str) -> SseEvent {
+    SseEvent::new(
+        "error",
+        json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message
+            }
+        }),
+    )
+}
+
+fn upstream_error_event(error_code: &str, error_message: &str) -> SseEvent {
+    let is_context_overflow = error_code.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || error_code.contains("ContentLengthExceeded")
+        || error_message.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || error_message.contains("Context window is full")
+        || error_message.contains("Input is too long");
+
+    if is_context_overflow {
+        stream_error_event("invalid_request_error", CONTEXT_WINDOW_FULL_MESSAGE)
+    } else {
+        stream_error_event(
+            "api_error",
+            "Upstream stream failed before response completion. Please retry.",
+        )
+    }
+}
+
 /// 内容块状态
 #[derive(Debug, Clone)]
 struct BlockState {
@@ -581,6 +616,12 @@ pub struct StreamContext {
     deliverable_text_seen: bool,
     /// 是否已经完整结束过一个有效的 tool_use 块。
     complete_tool_use_seen: bool,
+    /// 尚未收到 stop=true 的工具参数。完整前不得向下游发布 tool_use 块。
+    pending_tool_inputs: HashMap<String, String>,
+    /// 与 pending_tool_inputs 对应的工具名称。
+    pending_tool_names: HashMap<String, String>,
+    /// 已经向下游发出终止错误；此后不能再生成正常 message_stop。
+    terminal_error_seen: bool,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -666,6 +707,9 @@ impl StreamContext {
             output_tokens: 0,
             deliverable_text_seen: false,
             complete_tool_use_seen: false,
+            pending_tool_inputs: HashMap::new(),
+            pending_tool_names: HashMap::new(),
+            terminal_error_seen: false,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -763,6 +807,10 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        if self.terminal_error_seen {
+            return Vec::new();
+        }
+
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ReasoningContent(reasoning) => {
@@ -798,18 +846,16 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                Vec::new()
+                self.terminal_error_seen = true;
+                vec![upstream_error_event(error_code, error_message)]
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
-                if exception_type == "ContentLengthExceededException" {
-                    self.state_manager.set_stop_reason("max_tokens");
-                }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                Vec::new()
+                self.terminal_error_seen = true;
+                vec![upstream_error_event(exception_type, message)]
             }
             _ => Vec::new(),
         }
@@ -1241,9 +1287,11 @@ impl StreamContext {
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
-        let mut events = Vec::new();
+        if self.terminal_error_seen {
+            return Vec::new();
+        }
 
-        self.state_manager.set_has_tool_use(true);
+        let mut events = Vec::new();
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -1296,6 +1344,53 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
+        let tool_use_id = tool_use.tool_use_id.clone();
+        let input = self
+            .pending_tool_inputs
+            .entry(tool_use_id.clone())
+            .or_default();
+        input.push_str(&tool_use.input);
+        if !tool_use.name.trim().is_empty() {
+            self.pending_tool_names
+                .insert(tool_use_id.clone(), tool_use.name.clone());
+        }
+
+        // 不完整的工具参数不能暴露给下游，否则流中断时客户端会解析到残缺 JSON。
+        if !tool_use.stop {
+            return events;
+        }
+
+        let complete_input = self
+            .pending_tool_inputs
+            .remove(&tool_use_id)
+            .unwrap_or_default();
+        let tool_name = self
+            .pending_tool_names
+            .remove(&tool_use_id)
+            .unwrap_or_else(|| tool_use.name.clone());
+        let normalized_input = if complete_input.is_empty() {
+            "{}".to_string()
+        } else {
+            complete_input
+        };
+
+        let valid_object = serde_json::from_str::<serde_json::Value>(&normalized_input)
+            .is_ok_and(|value| value.is_object());
+        if tool_use_id.trim().is_empty() || tool_name.trim().is_empty() || !valid_object {
+            tracing::warn!(
+                tool_use_id = %tool_use_id,
+                tool_name = %tool_name,
+                "上游工具参数未完整结束，终止响应流"
+            );
+            self.terminal_error_seen = true;
+            return vec![stream_error_event(
+                "api_error",
+                INCOMPLETE_TOOL_INPUT_MESSAGE,
+            )];
+        }
+
+        self.state_manager.set_has_tool_use(true);
+
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
             idx
@@ -1309,9 +1404,9 @@ impl StreamContext {
         // 还原工具名称（如果有映射）
         let original_name = self
             .tool_name_map
-            .get(&tool_use.name)
+            .get(&tool_name)
             .cloned()
-            .unwrap_or_else(|| tool_use.name.clone());
+            .unwrap_or(tool_name);
 
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
@@ -1322,7 +1417,7 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_use.tool_use_id,
+                    "id": tool_use_id,
                     "name": original_name,
                     "input": {}
                 }
@@ -1330,33 +1425,24 @@ impl StreamContext {
         );
         events.extend(start_events);
 
-        // 发送参数增量 (ToolUseEvent.input 是 String 类型)
-        if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
-
-            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-                block_index,
-                json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": tool_use.input
-                    }
-                }),
-            ) {
-                events.push(delta_event);
-            }
+        self.output_tokens += (normalized_input.len() as i32 + 3) / 4; // 估算 token
+        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            block_index,
+            json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": normalized_input
+                }
+            }),
+        ) {
+            events.push(delta_event);
         }
 
-        // 如果是完整的工具调用（stop=true），发送 content_block_stop
-        if tool_use.stop {
-            if !tool_use.name.trim().is_empty() && !tool_use.tool_use_id.trim().is_empty() {
-                self.complete_tool_use_seen = true;
-            }
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                events.push(stop_event);
-            }
+        self.complete_tool_use_seen = true;
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
         }
 
         events
@@ -1371,8 +1457,30 @@ impl StreamContext {
                 .is_some_and(|text| !text.trim().is_empty())
     }
 
+    pub fn has_terminal_error(&self) -> bool {
+        self.terminal_error_seen
+    }
+
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        if self.terminal_error_seen {
+            return Vec::new();
+        }
+
+        if !self.pending_tool_inputs.is_empty() {
+            tracing::warn!(
+                pending_tool_count = self.pending_tool_inputs.len(),
+                "上游流结束时仍有未完成的工具参数"
+            );
+            self.pending_tool_inputs.clear();
+            self.pending_tool_names.clear();
+            self.terminal_error_seen = true;
+            return vec![stream_error_event(
+                "api_error",
+                INCOMPLETE_TOOL_INPUT_MESSAGE,
+            )];
+        }
+
         let mut events = Vec::new();
 
         match self.identity_response_guard.finish() {
@@ -1560,6 +1668,10 @@ impl BufferedStreamContext {
 
     pub fn has_deliverable_output(&self) -> bool {
         self.inner.has_deliverable_output()
+    }
+
+    pub fn has_terminal_error(&self) -> bool {
+        self.inner.has_terminal_error()
     }
 
     /// 取走当前已转换的事件，但不结束流。
@@ -2057,7 +2169,7 @@ mod tests {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            stop: true,
         });
         assert!(
             tool_events.iter().any(|e| {
@@ -2096,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_second_tool_use_closes_previous_tool_block_before_starting() {
+    fn test_consecutive_complete_tool_uses_keep_distinct_blocks() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, false, false, true, HashMap::new());
         let _ = ctx.generate_initial_events();
@@ -2105,7 +2217,7 @@ mod tests {
             name: "session_status".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: String::new(),
-            stop: false,
+            stop: true,
         });
 
         let first_tool_index = first_tool_events
@@ -2124,28 +2236,109 @@ mod tests {
             name: "read".to_string(),
             tool_use_id: "tool_2".to_string(),
             input: r#"{"file_path":"/tmp/a"}"#.to_string(),
+            stop: true,
+        });
+
+        assert!(
+            first_tool_events.iter().any(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(first_tool_index)
+            }),
+            "the first complete tool_use should close its own block"
+        );
+        let second_tool_index = second_tool_events
+            .iter()
+            .find_map(|e| {
+                if e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+                {
+                    e.data["index"].as_i64()
+                } else {
+                    None
+                }
+            })
+            .expect("second tool_use block should start");
+        assert_ne!(first_tool_index, second_tool_index);
+        assert!(second_tool_events.iter().any(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(second_tool_index)
+        }));
+    }
+
+    #[test]
+    fn test_tool_use_is_buffered_until_json_is_complete() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, false, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let partial = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "exec".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{\"command\":\"".to_string(),
+            stop: false,
+        });
+        assert!(
+            partial
+                .iter()
+                .all(|event| event.data["content_block"]["type"] != "tool_use"),
+            "partial tool JSON must not be exposed downstream"
+        );
+
+        let complete = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: String::new(),
+            tool_use_id: "tool_1".to_string(),
+            input: "pwd\"}".to_string(),
+            stop: true,
+        });
+        assert!(complete.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["type"] == "input_json_delta"
+                && event.data["delta"]["partial_json"] == r#"{"command":"pwd"}"#
+        }));
+        assert!(!ctx.has_terminal_error());
+    }
+
+    #[test]
+    fn test_incomplete_tool_use_ends_with_error_not_message_stop() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, false, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "exec".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{\"command\":\"".to_string(),
             stop: false,
         });
 
-        let pos_first_stop = second_tool_events.iter().position(|e| {
-            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(first_tool_index)
-        });
-        let pos_second_start = second_tool_events.iter().position(|e| {
-            e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+        let final_events = ctx.generate_final_events();
+        assert!(ctx.has_terminal_error());
+        assert!(final_events.iter().any(|event| event.event == "error"));
+        assert!(
+            final_events
+                .iter()
+                .all(|event| event.event != "message_stop")
+        );
+    }
+
+    #[test]
+    fn test_upstream_context_error_is_terminal() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, false, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_kiro_event(&Event::Error {
+            error_code: "CONTENT_LENGTH_EXCEEDS_THRESHOLD".to_string(),
+            error_message: "Input is too long".to_string(),
         });
 
+        assert!(ctx.has_terminal_error());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data["error"]["type"], "invalid_request_error");
+        let mut late_response = crate::kiro::model::events::AssistantResponseEvent::default();
+        late_response.content = "must not leak after terminal error".to_string();
         assert!(
-            pos_first_stop.is_some(),
-            "starting a second tool_use should close the previous open tool_use block"
+            ctx.process_kiro_event(&Event::AssistantResponse(late_response))
+                .is_empty()
         );
-        assert!(
-            pos_second_start.is_some(),
-            "second tool_use block should start"
-        );
-        assert!(
-            pos_first_stop.unwrap() < pos_second_start.unwrap(),
-            "previous tool_use block must stop before the next tool_use block starts"
-        );
+        assert!(ctx.generate_final_events().is_empty());
     }
 
     #[test]
@@ -2173,7 +2366,7 @@ mod tests {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            stop: true,
         });
 
         let text_start_index = events.iter().find_map(|e| {
@@ -2373,7 +2566,7 @@ mod tests {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
-            stop: false,
+            stop: true,
         });
         all_events.extend(tool_events);
 

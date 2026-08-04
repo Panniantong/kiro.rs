@@ -812,6 +812,15 @@ fn create_retrying_buffered_sse_stream(
                                         }
                                     }
 
+                                    if ctx.has_terminal_error() {
+                                        let bytes = ctx
+                                            .take_buffered_events()
+                                            .into_iter()
+                                            .map(|event| Ok(Bytes::from(event.to_sse_string())))
+                                            .collect();
+                                        return Some((bytes, EmptyStreamRetryState::Done));
+                                    }
+
                                     let mut gate_open = gate_open;
                                     let events = if gate_open {
                                         ctx.take_buffered_events()
@@ -844,13 +853,8 @@ fn create_retrying_buffered_sse_stream(
                                     let credential_id = attempt.credential_id();
                                     tracing::warn!(credential_id, error = %e, "读取保护流失败，准备重试");
                                     if gate_open {
-                                        let bytes = ctx
-                                            .finish_and_get_all_events()
-                                            .into_iter()
-                                            .map(|event| Ok(Bytes::from(event.to_sse_string())))
-                                            .collect();
                                         Some((
-                                            bytes,
+                                            vec![Ok(create_upstream_unavailable_sse())],
                                             EmptyStreamRetryState::Done,
                                         ))
                                     } else {
@@ -960,17 +964,14 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            let finished = ctx.has_terminal_error();
+
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, finished, ping_interval)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 异常流不能证明固定句已经完整结束，先原样释放身份护栏缓冲。
-                            let mut final_events = ctx.abort_identity_response_guard();
-                            final_events.extend(ctx.generate_final_events());
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // 传输中断不是正常结束，不能自动闭合可能残缺的 tool_use。
+                            let bytes = vec![Ok(create_upstream_unavailable_sse())];
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                         }
                         None => {
@@ -2251,16 +2252,20 @@ fn create_buffered_sse_stream(
                                         }
                                     }
                                 }
+                                if ctx.has_terminal_error() {
+                                    let all_events = ctx.take_buffered_events();
+                                    let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                        .into_iter()
+                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                        .collect();
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
+                                // 缓冲内容可能包含残缺 tool_use，错误时全部丢弃并返回终止事件。
+                                let bytes = vec![Ok(create_upstream_unavailable_sse())];
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
                             }
                             None => {
