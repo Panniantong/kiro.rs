@@ -1023,15 +1023,18 @@ fn build_non_stream_content_blocks(
 
     if thinking_enabled {
         if !reasoning_content.is_empty() || reasoning_signature.is_some() {
-            if emit_thinking_text {
+            let upstream_signature = reasoning_signature.filter(|signature| !signature.is_empty());
+            if emit_thinking_text || upstream_signature.is_some() {
                 let mut thinking_block = json!({
                     "type": "thinking",
-                    "thinking": reasoning_content
+                    "thinking": if emit_thinking_text {
+                        reasoning_content
+                    } else {
+                        String::new()
+                    }
                 });
 
-                if let Some(signature) =
-                    reasoning_signature.filter(|signature| !signature.is_empty())
-                {
+                if let Some(signature) = upstream_signature {
                     if let Some(obj) = thinking_block.as_object_mut() {
                         obj.insert("signature".to_string(), json!(signature));
                     }
@@ -1391,175 +1394,18 @@ fn has_claude_code_headers(headers: &HeaderMap) -> bool {
         || headers.contains_key("x-claude-code-session-id")
 }
 
-fn signature_mode_for_request(
-    thinking: Option<&Thinking>,
-    is_claude_code_request: bool,
-) -> SignatureMode {
-    if !should_forward_reasoning_signature(thinking, is_claude_code_request) {
-        return SignatureMode::Disabled;
-    }
-
-    if is_claude_code_request {
-        return SignatureMode::Passthrough;
-    }
-
-    match thinking.and_then(|thinking| thinking.display.as_deref()) {
-        Some("summarized") | Some("omitted") => SignatureMode::HvoyApiCheck,
-        _ => SignatureMode::Passthrough,
+fn signature_mode_for_request(thinking: Option<&Thinking>) -> SignatureMode {
+    match thinking.filter(|thinking| thinking.is_enabled()) {
+        Some(_) => SignatureMode::Passthrough,
+        None => SignatureMode::Disabled,
     }
 }
 
 fn signature_mode_for_messages_request(
     payload: &MessagesRequest,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
 ) -> SignatureMode {
-    signature_mode_for_messages_request_for_endpoint(payload, headers, false)
-}
-
-fn signature_mode_for_messages_request_for_endpoint(
-    payload: &MessagesRequest,
-    headers: &HeaderMap,
-    force_claude_code_request: bool,
-) -> SignatureMode {
-    let request_is_claude_code = force_claude_code_request
-        || is_claude_code_request(payload)
-        || has_claude_code_headers(headers);
-
-    if let Some(mode) = hvoy_api_check_signature_mode(payload, request_is_claude_code) {
-        return mode;
-    }
-
-    signature_mode_for_request(payload.thinking.as_ref(), request_is_claude_code)
-}
-
-fn hvoy_api_check_signature_mode(
-    payload: &MessagesRequest,
-    request_is_claude_code: bool,
-) -> Option<SignatureMode> {
-    if !request_is_claude_code || !is_hvoy_api_check_public_model(&payload.model) {
-        return None;
-    }
-
-    let text = messages_text(&payload.messages);
-    if is_hvoy_api_check_signature_probe(payload, &text) {
-        return Some(SignatureMode::HvoyApiCheck);
-    }
-
-    if is_hvoy_api_check_main_probe(payload, &text) {
-        return Some(SignatureMode::Disabled);
-    }
-
-    None
-}
-
-fn is_hvoy_api_check_public_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("claude-sonnet-5")
-        || model.contains("sonnet5")
-        || model.contains("claude-opus-5")
-        || model.contains("opus5")
-        || model.contains("claude-opus-4-8")
-        || model.contains("claude-opus-4-7")
-        || model.contains("claude-opus-4-6")
-        || model.contains("claude-sonnet-4-6")
-        || model.contains("claude-fable-5")
-}
-
-fn is_hvoy_api_check_signature_probe(payload: &MessagesRequest, text: &str) -> bool {
-    payload.thinking.as_ref().is_some_and(|thinking| {
-        thinking.thinking_type == "adaptive"
-            && matches!(thinking.display.as_deref(), Some("summarized"))
-    }) && text.to_ascii_lowercase().contains("sha256")
-        && (text.contains("3次") || text.contains("3 次"))
-        && text.contains("控制输出")
-}
-
-fn is_hvoy_api_check_main_probe(payload: &MessagesRequest, text: &str) -> bool {
-    is_hvoy_api_check_knowledge_probe(text)
-        || is_hvoy_api_check_pdf_probe(payload, text)
-        || is_hvoy_api_check_structured_calc_probe(payload, text)
-        || is_hvoy_api_check_right_quote_identity_probe(payload, text)
-}
-
-fn is_hvoy_api_check_knowledge_probe(text: &str) -> bool {
-    text.contains("请回答下面的近期知识题")
-        && (text.contains("序号|答案") || text.contains("序号｜答案"))
-        && text.contains("不要输出标题")
-}
-
-fn is_hvoy_api_check_pdf_probe(payload: &MessagesRequest, text: &str) -> bool {
-    messages_have_content_block_type(&payload.messages, "document")
-        && text
-            .to_ascii_lowercase()
-            .contains("what text does this pdf contain")
-        && text.contains("不要使用工具")
-}
-
-fn is_hvoy_api_check_structured_calc_probe(payload: &MessagesRequest, text: &str) -> bool {
-    has_expression_result_json_schema(payload)
-        && text.contains("计算")
-        && text.contains("乘以")
-        && text.contains("等于多少")
-}
-
-fn is_hvoy_api_check_right_quote_identity_probe(payload: &MessagesRequest, text: &str) -> bool {
-    payload
-        .thinking
-        .as_ref()
-        .is_some_and(|thinking| thinking.is_enabled())
-        && payload.output_config.is_none()
-        && payload.tools.as_ref().is_none_or(Vec::is_empty)
-        && text.contains("输出中文的这个符号”")
-        && text.contains("仅仅输出")
-        && text.contains("不要说别的")
-}
-
-fn messages_have_content_block_type(messages: &[super::types::Message], block_type: &str) -> bool {
-    messages.iter().any(|message| match &message.content {
-        serde_json::Value::Array(blocks) => blocks.iter().any(|block| {
-            block
-                .get("type")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| value == block_type)
-        }),
-        _ => false,
-    })
-}
-
-fn has_expression_result_json_schema(payload: &MessagesRequest) -> bool {
-    let Some(format) = payload
-        .output_config
-        .as_ref()
-        .and_then(|config| config.format.as_ref())
-    else {
-        return false;
-    };
-
-    if format.format_type != "json_schema" {
-        return false;
-    }
-
-    let Some(schema) = format.schema.as_ref() else {
-        return false;
-    };
-
-    let properties = schema.get("properties").and_then(|value| value.as_object());
-    let has_properties = properties.is_some_and(|properties| {
-        properties.contains_key("expression") && properties.contains_key("result")
-    });
-    let required = schema
-        .get("required")
-        .and_then(|value| value.as_array())
-        .is_some_and(|required| {
-            required
-                .iter()
-                .any(|value| value.as_str() == Some("expression"))
-                && required
-                    .iter()
-                    .any(|value| value.as_str() == Some("result"))
-        });
-
-    has_properties || required
+    signature_mode_for_request(payload.thinking.as_ref())
 }
 
 /// 判断请求是否应透传到 CC Test 上游。
@@ -1893,20 +1739,6 @@ fn summarize_relay_request(raw_body: &Bytes) -> serde_json::Value {
     })
 }
 
-fn should_forward_reasoning_signature(
-    thinking: Option<&Thinking>,
-    is_claude_code_request: bool,
-) -> bool {
-    let Some(thinking) = thinking.filter(|thinking| thinking.is_enabled()) else {
-        return false;
-    };
-
-    match thinking.display.as_deref() {
-        Some("summarized") | Some("omitted") => true,
-        _ => thinking.thinking_type == "enabled" || is_claude_code_request,
-    }
-}
-
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
@@ -2092,7 +1924,7 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    let signature_mode = signature_mode_for_messages_request_for_endpoint(&payload, &headers, true);
+    let signature_mode = signature_mode_for_messages_request(&payload, &headers);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -2677,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_stream_omitted_thinking_suppresses_empty_thinking_block() {
+    fn test_non_stream_omitted_thinking_keeps_upstream_signature() {
         let content = build_non_stream_content_blocks(
             "final answer".to_string(),
             "hidden upstream thinking".to_string(),
@@ -2688,9 +2520,12 @@ mod tests {
             "claude-opus-4-8",
         );
 
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "final answer");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "");
+        assert_eq!(content[0]["signature"], "real-upstream-signature");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
     }
 
     #[test]
@@ -2705,7 +2540,6 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(should_forward_reasoning_signature(Some(&thinking), false));
     }
 
     #[test]
@@ -2720,8 +2554,6 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(!should_forward_reasoning_signature(Some(&thinking), false));
-        assert!(should_forward_reasoning_signature(Some(&thinking), true));
     }
 
     #[test]
@@ -2736,7 +2568,6 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(should_forward_reasoning_signature(Some(&thinking), false));
     }
 
     #[test]
@@ -2751,15 +2582,14 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(should_forward_reasoning_signature(Some(&thinking), false));
     }
 
     #[test]
-    fn test_signature_mode_uses_hvoy_api_check_for_summarized_non_claude_code() {
+    fn test_signature_mode_uses_passthrough_for_summarized_non_claude_code() {
         let thinking = thinking("enabled", Some("summarized"));
         assert_eq!(
-            signature_mode_for_request(Some(&thinking), false),
-            SignatureMode::HvoyApiCheck
+            signature_mode_for_request(Some(&thinking)),
+            SignatureMode::Passthrough
         );
     }
 
@@ -2767,16 +2597,9 @@ mod tests {
     fn test_signature_mode_uses_passthrough_for_claude_code() {
         let thinking = thinking("enabled", Some("summarized"));
         assert_eq!(
-            signature_mode_for_request(Some(&thinking), true),
+            signature_mode_for_request(Some(&thinking)),
             SignatureMode::Passthrough
         );
-    }
-
-    #[test]
-    fn test_hvoy_api_check_public_model_accepts_sonnet5() {
-        assert!(is_hvoy_api_check_public_model("claude-sonnet-5"));
-        assert!(is_hvoy_api_check_public_model("claude-sonnet-5-thinking"));
-        assert!(is_hvoy_api_check_public_model("sonnet5"));
     }
 
     #[test]
@@ -2807,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hvoy_api_check_main_probe_disables_signatures_even_when_claude_code_shaped() {
+    fn test_detector_knowledge_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2830,12 +2653,12 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::Disabled
+            SignatureMode::Passthrough
         );
     }
 
     #[test]
-    fn test_hvoy_api_check_signature_probe_uses_hvoy_signature_mode_even_when_claude_code_shaped() {
+    fn test_detector_signature_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2858,12 +2681,12 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::HvoyApiCheck
+            SignatureMode::Passthrough
         );
     }
 
     #[test]
-    fn test_hvoy_api_check_pdf_probe_disables_signatures() {
+    fn test_detector_pdf_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2889,16 +2712,17 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::Disabled
+            SignatureMode::Passthrough
         );
     }
 
     #[test]
-    fn test_hvoy_api_check_structured_calc_probe_disables_signatures() {
+    fn test_detector_structured_calc_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
             "stream": true,
+            "thinking": {"type": "adaptive"},
             "output_config": {
                 "format": {
                     "type": "json_schema",
@@ -2927,7 +2751,7 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::Disabled
+            SignatureMode::Passthrough
         );
     }
 
@@ -2972,7 +2796,7 @@ mod tests {
     fn test_signature_mode_keeps_normal_enabled_thinking_passthrough() {
         let thinking = thinking("enabled", None);
         assert_eq!(
-            signature_mode_for_request(Some(&thinking), false),
+            signature_mode_for_request(Some(&thinking)),
             SignatureMode::Passthrough
         );
     }
