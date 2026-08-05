@@ -1009,11 +1009,25 @@ fn rewrite_non_stream_kiro_identity_response(text_content: &mut String) -> bool 
     true
 }
 
+#[derive(Default)]
+struct UpstreamReasoningBlock {
+    text: String,
+    signature: Option<String>,
+}
+
+fn push_reasoning_block_if_present(
+    blocks: &mut Vec<UpstreamReasoningBlock>,
+    current: &mut UpstreamReasoningBlock,
+) {
+    if !current.text.is_empty() || current.signature.is_some() {
+        blocks.push(std::mem::take(current));
+    }
+}
+
 /// 处理非流式请求
 fn build_non_stream_content_blocks(
     text_content: String,
-    reasoning_content: String,
-    reasoning_signature: Option<String>,
+    reasoning_blocks: Vec<UpstreamReasoningBlock>,
     tool_uses: Vec<serde_json::Value>,
     thinking_enabled: bool,
     emit_thinking_text: bool,
@@ -1022,13 +1036,18 @@ fn build_non_stream_content_blocks(
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        if !reasoning_content.is_empty() || reasoning_signature.is_some() {
-            let upstream_signature = reasoning_signature.filter(|signature| !signature.is_empty());
-            if emit_thinking_text || upstream_signature.is_some() {
+        if !reasoning_blocks.is_empty() {
+            for reasoning_block in reasoning_blocks {
+                let upstream_signature = reasoning_block
+                    .signature
+                    .filter(|signature| !signature.is_empty());
+                if !emit_thinking_text && upstream_signature.is_none() {
+                    continue;
+                }
                 let mut thinking_block = json!({
                     "type": "thinking",
                     "thinking": if emit_thinking_text {
-                        reasoning_content
+                        reasoning_block.text
                     } else {
                         String::new()
                     }
@@ -1119,8 +1138,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
-    let mut reasoning_content = String::new();
-    let mut reasoning_signature: Option<String> = None;
+    let mut reasoning_blocks: Vec<UpstreamReasoningBlock> = Vec::new();
+    let mut current_reasoning = UpstreamReasoningBlock::default();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -1142,14 +1161,26 @@ async fn handle_non_stream_request(
                         Event::ReasoningContent(reasoning) => {
                             if thinking_enabled {
                                 if !reasoning.text.is_empty() {
-                                    reasoning_content.push_str(&reasoning.text);
+                                    if current_reasoning.signature.is_some() {
+                                        push_reasoning_block_if_present(
+                                            &mut reasoning_blocks,
+                                            &mut current_reasoning,
+                                        );
+                                    }
+                                    current_reasoning.text.push_str(&reasoning.text);
                                 }
-                                if !reasoning.signature.is_empty() {
-                                    reasoning_signature = Some(reasoning.signature);
+                                if !reasoning.signature.is_empty()
+                                    && current_reasoning.signature.is_none()
+                                {
+                                    current_reasoning.signature = Some(reasoning.signature);
                                 }
                             }
                         }
                         Event::ToolUse(tool_use) => {
+                            push_reasoning_block_if_present(
+                                &mut reasoning_blocks,
+                                &mut current_reasoning,
+                            );
                             has_tool_use = true;
 
                             // 累积工具的 JSON 输入
@@ -1218,6 +1249,8 @@ async fn handle_non_stream_request(
         }
     }
 
+    push_reasoning_block_if_present(&mut reasoning_blocks, &mut current_reasoning);
+
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
@@ -1237,8 +1270,7 @@ async fn handle_non_stream_request(
 
     let content = build_non_stream_content_blocks(
         text_content,
-        reasoning_content,
-        reasoning_signature,
+        reasoning_blocks,
         tool_uses,
         thinking_enabled,
         emit_thinking_text,
@@ -2475,8 +2507,10 @@ mod tests {
     fn test_non_stream_content_includes_upstream_reasoning_signature() {
         let content = build_non_stream_content_blocks(
             "final answer".to_string(),
-            "real upstream thinking".to_string(),
-            Some("real-upstream-signature".to_string()),
+            vec![UpstreamReasoningBlock {
+                text: "real upstream thinking".to_string(),
+                signature: Some("real-upstream-signature".to_string()),
+            }],
             Vec::new(),
             true,
             true,
@@ -2495,8 +2529,10 @@ mod tests {
     fn test_non_stream_content_does_not_fallback_signature_without_upstream_signature() {
         let content = build_non_stream_content_blocks(
             "final answer".to_string(),
-            "real upstream thinking".to_string(),
-            None,
+            vec![UpstreamReasoningBlock {
+                text: "real upstream thinking".to_string(),
+                signature: None,
+            }],
             Vec::new(),
             true,
             true,
@@ -2512,8 +2548,10 @@ mod tests {
     fn test_non_stream_omitted_thinking_keeps_upstream_signature() {
         let content = build_non_stream_content_blocks(
             "final answer".to_string(),
-            "hidden upstream thinking".to_string(),
-            Some("real-upstream-signature".to_string()),
+            vec![UpstreamReasoningBlock {
+                text: "hidden upstream thinking".to_string(),
+                signature: Some("real-upstream-signature".to_string()),
+            }],
             Vec::new(),
             true,
             false,
@@ -2526,6 +2564,34 @@ mod tests {
         assert_eq!(content[0]["signature"], "real-upstream-signature");
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn test_non_stream_keeps_multiple_reasoning_blocks_paired_with_their_signatures() {
+        let content = build_non_stream_content_blocks(
+            "final answer".to_string(),
+            vec![
+                UpstreamReasoningBlock {
+                    text: "thinking-a".to_string(),
+                    signature: Some("signature-a".to_string()),
+                },
+                UpstreamReasoningBlock {
+                    text: "thinking-b".to_string(),
+                    signature: Some("signature-b".to_string()),
+                },
+            ],
+            Vec::new(),
+            true,
+            true,
+            "claude-opus-5",
+        );
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["thinking"], "thinking-a");
+        assert_eq!(content[0]["signature"], "signature-a");
+        assert_eq!(content[1]["thinking"], "thinking-b");
+        assert_eq!(content[1]["signature"], "signature-b");
+        assert_eq!(content[2]["text"], "final answer");
     }
 
     #[test]

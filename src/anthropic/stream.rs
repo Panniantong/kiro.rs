@@ -831,6 +831,13 @@ impl StreamContext {
         )
     }
 
+    fn prepare_next_reasoning_block(&mut self) {
+        self.thinking_block_index = None;
+        self.signature_delta_emitted = false;
+        self.thinking_delta_emitted = false;
+        self.in_thinking_block = false;
+    }
+
     fn process_reasoning_content(
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
@@ -841,15 +848,28 @@ impl StreamContext {
 
         let mut events = Vec::new();
 
-        if self.emit_thinking_text && !reasoning.text.is_empty() {
-            events.extend(self.ensure_thinking_block_started());
-            if let Some(thinking_index) = self.thinking_block_index {
-                self.output_tokens += estimate_tokens(&reasoning.text);
-                events.push(self.create_thinking_delta_event(thinking_index, &reasoning.text));
+        if !reasoning.text.is_empty() {
+            // A signature terminates its thinking block. Later reasoning text
+            // must open a fresh block, never reuse the already closed index.
+            if self.signature_delta_emitted {
+                self.prepare_next_reasoning_block();
+            }
+            if self.emit_thinking_text {
+                events.extend(self.ensure_thinking_block_started());
+                if let Some(thinking_index) = self.thinking_block_index {
+                    self.output_tokens += estimate_tokens(&reasoning.text);
+                    events.push(self.create_thinking_delta_event(thinking_index, &reasoning.text));
+                }
             }
         }
 
-        if !reasoning.signature.is_empty() && !self.signature_delta_emitted {
+        if !reasoning.signature.is_empty() {
+            if self.signature_delta_emitted {
+                // Without a text/tool boundary, the upstream event model gives
+                // us no new-block identity. Treat every additional signature as
+                // a duplicate of the current block rather than guessing.
+                return events;
+            }
             events.extend(self.ensure_thinking_block_started());
             if let Some(thinking_index) = self.thinking_block_index {
                 events.push(self.emit_signature_delta_event(thinking_index, &reasoning.signature));
@@ -1178,6 +1198,12 @@ impl StreamContext {
         let mut events = Vec::new();
 
         self.state_manager.set_has_tool_use(true);
+
+        // A completed signed reasoning block must not remain current across
+        // an interleaved tool boundary.
+        if self.signature_delta_emitted {
+            self.prepare_next_reasoning_block();
+        }
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -2827,6 +2853,169 @@ mod tests {
             collect_signatures(&all_events),
             vec!["first-upstream-signature".to_string()],
             "passthrough must expose exactly the first upstream signature per thinking block"
+        );
+    }
+
+    #[test]
+    fn test_interleaved_reasoning_blocks_preserve_each_upstream_signature() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-5",
+            1,
+            true,
+            SignatureMode::Passthrough,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        for event in [
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: "thinking-a".to_string(),
+                signature: String::new(),
+            }),
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: "signature-a".to_string(),
+            }),
+            Event::ToolUse(crate::kiro::model::events::ToolUseEvent {
+                name: "read".to_string(),
+                tool_use_id: "tool-a".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: "thinking-b".to_string(),
+                signature: String::new(),
+            }),
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: "signature-b".to_string(),
+            }),
+        ] {
+            events.extend(ctx.process_kiro_event(&event));
+        }
+
+        let thinking_starts = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let signature_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(thinking_starts.len(), 2);
+        assert_ne!(thinking_starts[0], thinking_starts[1]);
+        assert_eq!(signature_indices, thinking_starts);
+        assert_eq!(
+            collect_signatures(&events),
+            vec!["signature-a", "signature-b"]
+        );
+    }
+
+    #[test]
+    fn test_reasoning_text_after_signature_opens_a_new_thinking_block() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-5",
+            1,
+            true,
+            SignatureMode::Passthrough,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        for (text, signature) in [
+            ("thinking-a", ""),
+            ("", "signature-a"),
+            ("thinking-b", ""),
+            ("", "signature-b"),
+        ] {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: text.to_string(),
+                    signature: signature.to_string(),
+                },
+            )));
+        }
+
+        let thinking_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "thinking_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let signature_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(thinking_indices.len(), 2);
+        assert_ne!(thinking_indices[0], thinking_indices[1]);
+        assert_eq!(signature_indices, thinking_indices);
+        assert_eq!(
+            collect_signatures(&events),
+            vec!["signature-a", "signature-b"]
+        );
+    }
+
+    #[test]
+    fn test_hidden_reasoning_text_still_separates_upstream_signatures() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-5",
+            1,
+            true,
+            SignatureMode::Passthrough,
+            false,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        for (text, signature) in [
+            ("hidden-a", ""),
+            ("", "signature-a"),
+            ("hidden-b", ""),
+            ("", "signature-b"),
+        ] {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: text.to_string(),
+                    signature: signature.to_string(),
+                },
+            )));
+        }
+
+        let signature_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(signature_indices.len(), 2);
+        assert_ne!(signature_indices[0], signature_indices[1]);
+        assert_eq!(
+            collect_signatures(&events),
+            vec!["signature-a", "signature-b"]
         );
     }
 
