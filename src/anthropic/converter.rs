@@ -465,6 +465,7 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     InvalidReasoningEffort(String),
+    UnsupportedAttachment(String),
     EmptyMessages,
 }
 
@@ -475,6 +476,7 @@ impl std::fmt::Display for ConversionError {
             ConversionError::InvalidReasoningEffort(effort) => {
                 write!(f, "reasoning effort 不支持: {}", effort)
             }
+            ConversionError::UnsupportedAttachment(message) => write!(f, "{}", message),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
         }
     }
@@ -789,11 +791,27 @@ fn process_message_content(
                                     get_image_format(&source.media_type, &source.data)
                                 {
                                     images.push(KiroImage::from_base64(format, source.data));
+                                } else if let Some((format, data)) =
+                                    extract_pdf_image(&source.media_type, &source.data)
+                                {
+                                    images.push(KiroImage::from_base64(format, data));
+                                } else if source.media_type == "application/pdf" {
+                                    return Err(ConversionError::UnsupportedAttachment(
+                                        "无法安全解析 PDF 附件".to_string(),
+                                    ));
                                 }
+                            } else if let Some((format, data)) =
+                                extract_pdf_image_from_freeform_block(item)
+                            {
+                                images.push(KiroImage::from_base64(format, data));
                             } else if let Some((format, data)) =
                                 extract_image_from_freeform_block(item)
                             {
                                 images.push(KiroImage::from_base64(format, data));
+                            } else if is_pdf_attachment_block(item) {
+                                return Err(ConversionError::UnsupportedAttachment(
+                                    "无法安全解析 PDF 附件".to_string(),
+                                ));
                             }
                         }
                         "document" => {
@@ -803,6 +821,14 @@ fn process_message_content(
                                 {
                                     text_parts
                                         .push(format_document_text(&source.media_type, &text));
+                                } else if let Some((format, data)) =
+                                    extract_pdf_image(&source.media_type, &source.data)
+                                {
+                                    images.push(KiroImage::from_base64(format, data));
+                                } else if source.media_type == "application/pdf" {
+                                    return Err(ConversionError::UnsupportedAttachment(
+                                        "无法安全解析 PDF 附件".to_string(),
+                                    ));
                                 }
                             }
                         }
@@ -838,6 +864,10 @@ fn process_message_content(
                                 );
                                 text_parts.push(text);
                             } else if let Some((format, data)) =
+                                extract_pdf_image_from_freeform_block(item)
+                            {
+                                images.push(KiroImage::from_base64(format, data));
+                            } else if let Some((format, data)) =
                                 extract_image_from_freeform_block(item)
                             {
                                 tracing::warn!(
@@ -845,6 +875,10 @@ fn process_message_content(
                                     "未知 content block 含图片字段，已降级为 image 透传"
                                 );
                                 images.push(KiroImage::from_base64(format, data));
+                            } else if is_pdf_attachment_block(item) {
+                                return Err(ConversionError::UnsupportedAttachment(
+                                    "无法安全解析 PDF 附件".to_string(),
+                                ));
                             } else {
                                 tracing::warn!(
                                     block_type = other,
@@ -860,9 +894,18 @@ fn process_message_content(
                     text_parts.push(text);
                     continue;
                 }
+                if let Some((format, data)) = extract_pdf_image_from_freeform_block(item) {
+                    images.push(KiroImage::from_base64(format, data));
+                    continue;
+                }
                 if let Some((format, data)) = extract_image_from_freeform_block(item) {
                     images.push(KiroImage::from_base64(format, data));
                     continue;
+                }
+                if is_pdf_attachment_block(item) {
+                    return Err(ConversionError::UnsupportedAttachment(
+                        "无法安全解析 PDF 附件".to_string(),
+                    ));
                 }
                 tracing::warn!("跳过无法解析的 content block: {}", item);
             }
@@ -902,7 +945,10 @@ fn extract_image_from_freeform_block(item: &serde_json::Value) -> Option<(String
 
     // Anthropic: { type, source: { type: base64, media_type, data } }
     if let Some(source) = obj.get("source").and_then(|v| v.as_object()) {
-        let media_type = source.get("media_type").and_then(|v| v.as_str()).unwrap_or("");
+        let media_type = source
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let data = source.get("data").and_then(|v| v.as_str())?;
         if let Some(format) = get_image_format(media_type, data) {
             return Some((format, data.to_string()));
@@ -917,6 +963,125 @@ fn extract_image_from_freeform_block(item: &serde_json::Value) -> Option<(String
     }?;
 
     parse_data_url_image(image_url)
+}
+
+fn extract_pdf_image_from_freeform_block(item: &serde_json::Value) -> Option<(String, String)> {
+    let obj = item.as_object()?;
+
+    if let Some(source) = obj.get("source").and_then(|v| v.as_object()) {
+        let media_type = source
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let data = source.get("data").and_then(|v| v.as_str())?;
+        if let Some(image) = extract_pdf_image(media_type, data) {
+            return Some(image);
+        }
+    }
+
+    let image_url = match obj.get("image_url") {
+        Some(serde_json::Value::String(url)) => Some(url.as_str()),
+        Some(serde_json::Value::Object(map)) => map.get("url").and_then(|v| v.as_str()),
+        _ => None,
+    }?;
+    let rest = image_url.strip_prefix("data:application/pdf;base64,")?;
+    extract_pdf_image("application/pdf", rest)
+}
+
+fn is_pdf_attachment_block(item: &serde_json::Value) -> bool {
+    let Some(obj) = item.as_object() else {
+        return false;
+    };
+    if obj
+        .get("source")
+        .and_then(|v| v.get("media_type"))
+        .and_then(|v| v.as_str())
+        == Some("application/pdf")
+    {
+        return true;
+    }
+    let image_url = match obj.get("image_url") {
+        Some(serde_json::Value::String(url)) => Some(url.as_str()),
+        Some(serde_json::Value::Object(map)) => map.get("url").and_then(|v| v.as_str()),
+        _ => None,
+    };
+    image_url.is_some_and(|url| url.starts_with("data:application/pdf;base64,"))
+}
+
+pub(crate) fn extract_pdf_image(media_type: &str, data: &str) -> Option<(String, String)> {
+    if media_type != "application/pdf" {
+        return None;
+    }
+    let pdf = BASE64_STANDARD.decode(data).ok()?;
+    let jpeg = extract_single_pdf_jpeg(&pdf)?;
+    Some(("jpeg".to_string(), BASE64_STANDARD.encode(jpeg)))
+}
+
+fn extract_single_pdf_jpeg(pdf: &[u8]) -> Option<&[u8]> {
+    if !pdf.starts_with(b"%PDF-") {
+        return None;
+    }
+
+    let mut cursor = 0usize;
+    let mut found = None;
+    while let Some(relative) = find_bytes(&pdf[cursor..], b"/Subtype /Image") {
+        let image_start = cursor + relative;
+        let stream_relative = find_bytes(&pdf[image_start..], b"stream")?;
+        if stream_relative > 4096 {
+            cursor = image_start + b"/Subtype /Image".len();
+            continue;
+        }
+        let stream_marker = image_start + stream_relative;
+        let header = &pdf[image_start..stream_marker];
+        if find_bytes(header, b"/DCTDecode").is_none() {
+            cursor = stream_marker + b"stream".len();
+            continue;
+        }
+        let length = direct_pdf_stream_length(header)?;
+        let mut data_start = stream_marker + b"stream".len();
+        if pdf.get(data_start..data_start + 2) == Some(b"\r\n") {
+            data_start += 2;
+        } else if matches!(pdf.get(data_start), Some(b'\n' | b'\r')) {
+            data_start += 1;
+        }
+        let data_end = data_start.checked_add(length)?;
+        let jpeg = pdf.get(data_start..data_end)?;
+        if !jpeg.starts_with(&[0xff, 0xd8, 0xff]) || !jpeg.ends_with(&[0xff, 0xd9]) {
+            return None;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(jpeg);
+        cursor = data_end;
+    }
+    found
+}
+
+fn direct_pdf_stream_length(header: &[u8]) -> Option<usize> {
+    let pos = find_bytes(header, b"/Length")? + b"/Length".len();
+    let mut digits = header[pos..]
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(|b| b.is_ascii_digit());
+    let first = digits.next()?;
+    let mut value = usize::from(first - b'0');
+    for digit in digits {
+        value = value
+            .checked_mul(10)?
+            .checked_add(usize::from(digit - b'0'))?;
+    }
+    Some(value)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn parse_data_url_image(image_url: &str) -> Option<(String, String)> {
@@ -1015,7 +1180,9 @@ fn text_blocks_from_content(content: &serde_json::Value) -> Vec<String> {
             .filter_map(|item| {
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
-                        "text" | "input_text" | "output_text" => block.text.filter(|t| !t.is_empty()),
+                        "text" | "input_text" | "output_text" => {
+                            block.text.filter(|t| !t.is_empty())
+                        }
                         _ => block
                             .text
                             .filter(|t| !t.trim().is_empty())
@@ -4460,6 +4627,21 @@ mod tests {
         BASE64_STANDARD.encode(pdf.as_bytes())
     }
 
+    fn make_test_image_pdf_base64() -> (String, String) {
+        let jpeg = vec![
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x01, 0x66, 0x06, 0x34, 0x01, 0x01, 0x11,
+            0x00, 0xff, 0xd9,
+        ];
+        let mut pdf = format!(
+            "%PDF-1.3\n1 0 obj\n<< /Type /XObject /Subtype /Image /Width 1588 /Height 358 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} /Filter /DCTDecode >>\nstream\n",
+            jpeg.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(&jpeg);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF");
+        (BASE64_STANDARD.encode(pdf), BASE64_STANDARD.encode(jpeg))
+    }
+
     #[test]
     fn test_document_pdf_block_text_is_forwarded_to_kiro_prompt() {
         let marker = "hvoytest";
@@ -4504,6 +4686,79 @@ mod tests {
         assert!(content.contains("What text does this PDF contain?"));
         assert!(content.contains("Attached document content extracted"));
         assert!(content.contains("do not say no document was attached"));
+    }
+
+    #[test]
+    fn test_image_url_pdf_with_single_embedded_jpeg_is_forwarded_as_image() {
+        let (pdf_base64, jpeg_base64) = make_test_image_pdf_base64();
+        let req = MessagesRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:application/pdf;base64,{pdf_base64}")
+                        }
+                    },
+                    {"type": "text", "text": "describe it"}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).unwrap();
+        let input = converted
+            .conversation_state
+            .current_message
+            .user_input_message;
+
+        assert_eq!(input.images.len(), 1);
+        assert_eq!(input.images[0].format, "jpeg");
+        assert_eq!(input.images[0].source.bytes, jpeg_base64);
+        assert_eq!(input.content, "describe it");
+    }
+
+    #[test]
+    fn test_unreadable_image_url_pdf_fails_instead_of_silently_dropping_attachment() {
+        let unreadable_pdf = BASE64_STANDARD.encode(b"%PDF-1.3\n%%EOF");
+        let req = MessagesRequest {
+            model: "claude-opus-5".to_string(),
+            max_tokens: 128,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:application/pdf;base64,{unreadable_pdf}")
+                        }
+                    },
+                    {"type": "text", "text": "describe it"}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            metadata: None,
+        };
+
+        let error = convert_request(&req).expect_err("unreadable PDF must not be silently dropped");
+
+        assert!(error.to_string().contains("无法安全解析 PDF 附件"));
     }
 
     #[test]

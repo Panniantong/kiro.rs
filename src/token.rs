@@ -12,6 +12,7 @@ use crate::anthropic::types::{
 };
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::sync::OnceLock;
 
 /// Count Tokens API 配置
@@ -207,6 +208,7 @@ fn count_all_tokens_local(
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     total += count_tokens(text);
                 }
+                total += estimate_visual_tokens(item);
             }
         }
     }
@@ -222,6 +224,129 @@ fn count_all_tokens_local(
     }
 
     total.max(1)
+}
+
+fn estimate_visual_tokens(block: &serde_json::Value) -> u64 {
+    if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+        return match block.get("content") {
+            Some(serde_json::Value::Array(items)) => items.iter().map(estimate_visual_tokens).sum(),
+            Some(item @ serde_json::Value::Object(_)) => estimate_visual_tokens(item),
+            _ => 0,
+        };
+    }
+
+    let Some(bytes) = inline_image_bytes(block) else {
+        return 0;
+    };
+    let Some((width, height)) = image_dimensions(&bytes) else {
+        return 0;
+    };
+    visual_tokens_for_dimensions(width, height)
+}
+
+fn inline_image_bytes(block: &serde_json::Value) -> Option<Vec<u8>> {
+    if let Some(source) = block.get("source").and_then(|v| v.as_object()) {
+        let media_type = source
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let data = source.get("data").and_then(|v| v.as_str())?;
+        if media_type.starts_with("image/") {
+            return BASE64_STANDARD.decode(data).ok();
+        }
+        if media_type == "application/pdf" {
+            let (_, image_data) = crate::anthropic::converter::extract_pdf_image(media_type, data)?;
+            return BASE64_STANDARD.decode(image_data).ok();
+        }
+    }
+
+    let image_url = match block.get("image_url") {
+        Some(serde_json::Value::String(url)) => Some(url.as_str()),
+        Some(serde_json::Value::Object(map)) => map.get("url").and_then(|v| v.as_str()),
+        _ => None,
+    }?;
+    if let Some(data) = image_url.strip_prefix("data:application/pdf;base64,") {
+        let (_, image_data) =
+            crate::anthropic::converter::extract_pdf_image("application/pdf", data)?;
+        return BASE64_STANDARD.decode(image_data).ok();
+    }
+    let rest = image_url.strip_prefix("data:image/")?;
+    let (_, data) = rest.split_once(',')?;
+    BASE64_STANDARD.decode(data).ok()
+}
+
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 {
+        return Some((
+            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+        ));
+    }
+    if (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) && bytes.len() >= 10 {
+        return Some((
+            u32::from(u16::from_le_bytes(bytes[6..8].try_into().ok()?)),
+            u32::from(u16::from_le_bytes(bytes[8..10].try_into().ok()?)),
+        ));
+    }
+    if bytes.starts_with(b"RIFF")
+        && bytes.get(8..12) == Some(b"WEBP")
+        && bytes.get(12..16) == Some(b"VP8X")
+        && bytes.len() >= 30
+    {
+        let width =
+            1 + u32::from(bytes[24]) + (u32::from(bytes[25]) << 8) + (u32::from(bytes[26]) << 16);
+        let height =
+            1 + u32::from(bytes[27]) + (u32::from(bytes[28]) << 8) + (u32::from(bytes[29]) << 16);
+        return Some((width, height));
+    }
+    jpeg_dimensions(bytes)
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut cursor = 2usize;
+    while cursor + 4 <= bytes.len() {
+        while bytes.get(cursor) == Some(&0xff) {
+            cursor += 1;
+        }
+        let marker = *bytes.get(cursor)?;
+        cursor += 1;
+        if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes(
+            bytes.get(cursor..cursor + 2)?.try_into().ok()?,
+        ));
+        if length < 2 || cursor + length > bytes.len() {
+            return None;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            let height = u32::from(u16::from_be_bytes(
+                bytes.get(cursor + 3..cursor + 5)?.try_into().ok()?,
+            ));
+            let width = u32::from(u16::from_be_bytes(
+                bytes.get(cursor + 5..cursor + 7)?.try_into().ok()?,
+            ));
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        cursor += length;
+    }
+    None
+}
+
+fn visual_tokens_for_dimensions(width: u32, height: u32) -> u64 {
+    if width == 0 || height == 0 {
+        return 0;
+    }
+    let width = f64::from(width);
+    let height = f64::from(height);
+    let long_edge_scale = 1568.0 / width.max(height);
+    let area_scale = (1_150_000.0 / (width * height)).sqrt();
+    let scale = 1.0_f64.min(long_edge_scale).min(area_scale);
+    let resized_area = (width * scale).round() * (height * scale).round();
+    (resized_area / 750.0).ceil().max(1.0) as u64
 }
 
 /// 估算输出 tokens
@@ -242,4 +367,86 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+    #[test]
+    fn image_input_tokens_are_based_on_dimensions_not_base64_bytes() {
+        let jpeg = vec![
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x01, 0x66, 0x06, 0x34, 0x01, 0x01, 0x11,
+            0x00, 0xff, 0xd9,
+        ];
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": BASE64_STANDARD.encode(jpeg)
+                    }
+                },
+                {"type": "text", "text": "describe it"}
+            ]),
+        }];
+
+        let tokens = count_all_tokens_local(None, messages, None);
+
+        assert!(
+            (700..=800).contains(&tokens),
+            "unexpected visual token estimate: {tokens}"
+        );
+    }
+
+    #[test]
+    fn image_pdf_input_tokens_use_the_embedded_image_dimensions() {
+        let jpeg = vec![
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x01, 0x66, 0x06, 0x34, 0x01, 0x01, 0x11,
+            0x00, 0xff, 0xd9,
+        ];
+        let mut pdf = format!(
+            "%PDF-1.3\n1 0 obj\n<< /Type /XObject /Subtype /Image /Width 1588 /Height 358 /Length {} /Filter /DCTDecode >>\nstream\n",
+            jpeg.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(&jpeg);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF");
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:application/pdf;base64,{}", BASE64_STANDARD.encode(pdf))
+                    }
+                },
+                {"type": "text", "text": "describe it"}
+            ]),
+        }];
+
+        let tokens = count_all_tokens_local(None, messages, None);
+
+        assert!(
+            (700..=800).contains(&tokens),
+            "unexpected PDF visual token estimate: {tokens}"
+        );
+    }
+
+    #[test]
+    fn webp_image_dimensions_are_tokenized() {
+        let mut webp = vec![0u8; 30];
+        webp[0..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        webp[12..16].copy_from_slice(b"VP8X");
+        webp[24..27].copy_from_slice(&[0xe7, 0x03, 0x00]);
+        webp[27..30].copy_from_slice(&[0xf3, 0x01, 0x00]);
+
+        assert_eq!(image_dimensions(&webp), Some((1000, 500)));
+        assert!(visual_tokens_for_dimensions(1000, 500) > 0);
+    }
 }
