@@ -433,6 +433,9 @@ pub async fn post_messages(
                     "invalid_request_error",
                     format!("reasoning effort 不支持: {}", effort),
                 ),
+                ConversionError::UnsupportedAttachment(message) => {
+                    ("invalid_request_error", message.clone())
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -1887,6 +1890,9 @@ pub async fn post_messages_cc(
                     "invalid_request_error",
                     format!("reasoning effort 不支持: {}", effort),
                 ),
+                ConversionError::UnsupportedAttachment(message) => {
+                    ("invalid_request_error", message.clone())
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
