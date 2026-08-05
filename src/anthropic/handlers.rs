@@ -396,7 +396,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
-    force_opus_thinking_summarized(&mut payload);
+    force_adaptive_summarized_thinking(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -1365,36 +1365,39 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
-/// Opus 数据交付需要可见的 Thinking 正文。无论调用方是否省略 Thinking，
-/// 或明确请求 omitted，都统一要求上游返回 summarized Thinking。
-/// 已有的 Thinking 类型、预算和 effort 保持不变，避免改写调用方的其他配置。
-fn force_opus_thinking_summarized(payload: &mut MessagesRequest) {
-    if !payload.model.to_ascii_lowercase().contains("opus") {
+/// 新版 Opus / Sonnet 数据交付需要可见的 Thinking 正文。无论调用方是否省略 Thinking，
+/// 或明确请求 enabled、disabled、omitted，都统一覆写为 adaptive + summarized。
+/// budget_tokens 对 adaptive 模式不会传给上游；已有 effort 保持不变。
+fn force_adaptive_summarized_thinking(payload: &mut MessagesRequest) {
+    let model = payload.model.to_ascii_lowercase();
+    let supports_adaptive_summarized = model.contains("opus")
+        || model.contains("sonnet-5")
+        || model.contains("sonnet5")
+        || model.contains("5-sonnet")
+        || model.contains("sonnet-4-6")
+        || model.contains("sonnet-4.6");
+    if !supports_adaptive_summarized {
         return;
     }
 
-    match payload.thinking.as_mut() {
-        Some(thinking) if thinking.is_enabled() => {
-            thinking.display = Some("summarized".to_string());
-        }
-        _ => {
-            payload.thinking = Some(Thinking {
-                thinking_type: "adaptive".to_string(),
-                display: Some("summarized".to_string()),
-                budget_tokens: 20000,
-            });
-            if payload.output_config.is_none() {
-                payload.output_config = Some(OutputConfig {
-                    effort: "high".to_string(),
-                    format: None,
-                });
-            }
-        }
+    let thinking = payload.thinking.get_or_insert_with(|| Thinking {
+        thinking_type: "adaptive".to_string(),
+        display: Some("summarized".to_string()),
+        budget_tokens: 20000,
+    });
+    thinking.thinking_type = "adaptive".to_string();
+    thinking.display = Some("summarized".to_string());
+
+    if payload.output_config.is_none() {
+        payload.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+            format: None,
+        });
     }
 
     tracing::info!(
         model = %payload.model,
-        "Opus 请求已强制启用 summarized Thinking"
+        "请求已强制启用 adaptive + summarized Thinking"
     );
 }
 
@@ -1920,7 +1923,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
-    force_opus_thinking_summarized(&mut payload);
+    force_adaptive_summarized_thinking(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -2700,7 +2703,7 @@ mod tests {
         }))
         .unwrap();
 
-        force_opus_thinking_summarized(&mut payload);
+        force_adaptive_summarized_thinking(&mut payload);
 
         let thinking = payload.thinking.as_ref().unwrap();
         assert_eq!(thinking.thinking_type, "adaptive");
@@ -2717,7 +2720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_force_opus_thinking_overrides_omitted_but_preserves_existing_config() {
+    fn test_force_opus_thinking_overrides_enabled_and_omitted_with_adaptive_summarized() {
         let mut payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 128,
@@ -2727,10 +2730,10 @@ mod tests {
         }))
         .unwrap();
 
-        force_opus_thinking_summarized(&mut payload);
+        force_adaptive_summarized_thinking(&mut payload);
 
         let thinking = payload.thinking.as_ref().unwrap();
-        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.thinking_type, "adaptive");
         assert_eq!(thinking.display.as_deref(), Some("summarized"));
         assert_eq!(thinking.budget_tokens, 4096);
         assert_eq!(
@@ -2743,16 +2746,56 @@ mod tests {
     }
 
     #[test]
-    fn test_force_opus_thinking_does_not_change_non_opus_requests() {
+    fn test_force_opus_thinking_overrides_disabled() {
         let mut payload: MessagesRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-5",
+            "model": "claude-opus-5",
+            "max_tokens": 128,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        force_adaptive_summarized_thinking(&mut payload);
+
+        let thinking = payload.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.display.as_deref(), Some("summarized"));
+    }
+
+    #[test]
+    fn test_force_adaptive_summarized_thinking_for_sonnet_4_6_and_5() {
+        for model in ["claude-sonnet-4-6", "claude-sonnet-5"] {
+            let mut payload: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "max_tokens": 128,
+                "thinking": {"type": "disabled", "display": "omitted"},
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap();
+
+            force_adaptive_summarized_thinking(&mut payload);
+
+            let thinking = payload.thinking.as_ref().unwrap();
+            assert_eq!(thinking.thinking_type, "adaptive", "model={model}");
+            assert_eq!(
+                thinking.display.as_deref(),
+                Some("summarized"),
+                "model={model}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_force_adaptive_summarized_thinking_does_not_change_older_sonnet() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5-20250929",
             "max_tokens": 128,
             "thinking": {"type": "adaptive", "display": "omitted", "budget_tokens": 4096},
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
 
-        force_opus_thinking_summarized(&mut payload);
+        force_adaptive_summarized_thinking(&mut payload);
 
         let thinking = payload.thinking.as_ref().unwrap();
         assert_eq!(thinking.display.as_deref(), Some("omitted"));
