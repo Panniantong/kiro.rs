@@ -22,6 +22,11 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # GHCR repository names must be lowercase. GitHub preserves the owner casing in
+  # github.repository_owner, so do not interpolate it directly into image tags.
+  IMAGE_OWNER: panniantong
+
 jobs:
   pre-check:
     runs-on: ubuntu-latest
@@ -99,7 +104,7 @@ jobs:
           cache-to: type=gha,mode=max
           push: true
           provenance: false
-          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          tags: ghcr.io/${{ env.IMAGE_OWNER }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
@@ -119,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ needs.build.outputs.version }}"
           IS_BETA="${{ needs.build.outputs.is_beta }}"
-          IMAGE="ghcr.io/${{ github.repository_owner }}/kiro-rs"
+          IMAGE="ghcr.io/${{ env.IMAGE_OWNER }}/kiro-rs"
 
           # Create manifest for version tag
           docker manifest create ${IMAGE}:${VERSION} \
