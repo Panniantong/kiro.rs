@@ -112,9 +112,17 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  /** Omit to let eligible KIRO POWER accounts receive a pool proxy automatically. */
+  assignProxyFromPool?: boolean
   kiroApiKey?: string
   endpoint?: string
   importNote?: string
+}
+
+export interface ProxyPoolEligibility {
+  eligible: boolean
+  subscriptionTitle?: string
+  reason: string
 }
 
 // 添加凭据响应
@@ -123,6 +131,9 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+  assignedProxyUrl?: string
+  assignedProxyFromPool: boolean
+  proxyPoolEligibility?: ProxyPoolEligibility
 }
 
 // RPM 限流请求

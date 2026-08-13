@@ -235,8 +235,9 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
-    /// 未显式传入 proxyUrl 时，是否从代理池自动领取一个代理。
-    /// 缺省时：池非空即自动分配；传 false 可保留原来的全局代理/直连行为。
+    /// 未显式传入 proxyUrl 时，是否允许从代理池自动领取一个代理。
+    /// 缺省时：池非空且官方 getUsageLimits 返回的 subscriptionTitle 为 KIRO POWER 才自动分配；
+    /// 传 false 可保留原来的全局代理/直连行为。
     #[serde(default)]
     pub assign_proxy_from_pool: Option<bool>,
 
@@ -269,6 +270,24 @@ pub struct AddCredentialResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_proxy_url: Option<String>,
     pub assigned_proxy_from_pool: bool,
+    /// 自动代理池资格判定。仅在本次请求尝试自动从池分配时返回。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_pool_eligibility: Option<ProxyPoolEligibility>,
+}
+
+/// 自动代理池的订阅资格判定。
+///
+/// 只使用 Kiro 官方 getUsageLimits 返回的 subscriptionTitle，不依赖邮箱或额度。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolEligibility {
+    /// 是否符合自动分配代理的订阅条件（KIRO POWER）。
+    pub eligible: bool,
+    /// 官方 getUsageLimits 返回的订阅标题。查询失败或字段缺失时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    /// 判定结果或未分配原因。
+    pub reason: String,
 }
 
 // ============ 余额查询 ============

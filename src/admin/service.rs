@@ -10,6 +10,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
@@ -17,9 +18,10 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
     BalanceResponse, BatchSetCredentialProxyRequest, CredentialProxyTestResponse,
     CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    MaxRelayResponse, OveragePassthroughResponse, ProxyPoolEntryStatus, ProxyPoolResponse,
-    RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
-    SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
+    MaxRelayResponse, OveragePassthroughResponse, ProxyPoolEligibility, ProxyPoolEntryStatus,
+    ProxyPoolResponse, RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
+    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+    SetOveragePassthroughRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -466,6 +468,32 @@ impl AdminService {
             })
     }
 
+    fn has_proxy_pool_entries(&self) -> bool {
+        !self.proxy_pool.lock().proxies.is_empty()
+    }
+
+    /// ponytail: 只按 Kiro 官方返回的 subscriptionTitle 精确识别，不猜邮箱域名、
+    /// 余额或赠送额度；若 Kiro 日后变更套餐名，再把该规则改成配置项。
+    fn proxy_pool_eligibility(usage: &UsageLimitsResponse) -> ProxyPoolEligibility {
+        let subscription_title = usage.subscription_title().map(str::to_owned);
+        let eligible = subscription_title
+            .as_deref()
+            .map(|title| title.trim().eq_ignore_ascii_case("KIRO POWER"))
+            .unwrap_or(false);
+        let reason = if eligible {
+            "官方 subscriptionTitle 为 KIRO POWER，允许自动分配代理".to_string()
+        } else if let Some(title) = subscription_title.as_deref() {
+            format!("官方 subscriptionTitle 为 {title:?}，不自动分配代理")
+        } else {
+            "官方 getUsageLimits 未返回 subscriptionTitle，不自动分配代理".to_string()
+        };
+        ProxyPoolEligibility {
+            eligible,
+            subscription_title,
+            reason,
+        }
+    }
+
     fn load_proxy_pool_from(path: &Option<PathBuf>) -> ProxyPool {
         let Some(path) = path else {
             return ProxyPool::default();
@@ -645,25 +673,17 @@ impl AdminService {
             }
         }
 
-        // 序列化分配到实际写入，防止两个并发导入拿到同一个最后的空槽。
-        let _allocation_guard = self.allocation_lock.lock().await;
-
-        // 显式代理优先；未提供时自动从池中领取。未配置代理池时保持原有行为。
+        // 显式代理优先；未提供时才考虑代理池。
         let explicit_proxy = req.proxy_url.is_some();
         let assign_from_pool = req.assign_proxy_from_pool.unwrap_or(true);
-        let assigned_proxy = if explicit_proxy || !assign_from_pool {
-            None
-        } else {
-            self.next_proxy_pool_entry()?
-        };
 
-        // 构建凭据对象
+        // 先构建未绑定代理的凭据，使用官方 getUsageLimits 的 subscriptionTitle 判断资格。
         let email = req.email.clone();
         let import_note = req
             .import_note
             .map(|note| note.trim().to_string())
             .filter(|note| !note.is_empty());
-        let new_cred = KiroCredentials {
+        let mut new_cred = KiroCredentials {
             id: None,
             access_token: None,
             refresh_token: req.refresh_token,
@@ -681,23 +701,59 @@ impl AdminService {
             import_note,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             overage_status: None,     // 将在首次获取使用额度时自动同步
-            proxy_url: assigned_proxy
-                .as_ref()
-                .map(|entry| entry.proxy_url.clone())
-                .or(req.proxy_url),
-            proxy_username: assigned_proxy
-                .as_ref()
-                .and_then(|entry| entry.proxy_username.clone())
-                .or(req.proxy_username),
-            proxy_password: assigned_proxy
-                .as_ref()
-                .and_then(|entry| entry.proxy_password.clone())
-                .or(req.proxy_password),
+            proxy_url: req.proxy_url,
+            proxy_username: req.proxy_username,
+            proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             rpm: None,
         };
+
+        let should_check_pool =
+            !explicit_proxy && assign_from_pool && self.has_proxy_pool_entries();
+        let (proxy_pool_eligibility, inspected_usage) = if should_check_pool {
+            match self
+                .token_manager
+                .get_usage_limits_for_candidate(&new_cred)
+                .await
+            {
+                Ok(candidate) => {
+                    new_cred = candidate.credentials;
+                    (
+                        Some(Self::proxy_pool_eligibility(&candidate.usage_limits)),
+                        Some(candidate.usage_limits),
+                    )
+                }
+                Err(error) => (
+                    Some(ProxyPoolEligibility {
+                        eligible: false,
+                        subscription_title: None,
+                        reason: format!("官方 getUsageLimits 查询失败，不自动分配代理: {error}"),
+                    }),
+                    None,
+                ),
+            }
+        } else {
+            (None, None)
+        };
+
+        // 序列化分配到实际写入，防止两个并发导入拿到同一个最后的空槽。
+        let _allocation_guard = self.allocation_lock.lock().await;
+        let assigned_proxy = if proxy_pool_eligibility
+            .as_ref()
+            .map(|eligibility| eligibility.eligible)
+            .unwrap_or(false)
+        {
+            self.next_proxy_pool_entry()?
+        } else {
+            None
+        };
+        if let Some(proxy) = &assigned_proxy {
+            new_cred.proxy_url = Some(proxy.proxy_url.clone());
+            new_cred.proxy_username = proxy.proxy_username.clone();
+            new_cred.proxy_password = proxy.proxy_password.clone();
+        }
 
         // 调用 token_manager 添加凭据
         let credential_id = self
@@ -706,8 +762,11 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+        // 自动分配前已经查询过的结果直接保存，避免重复请求官方接口。
+        if let Some(usage) = inspected_usage.as_ref() {
+            self.token_manager
+                .store_usage_metadata(credential_id, usage);
+        } else if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
@@ -720,6 +779,7 @@ impl AdminService {
                 .as_ref()
                 .map(|entry| Self::redact_proxy_url(&entry.proxy_url)),
             assigned_proxy_from_pool: assigned_proxy.is_some(),
+            proxy_pool_eligibility,
         })
     }
 
@@ -1319,7 +1379,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_proxy_pool_assigns_two_accounts_before_rotating_and_persists() {
+    async fn test_proxy_pool_tracks_two_accounts_before_rotating_and_persists() {
         let test_dir =
             std::env::temp_dir().join(format!("kiro-admin-proxy-pool-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).unwrap();
@@ -1354,38 +1414,19 @@ mod tests {
             })
             .unwrap();
 
-        for index in 0..3 {
-            let response = service
-                .add_credential(AddCredentialRequest {
-                    refresh_token: None,
-                    auth_method: "api_key".to_string(),
-                    client_id: None,
-                    client_secret: None,
-                    priority: 0,
-                    region: None,
-                    auth_region: None,
-                    api_region: None,
-                    machine_id: None,
-                    email: None,
-                    import_note: None,
-                    proxy_url: None,
-                    proxy_username: None,
-                    proxy_password: None,
-                    assign_proxy_from_pool: None,
-                    kiro_api_key: Some(format!("ksk-proxy-pool-{}", index)),
-                    endpoint: None,
-                })
-                .await
-                .unwrap();
-            assert!(response.assigned_proxy_from_pool);
-            assert_eq!(
-                response.assigned_proxy_url.as_deref(),
-                Some(if index < 2 {
-                    "http://proxy-one.example:443/"
-                } else {
-                    "http://proxy-two.example:443/"
-                })
-            );
+        for (index, proxy_url) in [
+            "http://proxy-one.example:443",
+            "http://proxy-one.example:443",
+            "http://proxy-two.example:443",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut credential = KiroCredentials::default();
+            credential.auth_method = Some("api_key".to_string());
+            credential.kiro_api_key = Some(format!("ksk-proxy-pool-{index}"));
+            credential.proxy_url = Some((*proxy_url).to_string());
+            manager.add_credential(credential).await.unwrap();
         }
 
         let pool = service.get_proxy_pool();
@@ -1393,6 +1434,10 @@ mod tests {
         assert_eq!(pool.available_slots, 1);
         assert_eq!(pool.proxies[0].assigned_count, 2);
         assert_eq!(pool.proxies[1].assigned_count, 1);
+        assert_eq!(
+            service.next_proxy_pool_entry().unwrap().unwrap().proxy_url,
+            "http://proxy-two.example:443"
+        );
 
         let proxy_pool_path = credentials_path
             .parent()
@@ -1410,8 +1455,8 @@ mod tests {
         std::fs::remove_dir(&test_dir).unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_proxy_pool_refuses_a_third_account_when_all_slots_are_full() {
+    #[test]
+    fn test_proxy_pool_refuses_a_third_account_when_all_slots_are_full() {
         let test_dir = std::env::temp_dir().join(format!(
             "kiro-admin-proxy-pool-full-{}",
             uuid::Uuid::new_v4()
@@ -1452,27 +1497,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = service
-            .add_credential(AddCredentialRequest {
-                refresh_token: None,
-                auth_method: "api_key".to_string(),
-                client_id: None,
-                client_secret: None,
-                priority: 0,
-                region: None,
-                auth_region: None,
-                api_region: None,
-                machine_id: None,
-                email: None,
-                import_note: None,
-                proxy_url: None,
-                proxy_username: None,
-                proxy_password: None,
-                assign_proxy_from_pool: None,
-                kiro_api_key: Some("ksk-proxy-pool-full".to_string()),
-                endpoint: None,
-            })
-            .await;
+        let result = service.next_proxy_pool_entry();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("代理池已满"));
 
@@ -1483,5 +1508,24 @@ mod tests {
         std::fs::remove_file(&credentials_path).unwrap();
         std::fs::remove_file(&proxy_pool_path).unwrap();
         std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_pool_only_accepts_kiro_power_subscription_title() {
+        let power: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": " Kiro Power "}
+        }))
+        .unwrap();
+        let free: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": "KIRO FREE"}
+        }))
+        .unwrap();
+        let missing: UsageLimitsResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        let eligible = AdminService::proxy_pool_eligibility(&power);
+        assert!(eligible.eligible);
+        assert_eq!(eligible.subscription_title.as_deref(), Some(" Kiro Power "));
+        assert!(!AdminService::proxy_pool_eligibility(&free).eligible);
+        assert!(!AdminService::proxy_pool_eligibility(&missing).eligible);
     }
 }

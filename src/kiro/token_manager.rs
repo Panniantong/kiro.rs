@@ -594,6 +594,14 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// 对尚未导入的凭据完成官方额度查询后的结果。
+///
+/// OAuth 刷新可能轮换 refreshToken；把刷新后的凭据一并返回，调用方必须用它继续导入。
+pub(crate) struct CandidateUsageLimits {
+    pub credentials: KiroCredentials,
+    pub usage_limits: UsageLimitsResponse,
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -2330,6 +2338,53 @@ impl MultiTokenManager {
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
+        self.store_usage_metadata(id, &usage_limits);
+
+        Ok(usage_limits)
+    }
+
+    /// 使用尚未导入的凭据查询官方使用额度。
+    ///
+    /// 自动代理池在把代理写入凭据前调用此方法，避免不符合订阅条件的账号占用住宅 IP。
+    pub(crate) async fn get_usage_limits_for_candidate(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<CandidateUsageLimits> {
+        let refreshed_credentials = if credentials.is_api_key_credential() {
+            credentials.clone()
+        } else {
+            let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+            refresh_token(credentials, &self.config, effective_proxy.as_ref()).await?
+        };
+        let token = if refreshed_credentials.is_api_key_credential() {
+            refreshed_credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else {
+            refreshed_credentials
+                .access_token
+                .as_deref()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+        };
+
+        let effective_proxy = refreshed_credentials.effective_proxy(self.proxy.as_ref());
+        let usage_limits = get_usage_limits(
+            &refreshed_credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await?;
+        Ok(CandidateUsageLimits {
+            credentials: refreshed_credentials,
+            usage_limits,
+        })
+    }
+
+    /// 将已经拿到的官方额度查询结果持久化到凭据元数据。
+    pub fn store_usage_metadata(&self, id: u64, usage_limits: &UsageLimitsResponse) {
         // 更新订阅等级 / 超额状态到凭据（仅在发生变化时持久化）
         {
             let new_title = usage_limits.subscription_title();
@@ -2383,8 +2438,6 @@ impl MultiTokenManager {
                 }
             }
         }
-
-        Ok(usage_limits)
     }
 
     /// 添加新凭据（Admin API）

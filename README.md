@@ -505,10 +505,14 @@ curl -X POST http://HOST:8996/api/admin/credentials/281/proxy \
 ### 代理池自动分配
 
 将购买到的代理加入池后，后续 `POST /api/admin/credentials` 导入账号只要不传
-`proxyUrl`，就会按入池顺序给每个 IP 连续分配两个账号，然后才轮到下一个 IP。
+`proxyUrl`，服务会先用该账号向 Kiro 官方 `getUsageLimits` 查询
+`subscriptionInfo.subscriptionTitle`。只有标题精确为 `KIRO POWER`（忽略大小写和首尾空格）
+的账号才会按入池顺序给每个 IP 连续分配两个账号，然后才轮到下一个 IP；不使用邮箱、
+总额度、试用额度或 bonus 作为判定条件。其他账号照常导入，但不占代理槽位。
 代理池保存为与 `credentials.json` 同目录的 `kiro_proxy_pool.json`，重启后保持有效。
-禁用账号也占用已分配槽位，避免重新启用时单个 IP 意外超过两个账号。池满时导入会失败，
-不会创建未绑定代理的新账号。显式传入 `proxyUrl` 或 `assignProxyFromPool: false` 可覆盖自动分配。
+禁用账号也占用已分配槽位，避免重新启用时单个 IP 意外超过两个账号。符合 `KIRO POWER`
+但池满时导入会失败，不会创建未绑定代理的新账号；不符合资格或查询失败的账号不会自动绑定。
+显式传入 `proxyUrl` 或 `assignProxyFromPool: false` 可覆盖自动分配。
 
 ```bash
 # 追加代理池。GET 接口只返回脱敏 URL 和账号占用，不返回认证信息。
@@ -522,7 +526,8 @@ curl -X POST http://HOST:8996/api/admin/proxy-pool \
 # 查看总槽位、每个代理已分配的账号 ID 和剩余槽位。
 curl http://HOST:8996/api/admin/proxy-pool -H 'x-api-key: ADMIN_API_KEY'
 
-# 新号自动领取池中第一个未满两号的代理；响应会返回脱敏 assignedProxyUrl。
+# 新号会先按官方 subscriptionTitle 判定；KIRO POWER 才领取池中第一个未满两号的代理。
+# 响应会返回 proxyPoolEligibility 和脱敏 assignedProxyUrl。
 curl -X POST http://HOST:8996/api/admin/credentials \
   -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
   -d '{"authMethod":"api_key","kiroApiKey":"ksk_xxx","email":"new-account@example.com"}'
