@@ -9,10 +9,10 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AddProxyPoolEntriesRequest, BatchCredentialIdsRequest,
-        BatchSetCredentialProxyRequest, BatchSetRpmRequest, RemoveProxyPoolEntriesRequest,
-        SetArmorBreakingRequest, SetCredentialProxyRequest, SetDefaultRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+        AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
+        BatchCredentialIdsRequest, BatchSetCredentialProxyRequest, BatchSetRpmRequest,
+        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
+        SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
     },
 };
@@ -83,6 +83,22 @@ pub async fn batch_set_credential_proxy(
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/assign-proxy-from-pool
+/// 为现有未绑定账号按订阅资格与两号一 IP 规则领取代理池出口。
+pub async fn assign_credential_proxy_from_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<AssignCredentialProxyFromPoolRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .assign_credentials_proxy_from_pool(payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

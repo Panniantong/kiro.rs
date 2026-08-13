@@ -124,6 +124,29 @@ pub struct BatchSetCredentialProxyRequest {
     pub proxy_password: Option<String>,
 }
 
+/// 让已导入但尚未绑定代理的凭据按自动代理池规则领取出口。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignCredentialProxyFromPoolRequest {
+    pub ids: Vec<u64>,
+}
+
+/// 已有凭据从自动代理池领取代理的结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignCredentialProxyFromPoolResponse {
+    pub assigned_credential_ids: Vec<u64>,
+    pub skipped: Vec<ProxyPoolAssignmentSkip>,
+}
+
+/// 未领取代理的凭据及原因。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolAssignmentSkip {
+    pub credential_id: u64,
+    pub reason: String,
+}
+
 /// 向自动分配代理池追加住宅代理。
 ///
 /// 代理认证信息只会写入服务端的代理池文件，所有读取接口均不会回显。

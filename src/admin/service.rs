@@ -16,12 +16,13 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
-    BalanceResponse, BatchSetCredentialProxyRequest, CredentialProxyTestResponse,
-    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    MaxRelayResponse, OveragePassthroughResponse, ProxyPoolEligibility, ProxyPoolEntryStatus,
-    ProxyPoolResponse, RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
-    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
-    SetOveragePassthroughRequest,
+    AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse, BalanceResponse,
+    BatchSetCredentialProxyRequest, CredentialProxyTestResponse, CredentialStatusItem,
+    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse, MaxRelayResponse,
+    OveragePassthroughResponse, ProxyPoolAssignmentSkip, ProxyPoolEligibility,
+    ProxyPoolEntryStatus, ProxyPoolResponse, RemoveProxyPoolEntriesRequest,
+    SetArmorBreakingRequest, SetCredentialProxyRequest, SetLoadBalancingModeRequest,
+    SetMaxRelayRequest, SetOveragePassthroughRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -210,6 +211,91 @@ impl AdminService {
                     None => AdminServiceError::InvalidCredential(message),
                 }
             })
+    }
+
+    /// 为已导入且未显式绑定代理的凭据补领自动代理池出口。
+    ///
+    /// ponytail: 沿用导入时的 subscriptionTitle 与两号一 IP 规则，认证信息只从服务端池文件
+    /// 读取，接口不接收、不返回代理密码。当前绑定的凭据一律跳过，避免覆盖人工配置。
+    pub async fn assign_credentials_proxy_from_pool(
+        &self,
+        req: AssignCredentialProxyFromPoolRequest,
+    ) -> Result<AssignCredentialProxyFromPoolResponse, AdminServiceError> {
+        if req.ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+
+        let mut assigned_credential_ids = Vec::new();
+        let mut skipped = Vec::new();
+        for id in req.ids {
+            let credentials = self
+                .token_manager
+                .credential_and_effective_proxy(id)
+                .map_err(|error| self.classify_error(error, id))?
+                .0;
+
+            if credentials.proxy_url.is_some() {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "凭据已有显式代理，未覆盖".to_string(),
+                });
+                continue;
+            }
+
+            let usage = self
+                .token_manager
+                .get_usage_limits_for(id)
+                .await
+                .map_err(|error| self.classify_balance_error(error, id))?;
+            let eligibility = Self::proxy_pool_eligibility(&usage);
+            if !eligibility.eligible {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: eligibility.reason,
+                });
+                continue;
+            }
+
+            // 分配与写入需要在同一临界区内，避免并发补绑突破每 IP 两号的上限。
+            let _allocation_guard = self.allocation_lock.lock().await;
+            let still_unbound = self
+                .token_manager
+                .credential_and_effective_proxy(id)
+                .map_err(|error| self.classify_error(error, id))?
+                .0
+                .proxy_url
+                .is_none();
+            if !still_unbound {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "凭据在分配期间已绑定代理，未覆盖".to_string(),
+                });
+                continue;
+            }
+            let Some(proxy) = self.next_proxy_pool_entry()? else {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "代理池为空，未分配".to_string(),
+                });
+                continue;
+            };
+            self.token_manager
+                .set_credential_proxy(
+                    id,
+                    Some(proxy.proxy_url),
+                    proxy.proxy_username,
+                    proxy.proxy_password,
+                )
+                .map_err(|error| self.classify_error(error, id))?;
+            assigned_credential_ids.push(id);
+        }
+
+        Ok(AssignCredentialProxyFromPoolResponse {
+            assigned_credential_ids,
+            skipped,
+        })
     }
 
     /// 获取代理池及当前账号占用情况。已绑定但后来从池移除的账号不计入可分配池。
