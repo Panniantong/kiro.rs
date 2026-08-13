@@ -51,6 +51,9 @@ pub struct CredentialStatusItem {
     /// 导入备注（用于标记批次、导入时间或账号性质）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_note: Option<String>,
+    /// 已同步的官方订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -293,6 +296,8 @@ pub struct AddCredentialResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_proxy_url: Option<String>,
     pub assigned_proxy_from_pool: bool,
+    /// 已识别为 KIRO PRO+ 但尚未绑定账号级代理；该账号以禁用状态导入。
+    pub activation_requires_proxy: bool,
     /// 自动代理池资格判定。仅在本次请求尝试自动从池分配时返回。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_pool_eligibility: Option<ProxyPoolEligibility>,

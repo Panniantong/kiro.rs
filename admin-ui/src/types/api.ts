@@ -19,6 +19,7 @@ export interface CredentialStatusItem {
   hasProfileArn: boolean
   email?: string
   importNote?: string
+  subscriptionTitle?: string
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -112,7 +113,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
-  /** Omit to let eligible KIRO POWER accounts receive a pool proxy automatically. */
+  /** Omit to let eligible KIRO PRO+ accounts receive a pool proxy automatically. */
   assignProxyFromPool?: boolean
   kiroApiKey?: string
   endpoint?: string
@@ -133,6 +134,7 @@ export interface AddCredentialResponse {
   email?: string
   assignedProxyUrl?: string
   assignedProxyFromPool: boolean
+  activationRequiresProxy: boolean
   proxyPoolEligibility?: ProxyPoolEligibility
 }
 

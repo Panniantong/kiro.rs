@@ -88,7 +88,7 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let proxy_pool = Self::load_proxy_pool_from(&proxy_pool_path);
 
-        Self {
+        let service = Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
@@ -96,7 +96,9 @@ impl AdminService {
             proxy_pool: Mutex::new(proxy_pool),
             allocation_lock: tokio::sync::Mutex::new(()),
             known_endpoints: known_endpoints.into_iter().collect(),
-        }
+        };
+        service.disable_unbound_kiro_pro_plus();
+        service
     }
 
     /// 获取所有凭据状态
@@ -121,6 +123,7 @@ impl AdminService {
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
                 import_note: entry.import_note,
+                subscription_title: entry.subscription_title,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -152,6 +155,10 @@ impl AdminService {
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
+        if !disabled {
+            self.ensure_can_enable(id)?;
+        }
+
         // 先获取当前凭据 ID，用于判断是否需要切换
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
@@ -562,10 +569,7 @@ impl AdminService {
     /// 余额或赠送额度；若 Kiro 日后变更套餐名，再把该规则改成配置项。
     fn proxy_pool_eligibility(usage: &UsageLimitsResponse) -> ProxyPoolEligibility {
         let subscription_title = usage.subscription_title().map(str::to_owned);
-        let eligible = subscription_title
-            .as_deref()
-            .map(|title| title.trim().eq_ignore_ascii_case("KIRO PRO+"))
-            .unwrap_or(false);
+        let eligible = Self::is_kiro_pro_plus(subscription_title.as_deref());
         let reason = if eligible {
             "官方 subscriptionTitle 为 KIRO PRO+，允许自动分配代理".to_string()
         } else if let Some(title) = subscription_title.as_deref() {
@@ -577,6 +581,79 @@ impl AdminService {
             eligible,
             subscription_title,
             reason,
+        }
+    }
+
+    fn is_kiro_pro_plus(subscription_title: Option<&str>) -> bool {
+        subscription_title
+            .map(|title| title.trim().eq_ignore_ascii_case("KIRO PRO+"))
+            .unwrap_or(false)
+    }
+
+    /// `direct`、全局代理和格式无效的地址都不算账号已经绑定住宅 IP。
+    fn has_bound_proxy_url(proxy_url: Option<&str>) -> bool {
+        proxy_url
+            .and_then(|url| {
+                (!url
+                    .trim()
+                    .eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT))
+                .then(|| Url::parse(url).ok())
+                .flatten()
+            })
+            .is_some_and(|url| {
+                matches!(url.scheme(), "http" | "https" | "socks5") && url.host_str().is_some()
+            })
+    }
+
+    fn has_credential_proxy(credentials: &KiroCredentials) -> bool {
+        Self::has_bound_proxy_url(credentials.proxy_url.as_deref())
+    }
+
+    fn requires_proxy_before_enable(credentials: &KiroCredentials) -> bool {
+        Self::is_kiro_pro_plus(credentials.subscription_title.as_deref())
+            && !Self::has_credential_proxy(credentials)
+    }
+
+    fn ensure_can_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+        let credentials = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|error| self.classify_error(error, id))?
+            .0;
+        if Self::requires_proxy_before_enable(&credentials) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 已识别为 KIRO PRO+，请先绑定账号级代理 IP 后再启用",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    /// 兼容已有凭据：服务启动时把已经识别为 PRO+、却没有账号级代理的活跃账号
+    /// 收口为禁用状态，避免旧数据绕过新规则。
+    fn disable_unbound_kiro_pro_plus(&self) {
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && Self::is_kiro_pro_plus(entry.subscription_title.as_deref())
+                    && !Self::has_bound_proxy_url(entry.proxy_url.as_deref())
+            })
+            .map(|entry| entry.id)
+            .collect();
+        for id in ids {
+            if let Err(error) = self.set_disabled(id, true) {
+                tracing::warn!(
+                    credential_id = id,
+                    "KIRO PRO+ 无账号级代理，启动收口禁用失败: {}",
+                    error
+                );
+            } else {
+                tracing::warn!(credential_id = id, "KIRO PRO+ 无账号级代理，已禁止启用");
+            }
         }
     }
 
@@ -615,6 +692,7 @@ impl AdminService {
 
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.ensure_can_enable(id)?;
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
@@ -759,8 +837,11 @@ impl AdminService {
             }
         }
 
-        // 显式代理优先；未提供时才考虑代理池。
-        let explicit_proxy = req.proxy_url.is_some();
+        // 显式代理优先；未提供时才考虑代理池。导入入口也复用代理校验，避免把
+        // `direct` 或不完整 URL 当成已绑定 IP。
+        let (proxy_url, proxy_username, proxy_password) =
+            Self::validate_proxy_binding(req.proxy_url, req.proxy_username, req.proxy_password)?;
+        let explicit_proxy = proxy_url.is_some();
         let assign_from_pool = req.assign_proxy_from_pool.unwrap_or(true);
 
         // 先构建未绑定代理的凭据，使用官方 getUsageLimits 的 subscriptionTitle 判断资格。
@@ -787,9 +868,9 @@ impl AdminService {
             import_note,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             overage_status: None,     // 将在首次获取使用额度时自动同步
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
+            proxy_url,
+            proxy_username,
+            proxy_password,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
@@ -831,7 +912,16 @@ impl AdminService {
             .map(|eligibility| eligibility.eligible)
             .unwrap_or(false)
         {
-            self.next_proxy_pool_entry()?
+            match self.next_proxy_pool_entry() {
+                Ok(proxy) => proxy,
+                // 池满时仍保存 PRO+ 凭据为待绑定禁用状态，而不是丢弃导入。
+                Err(AdminServiceError::InvalidCredential(message))
+                    if message.starts_with("代理池已满") =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -839,6 +929,20 @@ impl AdminService {
             new_cred.proxy_url = Some(proxy.proxy_url.clone());
             new_cred.proxy_username = proxy.proxy_username.clone();
             new_cred.proxy_password = proxy.proxy_password.clone();
+        }
+
+        // 候选查询已经拿到官方套餐时，在持久化前写入元数据。这样代理池满、
+        // 没有分到代理的 PRO+ 不会短暂进入可调度状态。
+        if let Some(usage) = inspected_usage.as_ref() {
+            new_cred.subscription_title = usage.subscription_title().map(str::to_owned);
+            new_cred.overage_status = usage.overage_status().map(str::to_owned);
+        }
+
+        // KIRO PRO+ 必须有账号级代理才允许进入调度；未绑定的号保留在库中，
+        // 方便后续加入代理池或人工绑定后再启用。
+        let mut activation_requires_proxy = Self::requires_proxy_before_enable(&new_cred);
+        if activation_requires_proxy {
+            new_cred.disabled = true;
         }
 
         // 调用 token_manager 添加凭据
@@ -852,19 +956,46 @@ impl AdminService {
         if let Some(usage) = inspected_usage.as_ref() {
             self.token_manager
                 .store_usage_metadata(credential_id, usage);
-        } else if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        } else {
+            match self.token_manager.get_usage_limits_for(credential_id).await {
+                Ok(_) => {
+                    // 候选查询偶发失败、但添加后的官方查询成功时，也不能让刚识别
+                    // 为 PRO+ 的无代理账号继续处于启用状态。
+                    let credentials = self
+                        .token_manager
+                        .credential_and_effective_proxy(credential_id)
+                        .map_err(|error| self.classify_error(error, credential_id))?
+                        .0;
+                    activation_requires_proxy = Self::requires_proxy_before_enable(&credentials);
+                    if activation_requires_proxy {
+                        self.token_manager
+                            .set_disabled(credential_id, true)
+                            .map_err(|error| self.classify_error(error, credential_id))?;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", error);
+                }
+            }
         }
 
         Ok(AddCredentialResponse {
             success: true,
-            message: format!("凭据添加成功，ID: {}", credential_id),
+            message: if activation_requires_proxy {
+                format!(
+                    "凭据添加成功，ID: {}；KIRO PRO+ 待绑定账号级代理后启用",
+                    credential_id
+                )
+            } else {
+                format!("凭据添加成功，ID: {}", credential_id)
+            },
             credential_id,
             email,
             assigned_proxy_url: assigned_proxy
                 .as_ref()
                 .map(|entry| Self::redact_proxy_url(&entry.proxy_url)),
             assigned_proxy_from_pool: assigned_proxy.is_some(),
+            activation_requires_proxy,
             proxy_pool_eligibility,
         })
     }
@@ -1284,6 +1415,95 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_kiro_pro_plus_requires_credential_proxy_before_enable() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-pro-plus-proxy-gate-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+        credential.subscription_title = Some(" KIRO PRO+ ".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        let error = service.set_disabled(1, false).unwrap_err();
+        assert!(error.to_string().contains("先绑定账号级代理"));
+        assert!(manager.snapshot().entries[0].disabled);
+
+        service
+            .set_credential_proxy(
+                1,
+                SetCredentialProxyRequest {
+                    proxy_url: Some("http://residential.example:443".to_string()),
+                    proxy_username: Some("buyer".to_string()),
+                    proxy_password: Some("secret".to_string()),
+                },
+            )
+            .unwrap();
+        service.set_disabled(1, false).unwrap();
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.entries[0].disabled);
+        assert!(snapshot.entries[0].has_proxy);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_startup_disables_existing_unbound_kiro_pro_plus() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-pro-plus-startup-gate-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("Manual")
+        );
+        drop(service);
+
+        std::fs::remove_file(&credentials_path).unwrap();
     }
 
     #[test]

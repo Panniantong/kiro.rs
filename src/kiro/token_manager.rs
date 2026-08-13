@@ -714,6 +714,9 @@ pub struct CredentialEntrySnapshot {
     /// 导入备注（用于前端显示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_note: Option<String>,
+    /// 已同步的官方订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -2089,6 +2092,7 @@ impl MultiTokenManager {
                     },
                     email: e.credentials.email.clone(),
                     import_note: e.credentials.import_note.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
