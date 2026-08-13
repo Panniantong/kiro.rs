@@ -461,6 +461,7 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/proxy` - 绑定、清除或显式直连账号代理
   - `POST /api/admin/credentials/batch-proxy` - 将同一代理批量绑定给多个账号（允许一 IP 两号）
+  - `GET|POST|DELETE /api/admin/proxy-pool` - 维护两号一 IP 的自动分配代理池
   - `POST /api/admin/credentials/:id/proxy/test` - 测试该账号实际出口 IP
   - `POST /api/admin/credentials/batch-proxy/test` - 批量测试账号出口 IP
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
@@ -500,6 +501,37 @@ curl -X POST http://HOST:8996/api/admin/credentials/batch-proxy \
 curl -X POST http://HOST:8996/api/admin/credentials/281/proxy \
   -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
   -d '{"proxyUrl":"direct"}'
+
+### 代理池自动分配
+
+将购买到的代理加入池后，后续 `POST /api/admin/credentials` 导入账号只要不传
+`proxyUrl`，就会按入池顺序给每个 IP 连续分配两个账号，然后才轮到下一个 IP。
+代理池保存为与 `credentials.json` 同目录的 `kiro_proxy_pool.json`，重启后保持有效。
+禁用账号也占用已分配槽位，避免重新启用时单个 IP 意外超过两个账号。池满时导入会失败，
+不会创建未绑定代理的新账号。显式传入 `proxyUrl` 或 `assignProxyFromPool: false` 可覆盖自动分配。
+
+```bash
+# 追加代理池。GET 接口只返回脱敏 URL 和账号占用，不返回认证信息。
+curl -X POST http://HOST:8996/api/admin/proxy-pool \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"proxies":[
+    {"proxyUrl":"http://residential-one.example:443","proxyUsername":"buyer","proxyPassword":"password"},
+    {"proxyUrl":"http://residential-two.example:443","proxyUsername":"buyer","proxyPassword":"password"}
+  ]}'
+
+# 查看总槽位、每个代理已分配的账号 ID 和剩余槽位。
+curl http://HOST:8996/api/admin/proxy-pool -H 'x-api-key: ADMIN_API_KEY'
+
+# 新号自动领取池中第一个未满两号的代理；响应会返回脱敏 assignedProxyUrl。
+curl -X POST http://HOST:8996/api/admin/credentials \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"authMethod":"api_key","kiroApiKey":"ksk_xxx","email":"new-account@example.com"}'
+
+# 从后续自动分配中移除代理，不改变已绑定账号。
+curl -X DELETE http://HOST:8996/api/admin/proxy-pool \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"proxyUrls":["http://residential-one.example:443"]}'
+```
 
 # 如果要在基础额度耗尽时立刻禁用账号 A、切换到账号 B，关闭已有的 overage 放行。
 # 否则 overageStatus=ENABLED 的账号会继续使用超额额度，不会立即让出给下一账号。

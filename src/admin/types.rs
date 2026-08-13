@@ -124,6 +124,45 @@ pub struct BatchSetCredentialProxyRequest {
     pub proxy_password: Option<String>,
 }
 
+/// 向自动分配代理池追加住宅代理。
+///
+/// 代理认证信息只会写入服务端的代理池文件，所有读取接口均不会回显。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddProxyPoolEntriesRequest {
+    pub proxies: Vec<SetCredentialProxyRequest>,
+}
+
+/// 从自动分配代理池移除代理。
+///
+/// 仅阻止后续自动分配，不会改变已绑定账号的出口代理。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveProxyPoolEntriesRequest {
+    pub proxy_urls: Vec<String>,
+}
+
+/// 自动分配代理池状态。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolResponse {
+    /// 每个代理最多绑定的账号数，当前固定为 2。
+    pub max_accounts_per_proxy: usize,
+    pub total: usize,
+    pub available_slots: usize,
+    pub proxies: Vec<ProxyPoolEntryStatus>,
+}
+
+/// 单个代理的脱敏状态。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolEntryStatus {
+    pub proxy_url: String,
+    pub assigned_credential_ids: Vec<u64>,
+    pub assigned_count: usize,
+    pub remaining_slots: usize,
+}
+
 /// 批量代理测试的目标凭据。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -196,6 +235,11 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
+    /// 未显式传入 proxyUrl 时，是否从代理池自动领取一个代理。
+    /// 缺省时：池非空即自动分配；传 false 可保留原来的全局代理/直连行为。
+    #[serde(default)]
+    pub assign_proxy_from_pool: Option<bool>,
+
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +265,10 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// 本次导入由自动代理池分配的代理 URL（不含认证信息）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_proxy_url: Option<String>,
+    pub assigned_proxy_from_pool: bool,
 }
 
 // ============ 余额查询 ============

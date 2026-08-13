@@ -9,9 +9,10 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchCredentialIdsRequest, BatchSetCredentialProxyRequest,
-        BatchSetRpmRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
-        SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+        AddCredentialRequest, AddProxyPoolEntriesRequest, BatchCredentialIdsRequest,
+        BatchSetCredentialProxyRequest, BatchSetRpmRequest, RemoveProxyPoolEntriesRequest,
+        SetArmorBreakingRequest, SetCredentialProxyRequest, SetDefaultRpmRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
     },
 };
@@ -79,6 +80,44 @@ pub async fn batch_set_credential_proxy(
         Ok(count) => Json(SuccessResponse::new(format!(
             "已更新 {} 个凭据的代理绑定",
             count
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxy-pool
+/// 返回自动分配代理池及每个代理的两号占用情况；不回显代理认证信息。
+pub async fn get_proxy_pool(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_pool())
+}
+
+/// POST /api/admin/proxy-pool
+/// 追加住宅代理到自动分配池。后续新账号未显式传 proxyUrl 时会自动领取。
+pub async fn add_proxy_pool_entries(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddProxyPoolEntriesRequest>,
+) -> impl IntoResponse {
+    match state.service.add_proxy_pool_entries(payload) {
+        Ok(total) => Json(SuccessResponse::new(format!(
+            "代理池已保存，共 {} 个代理",
+            total
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxy-pool
+/// 从自动分配池移除代理；不影响已绑定账号。
+pub async fn remove_proxy_pool_entries(
+    State(state): State<AdminState>,
+    Json(payload): Json<RemoveProxyPoolEntriesRequest>,
+) -> impl IntoResponse {
+    match state.service.remove_proxy_pool_entries(payload) {
+        Ok(removed) => Json(SuccessResponse::new(format!(
+            "已从代理池移除 {} 个代理，现有账号绑定未修改",
+            removed
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
