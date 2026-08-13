@@ -236,7 +236,7 @@ pub struct AddCredentialRequest {
     pub proxy_password: Option<String>,
 
     /// 未显式传入 proxyUrl 时，是否允许从代理池自动领取一个代理。
-    /// 缺省时：池非空且官方 getUsageLimits 返回的 subscriptionTitle 为 KIRO POWER 才自动分配；
+    /// 缺省时：池非空且官方 getUsageLimits 返回的 subscriptionTitle 为 KIRO PRO+ 才自动分配；
     /// 传 false 可保留原来的全局代理/直连行为。
     #[serde(default)]
     pub assign_proxy_from_pool: Option<bool>,
@@ -281,7 +281,7 @@ pub struct AddCredentialResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyPoolEligibility {
-    /// 是否符合自动分配代理的订阅条件（KIRO POWER）。
+    /// 是否符合自动分配代理的订阅条件（KIRO PRO+）。
     pub eligible: bool,
     /// 官方 getUsageLimits 返回的订阅标题。查询失败或字段缺失时为 None。
     #[serde(skip_serializing_if = "Option::is_none")]

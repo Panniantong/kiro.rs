@@ -478,10 +478,10 @@ impl AdminService {
         let subscription_title = usage.subscription_title().map(str::to_owned);
         let eligible = subscription_title
             .as_deref()
-            .map(|title| title.trim().eq_ignore_ascii_case("KIRO POWER"))
+            .map(|title| title.trim().eq_ignore_ascii_case("KIRO PRO+"))
             .unwrap_or(false);
         let reason = if eligible {
-            "官方 subscriptionTitle 为 KIRO POWER，允许自动分配代理".to_string()
+            "官方 subscriptionTitle 为 KIRO PRO+，允许自动分配代理".to_string()
         } else if let Some(title) = subscription_title.as_deref() {
             format!("官方 subscriptionTitle 为 {title:?}，不自动分配代理")
         } else {
@@ -1511,9 +1511,9 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_pool_only_accepts_kiro_power_subscription_title() {
-        let power: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
-            "subscriptionInfo": {"subscriptionTitle": " Kiro Power "}
+    fn test_proxy_pool_only_accepts_kiro_pro_plus_subscription_title() {
+        let pro_plus: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": " Kiro Pro+ "}
         }))
         .unwrap();
         let free: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
@@ -1522,9 +1522,9 @@ mod tests {
         .unwrap();
         let missing: UsageLimitsResponse = serde_json::from_value(serde_json::json!({})).unwrap();
 
-        let eligible = AdminService::proxy_pool_eligibility(&power);
+        let eligible = AdminService::proxy_pool_eligibility(&pro_plus);
         assert!(eligible.eligible);
-        assert_eq!(eligible.subscription_title.as_deref(), Some(" Kiro Power "));
+        assert_eq!(eligible.subscription_title.as_deref(), Some(" Kiro Pro+ "));
         assert!(!AdminService::proxy_pool_eligibility(&free).eligible);
         assert!(!AdminService::proxy_pool_eligibility(&missing).eligible);
     }
