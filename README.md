@@ -506,6 +506,15 @@ curl -X POST http://HOST:8996/api/admin/credentials/281/proxy \
 curl -X PUT http://HOST:8996/api/admin/config/overage-passthrough \
   -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
   -d '{"enabled":false}'
+
+# 按顺序接管而不是两号并发分摊时，使用 priority 调度，并让 A 的优先级小于 B。
+curl -X PUT http://HOST:8996/api/admin/config/load-balancing \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"mode":"priority"}'
+curl -X POST http://HOST:8996/api/admin/credentials/281/priority \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' -d '{"priority":0}'
+curl -X POST http://HOST:8996/api/admin/credentials/282/priority \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' -d '{"priority":1}'
 ```
 
 ## 注意事项
