@@ -85,6 +85,7 @@ pub fn build_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, routing::any};
 
     #[test]
     fn test_proxy_config_new() {
@@ -113,5 +114,26 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_client_routes_request_through_http_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().fallback(any(|| async { r#"{"ip":"203.0.113.44"}"# }));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = ProxyConfig::new(format!("http://{}", address));
+        let client = build_client(Some(&config), 5, TlsBackend::Rustls).unwrap();
+        let response = client
+            .get("http://unresolvable.invalid/proxy-check")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), r#"{"ip":"203.0.113.44"}"#);
     }
 }

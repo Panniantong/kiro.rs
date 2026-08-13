@@ -3,6 +3,8 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialProxy,
+  testCredentialProxy,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -19,7 +21,7 @@ import {
   getMaxRelay,
   setMaxRelay,
 } from '@/api/credentials'
-import type { AddCredentialRequest, SetMaxRelayRequest } from '@/types/api'
+import type { AddCredentialRequest, SetCredentialProxyRequest, SetMaxRelayRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -61,6 +63,25 @@ export function useSetPriority() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
+  })
+}
+
+// 设置账号代理绑定
+export function useSetCredentialProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, req }: { id: number; req: SetCredentialProxyRequest }) =>
+      setCredentialProxy(id, req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 测试账号代理出口
+export function useTestCredentialProxy() {
+  return useMutation({
+    mutationFn: (id: number) => testCredentialProxy(id),
   })
 }
 

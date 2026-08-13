@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use parking_lot::Mutex;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
@@ -14,8 +15,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, ArmorBreakingResponse, BalanceResponse,
-    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    MaxRelayResponse, OveragePassthroughResponse, SetArmorBreakingRequest,
+    BatchSetCredentialProxyRequest, CredentialProxyTestResponse, CredentialStatusItem,
+    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse, MaxRelayResponse,
+    OveragePassthroughResponse, SetArmorBreakingRequest, SetCredentialProxyRequest,
     SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
 };
 use crate::model::config::MaxRelayConfig;
@@ -89,7 +91,7 @@ impl AdminService {
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
+                proxy_url: entry.proxy_url.as_deref().map(Self::redact_proxy_url),
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -137,6 +139,154 @@ impl AdminService {
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 绑定、清除或显式直连单个凭据的代理。
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        req: SetCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let (proxy_url, proxy_username, proxy_password) =
+            Self::validate_proxy_binding(req.proxy_url, req.proxy_username, req.proxy_password)?;
+        self.token_manager
+            .set_credential_proxy(id, proxy_url, proxy_username, proxy_password)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 把相同代理批量绑定给多个凭据。
+    ///
+    /// ponytail: 不引入代理池表。住宅 IP 直接保存在需要共用它的两个账号上；换 IP
+    /// 时调用同一个接口即可批量覆盖。若未来需要跨大量账号复用、过期和库存管理，再升级为独立代理资源。
+    pub fn set_credentials_proxy_batch(
+        &self,
+        req: BatchSetCredentialProxyRequest,
+    ) -> Result<usize, AdminServiceError> {
+        let (proxy_url, proxy_username, proxy_password) =
+            Self::validate_proxy_binding(req.proxy_url, req.proxy_username, req.proxy_password)?;
+        let ids = req.ids;
+        self.token_manager
+            .set_credentials_proxy_batch(&ids, proxy_url, proxy_username, proxy_password)
+            .map(|_| ids.len())
+            .map_err(|e| {
+                let message = e.to_string();
+                match message
+                    .strip_prefix("凭据不存在: ")
+                    .and_then(|id| id.parse::<u64>().ok())
+                {
+                    Some(id) => AdminServiceError::NotFound { id },
+                    None => AdminServiceError::InvalidCredential(message),
+                }
+            })
+    }
+
+    /// 以指定凭据实际会使用的代理访问出口探针，不触发 Kiro Token 刷新或上游模型调用。
+    pub async fn test_credential_proxy(
+        &self,
+        id: u64,
+    ) -> Result<CredentialProxyTestResponse, AdminServiceError> {
+        let (credentials, effective_proxy) = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|e| self.classify_error(e, id))?;
+        let client = crate::http_client::build_client(
+            effective_proxy.as_ref(),
+            15,
+            self.token_manager.config().tls_backend,
+        )
+        .map_err(|e| AdminServiceError::InvalidCredential(format!("代理配置无效: {}", e)))?;
+        let response = client
+            .get("https://api.ipify.org?format=json")
+            .send()
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", e)))?;
+        let response = response
+            .error_for_status()
+            .map_err(|e| AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", e)))?;
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            AdminServiceError::UpstreamError(format!("代理出口测试响应无效: {}", e))
+        })?;
+        let egress_ip = body
+            .get("ip")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AdminServiceError::UpstreamError("代理出口测试未返回 IP".to_string()))?
+            .to_string();
+
+        Ok(CredentialProxyTestResponse {
+            credential_id: id,
+            uses_proxy: effective_proxy.is_some(),
+            uses_credential_proxy: credentials.proxy_url.is_some(),
+            proxy_url: credentials.proxy_url.as_deref().map(Self::redact_proxy_url),
+            egress_ip,
+            tested_at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    fn validate_proxy_binding(
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> Result<(Option<String>, Option<String>, Option<String>), AdminServiceError> {
+        let proxy_url = proxy_url
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+        let proxy_username = proxy_username
+            .map(|username| username.trim().to_string())
+            .filter(|username| !username.is_empty());
+        let proxy_password = proxy_password.filter(|password| !password.is_empty());
+
+        match proxy_url.as_deref() {
+            None => {
+                if proxy_username.is_some() || proxy_password.is_some() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "清除代理时不能携带代理用户名或密码".to_string(),
+                    ));
+                }
+            }
+            Some(url) if url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) => {
+                if proxy_username.is_some() || proxy_password.is_some() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "direct 不能携带代理用户名或密码".to_string(),
+                    ));
+                }
+            }
+            Some(url) => {
+                let parsed = Url::parse(url).map_err(|_| {
+                    AdminServiceError::InvalidCredential("proxyUrl 必须是完整代理 URL".to_string())
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https" | "socks5")
+                    || parsed.host_str().is_none()
+                {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "proxyUrl 仅支持 http、https、socks5，且必须包含主机".to_string(),
+                    ));
+                }
+                if proxy_username.is_some() != proxy_password.is_some() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "代理用户名和密码必须同时提供".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok((proxy_url, proxy_username, proxy_password))
+    }
+
+    fn redact_proxy_url(value: &str) -> String {
+        if value.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+            return KiroCredentials::PROXY_DIRECT.to_string();
+        }
+        match Url::parse(value) {
+            Ok(mut url) => {
+                if !url.username().is_empty() || url.password().is_some() {
+                    let _ = url.set_username("***");
+                    let _ = url.set_password(Some("***"));
+                }
+                url.to_string()
+            }
+            Err(_) => "[invalid proxy URL]".to_string(),
+        }
     }
 
     /// 重置失败计数并重新启用
@@ -685,6 +835,74 @@ mod tests {
         expired_reset.next_reset_at =
             Some((Utc::now() - chrono::Duration::seconds(1)).timestamp() as f64);
         assert!(!AdminService::is_quota_exhausted_balance(&expired_reset));
+    }
+
+    #[test]
+    fn test_shared_proxy_binding_allows_two_credentials_and_persists() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-shared-proxy-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.machine_id = Some("machine-1".to_string());
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.machine_id = Some("machine-2".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![first.clone(), second.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![first, second],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+        let proxy_url = "http://residential.example:8080".to_string();
+
+        assert_eq!(
+            service
+                .set_credentials_proxy_batch(BatchSetCredentialProxyRequest {
+                    ids: vec![1, 2],
+                    proxy_url: Some(proxy_url.clone()),
+                    proxy_username: Some("buyer".to_string()),
+                    proxy_password: Some("secret".to_string()),
+                })
+                .unwrap(),
+            2
+        );
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        for id in [1, 2] {
+            let credential = persisted
+                .iter()
+                .find(|credential| credential.id == Some(id))
+                .unwrap();
+            assert_eq!(credential.proxy_url.as_deref(), Some(proxy_url.as_str()));
+            assert_eq!(credential.proxy_username.as_deref(), Some("buyer"));
+            assert_eq!(credential.proxy_password.as_deref(), Some("secret"));
+        }
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_binding_rejects_partial_authentication() {
+        let result = AdminService::validate_proxy_binding(
+            Some("http://residential.example:8080".to_string()),
+            Some("buyer".to_string()),
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

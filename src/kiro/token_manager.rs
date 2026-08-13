@@ -2161,6 +2161,78 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据级代理绑定（Admin API）。
+    ///
+    /// 同一代理可以绑定给多个凭据；这用于一个住宅 IP 挂多个账号、额度耗尽后继续
+    /// 使用相同出口 IP 的场景。`None` 表示清除凭据级绑定并回退到全局代理。
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_url = proxy_url;
+            entry.credentials.proxy_username = proxy_username;
+            entry.credentials.proxy_password = proxy_password;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 批量设置凭据级代理绑定（Admin API）。
+    ///
+    /// 所有目标凭据必须存在，避免只成功绑定一部分账号。
+    pub fn set_credentials_proxy_batch(
+        &self,
+        ids: &[u64],
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            anyhow::bail!("至少需要一个凭据 ID");
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            for &id in ids {
+                if !entries.iter().any(|entry| entry.id == id) {
+                    anyhow::bail!("凭据不存在: {}", id);
+                }
+            }
+            for entry in entries.iter_mut().filter(|entry| ids.contains(&entry.id)) {
+                entry.credentials.proxy_url = proxy_url.clone();
+                entry.credentials.proxy_username = proxy_username.clone();
+                entry.credentials.proxy_password = proxy_password.clone();
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 返回指定凭据与其有效代理配置，供管理端测试出口连通性。
+    pub fn credential_and_effective_proxy(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(KiroCredentials, Option<ProxyConfig>)> {
+        let credentials = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.credentials.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        Ok((credentials, effective_proxy))
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -3724,6 +3796,85 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
         assert!(persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
         assert!(!persisted.iter().find(|c| c.id == Some(2)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_shared_proxy_pair_fails_over_to_the_second_credential() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-shared-proxy-pair-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let proxy_url = "http://residential.example:8080".to_string();
+
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.priority = 0;
+        first.machine_id = Some("machine-1".to_string());
+        first.proxy_url = Some(proxy_url.clone());
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.priority = 1;
+        second.machine_id = Some("machine-2".to_string());
+        second.proxy_url = Some(proxy_url.clone());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![first.clone(), second.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.report_quota_exhausted(1));
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 2);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .disabled
+        );
+        assert!(
+            !snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == 2)
+                .unwrap()
+                .disabled
+        );
+
+        let (_, effective_proxy) = manager.credential_and_effective_proxy(2).unwrap();
+        assert_eq!(effective_proxy, Some(ProxyConfig::new(proxy_url)));
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(
+            persisted
+                .iter()
+                .find(|credential| credential.id == Some(1))
+                .unwrap()
+                .disabled
+        );
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|credential| credential.id == Some(2))
+                .unwrap()
+                .proxy_url
+                .as_deref(),
+            Some("http://residential.example:8080")
+        );
 
         std::fs::remove_file(&credentials_path).unwrap();
     }

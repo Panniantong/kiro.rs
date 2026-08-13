@@ -6,6 +6,9 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetCredentialProxyRequest,
+  BatchSetCredentialProxyRequest,
+  CredentialProxyTestResponse,
   AddCredentialRequest,
   AddCredentialResponse,
   SetRpmRequest,
@@ -60,6 +63,29 @@ export async function setCredentialPriority(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
   )
+  return data
+}
+
+// 绑定、清除或设置单个账号的代理。相同代理可绑定多个账号。
+export async function setCredentialProxy(
+  id: number,
+  req: SetCredentialProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/proxy`, req)
+  return data
+}
+
+// 将同一代理批量绑定给多个账号。
+export async function batchSetCredentialProxy(
+  req: BatchSetCredentialProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/batch-proxy', req)
+  return data
+}
+
+// 测试账号实际会使用的代理出口 IP。
+export async function testCredentialProxy(id: number): Promise<CredentialProxyTestResponse> {
+  const { data } = await api.post<CredentialProxyTestResponse>(`/credentials/${id}/proxy/test`)
   return data
 }
 

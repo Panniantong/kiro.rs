@@ -101,6 +101,51 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 更新单个凭据的代理绑定。
+///
+/// `proxy_url = null` 清除凭据级绑定并回退到全局代理；
+/// `proxy_url = "direct"` 显式直连；其余值必须是 HTTP/HTTPS/SOCKS5 代理 URL。
+/// 相同代理可以绑定给任意多个凭据（例如一个住宅 IP 挂两个账号）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyRequest {
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+}
+
+/// 将同一代理绑定批量写入多个凭据。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetCredentialProxyRequest {
+    pub ids: Vec<u64>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+}
+
+/// 批量代理测试的目标凭据。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCredentialIdsRequest {
+    pub ids: Vec<u64>,
+}
+
+/// 一次账号级代理出口测试结果。
+///
+/// 不回显代理用户名或密码；`proxy_url` 已脱敏。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialProxyTestResponse {
+    pub credential_id: u64,
+    pub uses_proxy: bool,
+    pub uses_credential_proxy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    pub egress_ip: String,
+    pub tested_at: String,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

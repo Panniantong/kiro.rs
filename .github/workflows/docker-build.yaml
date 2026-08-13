@@ -12,6 +12,11 @@ on:
         description: 'Version tag for Docker images (e.g., 2025.12.1)'
         required: true
         default: '2026.1.1'
+      publish_latest:
+        description: 'Also update the latest tag (manual builds default to false)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -122,11 +127,15 @@ jobs:
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # Create manifest for latest/beta alias tag
+          # Create the existing alias tag for automatic builds. Manual builds only publish their
+          # immutable version tag unless the operator explicitly opts into changing `latest`.
           if [ "${IS_BETA}" = "true" ]; then
             ALIAS_TAG="beta"
-          else
+          elif [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ inputs.publish_latest }}" = "true" ]; then
             ALIAS_TAG="latest"
+          else
+            echo "::notice::Manual image build leaves the latest tag unchanged"
+            exit 0
           fi
           docker manifest create ${IMAGE}:${ALIAS_TAG} \
             ${IMAGE}:${VERSION}-amd64 \

@@ -459,11 +459,54 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
+  - `POST /api/admin/credentials/:id/proxy` - 绑定、清除或显式直连账号代理
+  - `POST /api/admin/credentials/batch-proxy` - 将同一代理批量绑定给多个账号（允许一 IP 两号）
+  - `POST /api/admin/credentials/:id/proxy/test` - 测试该账号实际出口 IP
+  - `POST /api/admin/credentials/batch-proxy/test` - 批量测试账号出口 IP
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+
+### 账号组共用住宅 IP API
+
+一个住宅 IP 可按同一 `proxyUrl` 绑定给两个账号。账号 A 收到额度耗尽后会被持久化禁用，调度会选择账号 B；B 仍读取同一 `proxyUrl`，因此继续从相同 IP 出站。
+
+所有接口均需现有的 `x-api-key: <adminApiKey>`。密码只在绑定请求中接收，不会在状态或测试响应中回显。
+
+```bash
+# 将同一住宅 IP 绑定到两个账号。完全成功才会写入，任一账号 ID 不存在则全部失败。
+curl -X POST http://HOST:8996/api/admin/credentials/batch-proxy \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{
+    "ids": [281, 282],
+    "proxyUrl": "http://residential.example:8080",
+    "proxyUsername": "buyer-user",
+    "proxyPassword": "buyer-password"
+  }'
+
+# 逐个验证这两个账号的实际出口 IP（不刷新 Token、不调用 Kiro）。
+curl -X POST http://HOST:8996/api/admin/credentials/batch-proxy/test \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"ids": [281, 282]}'
+
+# 更换 IP 时对同一组账号重发 batch-proxy；解绑时不带代理字段。
+curl -X POST http://HOST:8996/api/admin/credentials/batch-proxy \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"ids": [281, 282]}'
+
+# 单号强制直连（即使全局配置有代理）。
+curl -X POST http://HOST:8996/api/admin/credentials/281/proxy \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"proxyUrl":"direct"}'
+
+# 如果要在基础额度耗尽时立刻禁用账号 A、切换到账号 B，关闭已有的 overage 放行。
+# 否则 overageStatus=ENABLED 的账号会继续使用超额额度，不会立即让出给下一账号。
+curl -X PUT http://HOST:8996/api/admin/config/overage-passthrough \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"enabled":false}'
+```
 
 ## 注意事项
 

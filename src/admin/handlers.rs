@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchSetRpmRequest, SetArmorBreakingRequest, SetDefaultRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+        AddCredentialRequest, BatchCredentialIdsRequest, BatchSetCredentialProxyRequest,
+        BatchSetRpmRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
+        SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
     },
 };
@@ -53,6 +54,66 @@ pub async fn set_credential_priority(
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/credentials/:id/proxy
+/// 绑定、清除或显式直连单个账号的代理。
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理绑定已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-proxy
+/// 将同一代理批量绑定给多个账号（允许同一住宅 IP 挂多个账号）。
+pub async fn batch_set_credential_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credentials_proxy_batch(payload) {
+        Ok(count) => Json(SuccessResponse::new(format!(
+            "已更新 {} 个凭据的代理绑定",
+            count
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/proxy/test
+/// 测试账号实际使用的代理出口 IP，不会刷新 Token 或调用 Kiro 上游。
+pub async fn test_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.test_credential_proxy(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-proxy/test
+/// 逐个测试多个账号的有效代理出口。单个失败不会阻断其他账号的测试。
+pub async fn batch_test_credential_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchCredentialIdsRequest>,
+) -> impl IntoResponse {
+    let mut results = Vec::with_capacity(payload.ids.len());
+    for id in payload.ids {
+        match state.service.test_credential_proxy(id).await {
+            Ok(response) => results
+                .push(serde_json::json!({ "credentialId": id, "ok": true, "result": response })),
+            Err(error) => results.push(
+                serde_json::json!({ "credentialId": id, "ok": false, "error": error.to_string() }),
+            ),
+        }
+    }
+    Json(serde_json::json!({ "results": results })).into_response()
 }
 
 /// POST /api/admin/credentials/:id/reset

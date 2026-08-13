@@ -79,6 +79,25 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetCredentialProxyRequest {
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+}
+
+export interface BatchSetCredentialProxyRequest extends SetCredentialProxyRequest {
+  ids: number[]
+}
+
+export interface CredentialProxyTestResponse {
+  credentialId: number
+  usesProxy: boolean
+  usesCredentialProxy: boolean
+  proxyUrl?: string
+  egressIp: string
+  testedAt: string
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string

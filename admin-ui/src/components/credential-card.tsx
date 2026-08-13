@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Network } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -22,6 +22,8 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useSetCredentialProxy,
+  useTestCredentialProxy,
   useSetRpm,
 } from '@/hooks/use-credentials'
 
@@ -63,6 +65,11 @@ export function CredentialCard({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [editingRpm, setEditingRpm] = useState(false)
   const [rpmValue, setRpmValue] = useState(credential.rpm == null ? '' : String(credential.rpm))
+  const [showProxyDialog, setShowProxyDialog] = useState(false)
+  const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
+  const [egressIp, setEgressIp] = useState<string | null>(null)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -70,6 +77,8 @@ export function CredentialCard({
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
   const setRpm = useSetRpm()
+  const setCredentialProxy = useSetCredentialProxy()
+  const testCredentialProxy = useTestCredentialProxy()
 
   const effectiveRpm = credential.effectiveRpm
   const isAtLimit = effectiveRpm != null && credential.currentRpm >= effectiveRpm
@@ -172,6 +181,56 @@ export function CredentialCard({
       onError: (err) => {
         toast.error('删除失败: ' + (err as Error).message)
       },
+    })
+  }
+
+  const handleSaveProxy = () => {
+    const trimmedUrl = proxyUrl.trim()
+    if (!trimmedUrl) {
+      toast.error('请输入完整代理 URL；如需解除绑定请使用“清除 IP 绑定”')
+      return
+    }
+    setCredentialProxy.mutate(
+      {
+        id: credential.id,
+        req: {
+          proxyUrl: trimmedUrl,
+          proxyUsername: proxyUsername.trim() || undefined,
+          proxyPassword: proxyPassword || undefined,
+        },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setShowProxyDialog(false)
+          setProxyUsername('')
+          setProxyPassword('')
+        },
+        onError: (err) => toast.error('代理绑定失败: ' + (err as Error).message),
+      }
+    )
+  }
+
+  const handleClearProxy = () => {
+    setCredentialProxy.mutate(
+      { id: credential.id, req: {} },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setShowProxyDialog(false)
+        },
+        onError: (err) => toast.error('清除代理失败: ' + (err as Error).message),
+      }
+    )
+  }
+
+  const handleTestProxy = () => {
+    testCredentialProxy.mutate(credential.id, {
+      onSuccess: (result) => {
+        setEgressIp(result.egressIp)
+        toast.success(`出口 IP：${result.egressIp}`)
+      },
+      onError: (err) => toast.error('代理测试失败: ' + (err as Error).message),
     })
   }
 
@@ -351,6 +410,7 @@ export function CredentialCard({
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
                 <span className="font-medium">{credential.proxyUrl}</span>
+                {egressIp && <span className="text-xs text-muted-foreground ml-2">出口 {egressIp}</span>}
               </div>
             )}
             {credential.hasProfileArn && (
@@ -502,6 +562,29 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={() => {
+                setProxyUrl('')
+                setProxyUsername('')
+                setProxyPassword('')
+                setEgressIp(null)
+                setShowProxyDialog(true)
+              }}
+            >
+              <Network className="h-4 w-4 mr-1" />
+              {credential.hasProxy ? '更换 IP' : '绑定 IP'}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleTestProxy}
+              disabled={testCredentialProxy.isPending}
+            >
+              <Network className={`h-4 w-4 mr-1 ${testCredentialProxy.isPending ? 'animate-pulse' : ''}`} />
+              测试出口
+            </Button>
+            <Button
+              size="sm"
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
@@ -537,6 +620,53 @@ export function CredentialCard({
               disabled={deleteCredential.isPending || !credential.disabled}
             >
               确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showProxyDialog} onOpenChange={setShowProxyDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>绑定账号代理</DialogTitle>
+            <DialogDescription>
+              当前：{credential.proxyUrl || '未绑定'}。同一个住宅 IP 可绑定到两个账号；更换时请输入完整新代理，输入 direct 则强制直连。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input
+              placeholder="http://host:port 或 socks5://host:port"
+              value={proxyUrl}
+              onChange={(event) => setProxyUrl(event.target.value)}
+              disabled={setCredentialProxy.isPending}
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <Input
+                placeholder="代理用户名"
+                value={proxyUsername}
+                onChange={(event) => setProxyUsername(event.target.value)}
+                disabled={setCredentialProxy.isPending}
+              />
+              <Input
+                type="password"
+                placeholder="代理密码"
+                value={proxyPassword}
+                onChange={(event) => setProxyPassword(event.target.value)}
+                disabled={setCredentialProxy.isPending}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            {credential.hasProxy && (
+              <Button variant="destructive" onClick={handleClearProxy} disabled={setCredentialProxy.isPending}>
+                清除 IP 绑定
+              </Button>
+            )}
+            <Button variant="outline" onClick={() => setShowProxyDialog(false)} disabled={setCredentialProxy.isPending}>
+              取消
+            </Button>
+            <Button onClick={handleSaveProxy} disabled={setCredentialProxy.isPending}>
+              保存绑定
             </Button>
           </DialogFooter>
         </DialogContent>
