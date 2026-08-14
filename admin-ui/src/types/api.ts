@@ -156,6 +156,16 @@ export interface SetDefaultRpmRequest {
   defaultRpm: number | null
 }
 
+export interface ProPlusProxyGateResponse {
+  enabled: boolean
+  maxAccountsPerProxy: number
+}
+
+export interface SetProPlusProxyGateRequest {
+  enabled: boolean
+  maxAccountsPerProxy: number
+}
+
 // CC Test 透传配置
 export interface MaxRelayResponse {
   enabled: boolean

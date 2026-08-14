@@ -18,10 +18,17 @@ import {
   setDefaultRpm,
   getArmorBreaking,
   setArmorBreaking,
+  getProPlusProxyGate,
+  setProPlusProxyGate,
   getMaxRelay,
   setMaxRelay,
 } from '@/api/credentials'
-import type { AddCredentialRequest, SetCredentialProxyRequest, SetMaxRelayRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  SetCredentialProxyRequest,
+  SetMaxRelayRequest,
+  SetProPlusProxyGateRequest,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -207,6 +214,24 @@ export function useSetArmorBreaking() {
     mutationFn: setArmorBreaking,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['armorBreaking'] })
+    },
+  })
+}
+
+export function useProPlusProxyGate() {
+  return useQuery({
+    queryKey: ['proPlusProxyGate'],
+    queryFn: getProPlusProxyGate,
+  })
+}
+
+export function useSetProPlusProxyGate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetProPlusProxyGateRequest) => setProPlusProxyGate(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proPlusProxyGate'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

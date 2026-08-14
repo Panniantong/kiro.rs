@@ -630,7 +630,7 @@ export function CredentialCard({
           <DialogHeader>
             <DialogTitle>绑定账号代理</DialogTitle>
             <DialogDescription>
-              当前：{credential.proxyUrl || '未绑定'}。同一个住宅 IP 可绑定到两个账号；更换时请输入完整新代理，输入 direct 则强制直连。
+              当前：{credential.proxyUrl || '未绑定'}。同一个住宅 IP 的账号数由全局 PRO+ 代理门禁配置限制；更换时请输入完整新代理，输入 direct 则强制直连。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">

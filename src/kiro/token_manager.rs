@@ -792,6 +792,10 @@ pub struct MultiTokenManager {
     armor_breaking: Mutex<bool>,
     /// 超额放行全局开关（运行时可修改，默认 true = 开启）
     overage_passthrough: Mutex<bool>,
+    /// PRO+ 账号级代理门禁（运行时可修改，默认开启）
+    require_pro_plus_credential_proxy: Mutex<bool>,
+    /// 自动代理池中单个代理允许绑定的最大账号数（运行时可修改，默认 2）
+    max_accounts_per_proxy: Mutex<usize>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -933,6 +937,8 @@ impl MultiTokenManager {
         let default_rpm_init = config.default_rpm;
         let armor_breaking = config.armor_breaking;
         let overage_passthrough = config.overage_passthrough;
+        let require_pro_plus_credential_proxy = config.require_pro_plus_credential_proxy;
+        let max_accounts_per_proxy = config.max_accounts_per_proxy;
         let max_relay = config.max_relay.clone();
         let manager = Self {
             config,
@@ -946,6 +952,8 @@ impl MultiTokenManager {
             default_rpm: Mutex::new(default_rpm_init),
             armor_breaking: Mutex::new(armor_breaking),
             overage_passthrough: Mutex::new(overage_passthrough),
+            require_pro_plus_credential_proxy: Mutex::new(require_pro_plus_credential_proxy),
+            max_accounts_per_proxy: Mutex::new(max_accounts_per_proxy),
             max_relay: Mutex::new(max_relay),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -2901,6 +2909,73 @@ impl MultiTokenManager {
         }
 
         tracing::info!("超额放行开关已设置为: {}", on);
+        Ok(())
+    }
+
+    /// 获取 PRO+ 账号级代理门禁开关。
+    pub fn get_require_pro_plus_credential_proxy(&self) -> bool {
+        *self.require_pro_plus_credential_proxy.lock()
+    }
+
+    /// 获取单个代理允许绑定的最大账号数。
+    pub fn get_max_accounts_per_proxy(&self) -> usize {
+        *self.max_accounts_per_proxy.lock()
+    }
+
+    fn persist_pro_plus_proxy_gate(
+        &self,
+        enabled: bool,
+        max_accounts_per_proxy: usize,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，PRO+ 代理门禁仅在当前进程生效: enabled={} max_accounts_per_proxy={}",
+                    enabled,
+                    max_accounts_per_proxy
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.require_pro_plus_credential_proxy = enabled;
+        config.max_accounts_per_proxy = max_accounts_per_proxy;
+        config
+            .save()
+            .with_context(|| format!("持久化 PRO+ 代理门禁失败: {}", config_path.display()))
+    }
+
+    /// 热更新并持久化 PRO+ 代理门禁配置，持久化失败时回滚运行态。
+    pub fn set_pro_plus_proxy_gate(
+        &self,
+        enabled: bool,
+        max_accounts_per_proxy: usize,
+    ) -> anyhow::Result<()> {
+        if max_accounts_per_proxy == 0 {
+            anyhow::bail!("每个代理账号数必须大于 0");
+        }
+
+        let previous_enabled = self.get_require_pro_plus_credential_proxy();
+        let previous_max = self.get_max_accounts_per_proxy();
+        *self.require_pro_plus_credential_proxy.lock() = enabled;
+        *self.max_accounts_per_proxy.lock() = max_accounts_per_proxy;
+
+        if let Err(error) = self.persist_pro_plus_proxy_gate(enabled, max_accounts_per_proxy) {
+            *self.require_pro_plus_credential_proxy.lock() = previous_enabled;
+            *self.max_accounts_per_proxy.lock() = previous_max;
+            return Err(error);
+        }
+
+        tracing::info!(
+            "PRO+ 代理门禁已更新: enabled={} max_accounts_per_proxy={}",
+            enabled,
+            max_accounts_per_proxy
+        );
         Ok(())
     }
 

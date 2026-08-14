@@ -178,6 +178,17 @@ async fn main() {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let reconcile_service = admin_state.service.clone();
+            tokio::spawn(async move {
+                match reconcile_service.reconcile_pending_pro_plus().await {
+                    Ok((enabled, pending)) => tracing::info!(
+                        "PRO+ 代理等待队列启动收口完成: enabled={} pending={}",
+                        enabled,
+                        pending
+                    ),
+                    Err(error) => tracing::warn!("PRO+ 代理等待队列启动收口失败: {}", error),
+                }
+            });
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

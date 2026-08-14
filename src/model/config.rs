@@ -135,6 +135,16 @@ pub struct Config {
     #[serde(default = "default_overage_passthrough")]
     pub overage_passthrough: bool,
 
+    /// PRO+ 账号级代理门禁（默认开启）。
+    ///
+    /// 开启时，KIRO PRO+ 必须绑定有效的账号级代理才能启用；关闭时回到旧逻辑。
+    #[serde(default = "default_require_pro_plus_credential_proxy")]
+    pub require_pro_plus_credential_proxy: bool,
+
+    /// 自动代理池中单个代理允许绑定的最大账号数（默认 2）。
+    #[serde(default = "default_max_accounts_per_proxy")]
+    pub max_accounts_per_proxy: usize,
+
     /// CC Test 检测请求透传配置（默认关闭）
     ///
     /// 运行时可经 Admin API `/config/max-relay` 热切换。开启后只有 CC Test 检测探针
@@ -210,6 +220,14 @@ fn default_overage_passthrough() -> bool {
     true
 }
 
+fn default_require_pro_plus_credential_proxy() -> bool {
+    true
+}
+
+fn default_max_accounts_per_proxy() -> usize {
+    2
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -243,6 +261,8 @@ impl Default for Config {
             default_rpm: None,
             armor_breaking: default_armor_breaking(),
             overage_passthrough: default_overage_passthrough(),
+            require_pro_plus_credential_proxy: default_require_pro_plus_credential_proxy(),
+            max_accounts_per_proxy: default_max_accounts_per_proxy(),
             max_relay: MaxRelayConfig::default(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
@@ -282,6 +302,9 @@ impl Config {
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        if config.max_accounts_per_proxy == 0 {
+            anyhow::bail!("maxAccountsPerProxy 必须大于 0");
+        }
         config.config_path = Some(path.to_path_buf());
         Ok(config)
     }
@@ -299,8 +322,52 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
-            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        let temp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        fs::write(&temp_path, content)
+            .with_context(|| format!("写入临时配置文件失败: {}", temp_path.display()))?;
+        if let Ok(metadata) = fs::metadata(path) {
+            fs::set_permissions(&temp_path, metadata.permissions())
+                .with_context(|| format!("继承配置文件权限失败: {}", temp_path.display()))?;
+        }
+        if let Err(error) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error).with_context(|| format!("原子替换配置文件失败: {}", path.display()));
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pro_plus_proxy_gate_defaults_to_enabled_with_two_accounts_per_proxy() {
+        let config = Config::default();
+
+        assert!(config.require_pro_plus_credential_proxy);
+        assert_eq!(config.max_accounts_per_proxy, 2);
+    }
+
+    #[test]
+    fn missing_pro_plus_proxy_gate_fields_use_safe_defaults() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert!(config.require_pro_plus_credential_proxy);
+        assert_eq!(config.max_accounts_per_proxy, 2);
+    }
+
+    #[test]
+    fn config_load_rejects_zero_accounts_per_proxy() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-invalid-proxy-capacity-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, r#"{"maxAccountsPerProxy":0}"#).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("maxAccountsPerProxy 必须大于 0"));
+
+        std::fs::remove_file(path).unwrap();
     }
 }

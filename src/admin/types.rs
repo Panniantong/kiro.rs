@@ -108,7 +108,7 @@ pub struct SetPriorityRequest {
 ///
 /// `proxy_url = null` 清除凭据级绑定并回退到全局代理；
 /// `proxy_url = "direct"` 显式直连；其余值必须是 HTTP/HTTPS/SOCKS5 代理 URL。
-/// 相同代理可以绑定给任意多个凭据（例如一个住宅 IP 挂两个账号）。
+/// 相同代理的绑定数量受全局 `maxAccountsPerProxy` 限制。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetCredentialProxyRequest {
@@ -172,11 +172,27 @@ pub struct RemoveProxyPoolEntriesRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyPoolResponse {
-    /// 每个代理最多绑定的账号数，当前固定为 2。
+    /// 每个代理最多绑定的账号数。
     pub max_accounts_per_proxy: usize,
     pub total: usize,
     pub available_slots: usize,
     pub proxies: Vec<ProxyPoolEntryStatus>,
+}
+
+/// PRO+ 账号级代理门禁配置。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProPlusProxyGateResponse {
+    pub enabled: bool,
+    pub max_accounts_per_proxy: usize,
+}
+
+/// 更新 PRO+ 账号级代理门禁配置。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProPlusProxyGateRequest {
+    pub enabled: bool,
+    pub max_accounts_per_proxy: usize,
 }
 
 /// 单个代理的脱敏状态。
@@ -199,7 +215,7 @@ pub struct BatchCredentialIdsRequest {
 /// 一次账号级代理出口测试结果。
 ///
 /// 不回显代理用户名或密码；`proxy_url` 已脱敏。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialProxyTestResponse {
     pub credential_id: u64,

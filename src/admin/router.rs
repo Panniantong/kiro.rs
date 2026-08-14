@@ -11,10 +11,11 @@ use super::{
         batch_set_credential_proxy, batch_set_credential_rpm, batch_test_credential_proxy,
         delete_credential, force_refresh_token, get_all_credentials, get_armor_breaking,
         get_credential_balance, get_default_rpm, get_load_balancing_mode, get_max_relay,
-        get_overage_passthrough, get_proxy_pool, remove_proxy_pool_entries, reset_failure_count,
-        set_armor_breaking, set_credential_disabled, set_credential_priority, set_credential_proxy,
-        set_credential_rpm, set_default_rpm, set_load_balancing_mode, set_max_relay,
-        set_overage_passthrough, test_credential_proxy,
+        get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool,
+        remove_proxy_pool_entries, reset_failure_count, set_armor_breaking,
+        set_credential_disabled, set_credential_priority, set_credential_proxy, set_credential_rpm,
+        set_default_rpm, set_load_balancing_mode, set_max_relay, set_overage_passthrough,
+        set_pro_plus_proxy_gate, test_credential_proxy,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -30,7 +31,7 @@ use super::{
 /// - `POST /credentials/:id/proxy` - 绑定、清除或显式直连账号代理
 /// - `POST /credentials/batch-proxy` - 将同一代理批量绑定给多个账号
 /// - `POST /credentials/assign-proxy-from-pool` - 为现有未绑定账号按池规则补绑代理
-/// - `GET|POST|DELETE /proxy-pool` - 自动分配代理池（每 IP 两个账号）
+/// - `GET|POST|DELETE /proxy-pool` - 自动分配代理池（单 IP 容量可配置）
 /// - `POST /credentials/:id/proxy/test` - 测试账号实际出口 IP
 /// - `POST /credentials/batch-proxy/test` - 批量测试账号出口 IP
 /// - `POST /credentials/:id/reset` - 重置失败计数
@@ -90,6 +91,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/overage-passthrough",
             get(get_overage_passthrough).put(set_overage_passthrough),
+        )
+        .route(
+            "/config/pro-plus-proxy-gate",
+            get(get_pro_plus_proxy_gate).put(set_pro_plus_proxy_gate),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
