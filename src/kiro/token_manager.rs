@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, broadcast};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -796,6 +796,8 @@ pub struct MultiTokenManager {
     require_pro_plus_credential_proxy: Mutex<bool>,
     /// 自动代理池中单个代理允许绑定的最大账号数（运行时可修改，默认 2）
     max_accounts_per_proxy: Mutex<usize>,
+    /// 额度耗尽事件。AdminService 订阅后负责释放 PRO+ 代理并触发等待账号补位。
+    quota_exhausted_tx: broadcast::Sender<u64>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -940,6 +942,7 @@ impl MultiTokenManager {
         let require_pro_plus_credential_proxy = config.require_pro_plus_credential_proxy;
         let max_accounts_per_proxy = config.max_accounts_per_proxy;
         let max_relay = config.max_relay.clone();
+        let (quota_exhausted_tx, _) = broadcast::channel(256);
         let manager = Self {
             config,
             proxy,
@@ -954,6 +957,7 @@ impl MultiTokenManager {
             overage_passthrough: Mutex::new(overage_passthrough),
             require_pro_plus_credential_proxy: Mutex::new(require_pro_plus_credential_proxy),
             max_accounts_per_proxy: Mutex::new(max_accounts_per_proxy),
+            quota_exhausted_tx,
             max_relay: Mutex::new(max_relay),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -982,6 +986,11 @@ impl MultiTokenManager {
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()
+    }
+
+    /// 订阅额度耗尽事件。接收方只负责代理滚动，不参与凭据禁用判定。
+    pub fn subscribe_quota_exhausted(&self) -> broadcast::Receiver<u64> {
+        self.quota_exhausted_tx.subscribe()
     }
 
     /// 获取可用凭据数量
@@ -1888,6 +1897,7 @@ impl MultiTokenManager {
         if let Err(e) = self.persist_credentials() {
             tracing::warn!("额度用尽禁用凭据后持久化失败（不影响本次切换）: {}", e);
         }
+        let _ = self.quota_exhausted_tx.send(id);
         result
     }
 
@@ -3916,6 +3926,20 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_report_quota_exhausted_emits_rotation_event() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let mut events = manager.subscribe_quota_exhausted();
+
+        manager.report_quota_exhausted(1);
+
+        assert_eq!(events.try_recv().unwrap(), 1);
     }
 
     #[test]

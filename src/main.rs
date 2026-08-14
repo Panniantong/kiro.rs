@@ -175,11 +175,18 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
+            let quota_events = token_manager.subscribe_quota_exhausted();
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let rotation_service = admin_state.service.clone();
+            tokio::spawn(rotation_service.run_quota_rotation_worker(quota_events));
             let reconcile_service = admin_state.service.clone();
             tokio::spawn(async move {
+                match reconcile_service.retire_cached_quota_exhausted_pro_plus() {
+                    Ok(retired) => tracing::info!(retired, "PRO+ 历史额度耗尽账号启动收口完成"),
+                    Err(error) => tracing::warn!("PRO+ 历史额度耗尽账号启动收口失败: {}", error),
+                }
                 match reconcile_service.reconcile_pending_pro_plus().await {
                     Ok((enabled, pending)) => tracing::info!(
                         "PRO+ 代理等待队列启动收口完成: enabled={} pending={}",
