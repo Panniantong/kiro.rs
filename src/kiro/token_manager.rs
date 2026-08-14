@@ -2466,6 +2466,11 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        // AdminService 会让需要完成前置校验的凭据以 disabled=true 入池。
+        // Token 刷新返回的新对象不能覆盖这个调度状态，否则账号会在代理验真前短暂可用，
+        // 池满时甚至会一直保持启用。
+        let initial_disabled = new_cred.disabled;
+
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -2560,6 +2565,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.disabled = initial_disabled;
         let import_note_for_log = validated_cred.import_note.clone().unwrap_or_default();
 
         {
@@ -2569,7 +2575,7 @@ impl MultiTokenManager {
                 credentials: validated_cred,
                 failure_count: 0,
                 refresh_failure_count: 0,
-                disabled: false,
+                disabled: initial_disabled,
                 disabled_reason: None,
                 cooldown_until: None,
                 success_count: 0,
@@ -3428,6 +3434,23 @@ mod tests {
             snapshot.entries[0].import_note.as_deref(),
             Some("Batch 001 - test 1P")
         );
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_preserves_initial_disabled_state() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut credential = KiroCredentials::default();
+        credential.kiro_api_key = Some("ksk_test_disabled_import".to_string());
+        credential.auth_method = Some("api_key".to_string());
+        credential.disabled = true;
+
+        manager.add_credential(credential).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(manager.available_count(), 0);
     }
 
     #[tokio::test]
