@@ -798,6 +798,9 @@ pub struct MultiTokenManager {
     max_accounts_per_proxy: Mutex<usize>,
     /// 额度耗尽事件。AdminService 订阅后负责释放 PRO+ 代理并触发等待账号补位。
     quota_exhausted_tx: broadcast::Sender<u64>,
+    /// 稳定禁用事件。手动禁用、刷新连续失败、refreshToken 永久失效等终态
+    /// 由 AdminService 释放 PRO+ 代理；五分钟自动恢复的 TooManyFailures 不发送。
+    stable_disabled_tx: broadcast::Sender<u64>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -943,6 +946,7 @@ impl MultiTokenManager {
         let max_accounts_per_proxy = config.max_accounts_per_proxy;
         let max_relay = config.max_relay.clone();
         let (quota_exhausted_tx, _) = broadcast::channel(256);
+        let (stable_disabled_tx, _) = broadcast::channel(256);
         let manager = Self {
             config,
             proxy,
@@ -958,6 +962,7 @@ impl MultiTokenManager {
             require_pro_plus_credential_proxy: Mutex::new(require_pro_plus_credential_proxy),
             max_accounts_per_proxy: Mutex::new(max_accounts_per_proxy),
             quota_exhausted_tx,
+            stable_disabled_tx,
             max_relay: Mutex::new(max_relay),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -991,6 +996,11 @@ impl MultiTokenManager {
     /// 订阅额度耗尽事件。接收方只负责代理滚动，不参与凭据禁用判定。
     pub fn subscribe_quota_exhausted(&self) -> broadcast::Receiver<u64> {
         self.quota_exhausted_tx.subscribe()
+    }
+
+    /// 订阅稳定禁用事件。接收方只处理代理释放与补位，不改变禁用原因。
+    pub fn subscribe_stable_disabled(&self) -> broadcast::Receiver<u64> {
+        self.stable_disabled_tx.subscribe()
     }
 
     /// 获取可用凭据数量
@@ -1968,6 +1978,13 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        if self.entries.lock().iter().any(|entry| {
+            entry.id == id
+                && entry.disabled
+                && entry.disabled_reason == Some(DisabledReason::TooManyRefreshFailures)
+        }) {
+            let _ = self.stable_disabled_tx.send(id);
+        }
         result
     }
 
@@ -2020,6 +2037,13 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        if self.entries.lock().iter().any(|entry| {
+            entry.id == id
+                && entry.disabled
+                && entry.disabled_reason == Some(DisabledReason::InvalidRefreshToken)
+        }) {
+            let _ = self.stable_disabled_tx.send(id);
+        }
         result
     }
 
@@ -2150,6 +2174,24 @@ impl MultiTokenManager {
 
     /// 设置凭据禁用状态（Admin API）
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
+        self.set_disabled_inner(id, disabled, true)
+    }
+
+    /// AdminService 内部用于“禁用后继续等待代理”的过渡状态，不发送稳定禁用事件。
+    pub(crate) fn set_disabled_without_release_event(
+        &self,
+        id: u64,
+        disabled: bool,
+    ) -> anyhow::Result<()> {
+        self.set_disabled_inner(id, disabled, false)
+    }
+
+    fn set_disabled_inner(
+        &self,
+        id: u64,
+        disabled: bool,
+        notify_stable_disabled: bool,
+    ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -2168,6 +2210,9 @@ impl MultiTokenManager {
         }
         // 持久化更改
         self.persist_credentials()?;
+        if disabled && notify_stable_disabled {
+            let _ = self.stable_disabled_tx.send(id);
+        }
         Ok(())
     }
 

@@ -37,7 +37,11 @@ pub async fn set_credential_disabled(
             return (error.status_code(), Json(error.into_response())).into_response();
         }
     }
-    match state.service.set_disabled(id, payload.disabled) {
+    match state
+        .service
+        .set_disabled_and_reconcile(id, payload.disabled)
+        .await
+    {
         Ok(_) => {
             let action = if payload.disabled { "禁用" } else { "启用" };
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()

@@ -188,6 +188,22 @@ impl AdminService {
         Ok(())
     }
 
+    /// 设置凭据禁用状态，并在 PRO+ 进入稳定禁用状态后释放代理、触发等待队列补位。
+    ///
+    /// 手动禁用是终态：账号不会重新进入等待队列。以后若要恢复，必须重新分配
+    /// 账号级代理并完成出口验证后再启用。
+    pub async fn set_disabled_and_reconcile(
+        &self,
+        id: u64,
+        disabled: bool,
+    ) -> Result<(), AdminServiceError> {
+        self.set_disabled(id, disabled)?;
+        if disabled && self.release_disabled_pro_plus_proxy(id, true)? {
+            self.reconcile_pending_pro_plus().await?;
+        }
+        Ok(())
+    }
+
     /// 设置凭据优先级
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -427,10 +443,11 @@ impl AdminService {
                     enabled_count += 1;
                 }
                 Ok(_) | Err(_) => {
-                    // 保留绑定与等待状态，便于修复代理后重试；绝不回退直连。
+                    // 验证失败继续等待，但释放失败绑定，避免禁用账号长期占槽；绝不回退直连。
                     self.token_manager
-                        .set_disabled(id, true)
+                        .set_disabled_without_release_event(id, true)
                         .map_err(|error| self.classify_error(error, id))?;
+                    self.release_disabled_pro_plus_proxy(id, false)?;
                 }
             }
         }
@@ -473,6 +490,53 @@ impl AdminService {
                 Ok(false) => {}
                 Err(error) => {
                     tracing::error!(credential_id = id, "额度耗尽 PRO+ 永久退役失败: {}", error)
+                }
+            }
+        }
+    }
+
+    /// 监听手动禁用和确定性凭据失效事件，释放 PRO+ 代理并立即补位。
+    pub async fn run_stable_disabled_proxy_release_worker(
+        self: Arc<Self>,
+        mut events: tokio::sync::broadcast::Receiver<u64>,
+    ) {
+        loop {
+            let id = match events.recv().await {
+                Ok(id) => id,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "PRO+ 稳定禁用事件处理滞后，执行全量历史收口");
+                    match self.release_stale_disabled_pro_plus_proxies() {
+                        Ok(released) if released > 0 => {
+                            let _ = self.reconcile_pending_pro_plus().await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::error!("PRO+ 稳定禁用全量收口失败: {}", error),
+                    }
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
+            if !self.token_manager.get_require_pro_plus_credential_proxy() {
+                continue;
+            }
+            match self.release_disabled_pro_plus_proxy(id, true) {
+                Ok(true) => match self.reconcile_pending_pro_plus().await {
+                    Ok((enabled, pending)) => tracing::info!(
+                        credential_id = id,
+                        enabled,
+                        pending,
+                        "稳定禁用 PRO+ 已释放代理并完成补位"
+                    ),
+                    Err(error) => tracing::error!(
+                        credential_id = id,
+                        "稳定禁用 PRO+ 已释放代理，但补位失败: {}",
+                        error
+                    ),
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(credential_id = id, "稳定禁用 PRO+ 释放代理失败: {}", error)
                 }
             }
         }
@@ -810,6 +874,82 @@ impl AdminService {
             && !Self::has_credential_proxy(credentials)
     }
 
+    /// 释放已禁用 PRO+ 的账号级代理。
+    ///
+    /// `clear_pending=true` 用于人工或确定性失效禁用，表示该账号不能自动复活；
+    /// `clear_pending=false` 用于代理验证失败，账号继续等待下次分配，但不长期占槽。
+    fn release_disabled_pro_plus_proxy(
+        &self,
+        id: u64,
+        clear_pending: bool,
+    ) -> Result<bool, AdminServiceError> {
+        if !self.token_manager.get_require_pro_plus_credential_proxy() {
+            return Ok(false);
+        }
+        let snapshot = self.token_manager.snapshot();
+        let Some(entry) = snapshot.entries.into_iter().find(|entry| entry.id == id) else {
+            return Err(AdminServiceError::NotFound { id });
+        };
+        if !entry.disabled || !Self::is_kiro_pro_plus(entry.subscription_title.as_deref()) {
+            return Ok(false);
+        }
+        let credentials = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|error| self.classify_error(error, id))?
+            .0;
+        if !Self::has_credential_proxy(&credentials) {
+            if clear_pending {
+                self.clear_proxy_pending(id)?;
+            }
+            return Ok(false);
+        }
+
+        self.token_manager
+            .set_credential_proxy(id, None, None, None)
+            .map_err(|error| self.classify_error(error, id))?;
+        if clear_pending {
+            self.clear_proxy_pending(id)?;
+        }
+        Ok(true)
+    }
+
+    /// 服务启动时清理旧版本遗留的“已禁用但仍占代理”PRO+。
+    ///
+    /// `TooManyFailures` 是五分钟自动恢复的瞬时冷却，不属于稳定禁用；额度耗尽由
+    /// 专用退役流程处理。其余稳定禁用均释放代理。历史代理验证失败账号若仍在
+    /// pending 队列，则保留等待身份但释放失败绑定。
+    pub fn release_stale_disabled_pro_plus_proxies(&self) -> Result<usize, AdminServiceError> {
+        if !self.token_manager.get_require_pro_plus_credential_proxy() {
+            return Ok(0);
+        }
+        let pending_ids: HashSet<u64> = self.pending_proxy_ids().into_iter().collect();
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.disabled
+                    && entry.has_proxy
+                    && Self::is_kiro_pro_plus(entry.subscription_title.as_deref())
+                    && !matches!(
+                        entry.disabled_reason.as_deref(),
+                        Some("TooManyFailures" | "QuotaExceeded")
+                    )
+            })
+            .map(|entry| entry.id)
+            .collect();
+
+        let mut released = 0;
+        for id in ids {
+            if self.release_disabled_pro_plus_proxy(id, !pending_ids.contains(&id))? {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
     fn ensure_can_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         if self
             .proxy_pool
@@ -882,7 +1022,11 @@ impl AdminService {
             .map(|entry| entry.id)
             .collect();
         for id in ids {
-            if let Err(error) = self.set_disabled(id, true) {
+            if let Err(error) = self
+                .token_manager
+                .set_disabled_without_release_event(id, true)
+                .map_err(|error| self.classify_error(error, id))
+            {
                 tracing::warn!(
                     credential_id = id,
                     "KIRO PRO+ 无账号级代理，启动收口禁用失败: {}",
@@ -931,7 +1075,7 @@ impl AdminService {
 
         if !already_disabled {
             self.token_manager
-                .set_disabled(id, true)
+                .set_disabled_without_release_event(id, true)
                 .map_err(|error| self.classify_error(error, id))?;
         }
         if Self::has_credential_proxy(&credentials) {
@@ -1186,7 +1330,7 @@ impl AdminService {
                 .0;
             if !Self::has_credential_proxy(&credentials) {
                 self.token_manager
-                    .set_disabled(id, true)
+                    .set_disabled_without_release_event(id, true)
                     .map_err(|error| self.classify_error(error, id))?;
                 self.mark_proxy_pending(id)?;
                 let _ = self.reconcile_pending_pro_plus().await?;
@@ -1288,7 +1432,7 @@ impl AdminService {
 
         // 序列化分配到实际写入，防止两个并发导入拿到同一个最后的空槽。
         let _allocation_guard = self.allocation_lock.lock().await;
-        let assigned_proxy = if proxy_pool_eligibility
+        let mut assigned_proxy = if proxy_pool_eligibility
             .as_ref()
             .map(|eligibility| eligibility.eligible)
             .unwrap_or(false)
@@ -1353,7 +1497,7 @@ impl AdminService {
                     activation_requires_proxy = self.requires_proxy_before_enable(&credentials);
                     if activation_requires_proxy {
                         self.token_manager
-                            .set_disabled(credential_id, true)
+                            .set_disabled_without_release_event(credential_id, true)
                             .map_err(|error| self.classify_error(error, credential_id))?;
                     }
                 }
@@ -1382,8 +1526,10 @@ impl AdminService {
                         Ok(_) | Err(_) => {
                             proxy_test_failed = true;
                             self.token_manager
-                                .set_disabled(credential_id, true)
+                                .set_disabled_without_release_event(credential_id, true)
                                 .map_err(|error| self.classify_error(error, credential_id))?;
+                            self.release_disabled_pro_plus_proxy(credential_id, false)?;
+                            assigned_proxy = None;
                             self.mark_proxy_pending(credential_id)?;
                         }
                     }
@@ -2685,6 +2831,214 @@ mod tests {
         std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
         std::fs::remove_file(test_dir.join("kiro_balance_cache.json")).unwrap();
         std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_manual_disable_releases_pro_plus_proxy_without_requeueing() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-manual-disabled-proxy-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://manual-disabled.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service.set_disabled_and_reconcile(1, true).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert!(!snapshot.entries[0].has_proxy);
+        assert!(service.pending_proxy_ids().is_empty());
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_proxy_pool.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_startup_releases_stale_disabled_pro_plus_proxy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-stale-disabled-proxy-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://stale-disabled.example:443".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        assert_eq!(
+            service.release_stale_disabled_pro_plus_proxies().unwrap(),
+            1
+        );
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert!(!snapshot.entries[0].has_proxy);
+        assert!(service.pending_proxy_ids().is_empty());
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_proxy_pool.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_invalid_refresh_token_event_releases_pro_plus_proxy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-invalid-refresh-proxy-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://invalid-refresh.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let events = manager.subscribe_stable_disabled();
+        let service = Arc::new(AdminService::new(manager.clone(), Vec::<String>::new()));
+        let worker = tokio::spawn(
+            service
+                .clone()
+                .run_stable_disabled_proxy_release_worker(events),
+        );
+
+        manager.report_refresh_token_invalid(1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !manager.snapshot().entries[0].has_proxy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        let _ = worker.await;
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("InvalidRefreshToken")
+        );
+        assert!(!snapshot.entries[0].has_proxy);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_proxy_pool.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        }
+        if test_dir.join("kiro_stats.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_transient_failure_cooldown_keeps_pro_plus_proxy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-transient-disabled-proxy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://transient-failure.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        manager.report_failure(1);
+        manager.report_failure(1);
+        manager.report_failure(1);
+
+        assert_eq!(
+            service.release_stale_disabled_pro_plus_proxies().unwrap(),
+            0
+        );
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("TooManyFailures")
+        );
+        assert!(snapshot.entries[0].has_proxy);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_stats.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        }
         std::fs::remove_dir(&test_dir).unwrap();
     }
 

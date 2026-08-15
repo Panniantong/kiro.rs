@@ -176,16 +176,30 @@ async fn main() {
             anthropic_app
         } else {
             let quota_events = token_manager.subscribe_quota_exhausted();
+            let stable_disabled_events = token_manager.subscribe_stable_disabled();
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let rotation_service = admin_state.service.clone();
             tokio::spawn(rotation_service.run_quota_rotation_worker(quota_events));
+            let disabled_release_service = admin_state.service.clone();
+            tokio::spawn(
+                disabled_release_service
+                    .run_stable_disabled_proxy_release_worker(stable_disabled_events),
+            );
             let reconcile_service = admin_state.service.clone();
             tokio::spawn(async move {
                 match reconcile_service.retire_cached_quota_exhausted_pro_plus() {
                     Ok(retired) => tracing::info!(retired, "PRO+ 历史额度耗尽账号启动收口完成"),
                     Err(error) => tracing::warn!("PRO+ 历史额度耗尽账号启动收口失败: {}", error),
+                }
+                match reconcile_service.release_stale_disabled_pro_plus_proxies() {
+                    Ok(released) => {
+                        tracing::info!(released, "PRO+ 历史禁用账号代理启动释放完成")
+                    }
+                    Err(error) => {
+                        tracing::warn!("PRO+ 历史禁用账号代理启动释放失败: {}", error)
+                    }
                 }
                 match reconcile_service.reconcile_pending_pro_plus().await {
                     Ok((enabled, pending)) => tracing::info!(
