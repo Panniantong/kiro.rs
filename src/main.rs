@@ -182,6 +182,8 @@ async fn main() {
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let rotation_service = admin_state.service.clone();
             tokio::spawn(rotation_service.run_quota_rotation_worker(quota_events));
+            let quota_guard_service = admin_state.service.clone();
+            tokio::spawn(quota_guard_service.run_pro_plus_quota_guard());
             let disabled_release_service = admin_state.service.clone();
             tokio::spawn(
                 disabled_release_service
@@ -189,9 +191,9 @@ async fn main() {
             );
             let reconcile_service = admin_state.service.clone();
             tokio::spawn(async move {
-                match reconcile_service.retire_cached_quota_exhausted_pro_plus() {
-                    Ok(retired) => tracing::info!(retired, "PRO+ 历史额度耗尽账号启动收口完成"),
-                    Err(error) => tracing::warn!("PRO+ 历史额度耗尽账号启动收口失败: {}", error),
+                match reconcile_service.retire_cached_low_quota_pro_plus() {
+                    Ok(retired) => tracing::info!(retired, "PRO+ 历史低额度账号启动收口完成"),
+                    Err(error) => tracing::warn!("PRO+ 历史低额度账号启动收口失败: {}", error),
                 }
                 match reconcile_service.release_stale_disabled_pro_plus_proxies() {
                     Ok(released) => {
