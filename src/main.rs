@@ -191,16 +191,16 @@ async fn main() {
             );
             let reconcile_service = admin_state.service.clone();
             tokio::spawn(async move {
-                match reconcile_service.retire_cached_low_quota_pro_plus() {
-                    Ok(retired) => tracing::info!(retired, "PRO+ 历史低额度账号启动收口完成"),
-                    Err(error) => tracing::warn!("PRO+ 历史低额度账号启动收口失败: {}", error),
+                match reconcile_service.retire_cached_nonviable_pool_credentials() {
+                    Ok(retired) => tracing::info!(retired, "代理池历史额度失效账号启动收口完成"),
+                    Err(error) => tracing::warn!("代理池历史额度失效账号启动收口失败: {}", error),
                 }
-                match reconcile_service.release_stale_disabled_pro_plus_proxies() {
+                match reconcile_service.release_stale_disabled_proxy_bindings() {
                     Ok(released) => {
-                        tracing::info!(released, "PRO+ 历史禁用账号代理启动释放完成")
+                        tracing::info!(released, "历史稳定禁用账号代理启动释放完成")
                     }
                     Err(error) => {
-                        tracing::warn!("PRO+ 历史禁用账号代理启动释放失败: {}", error)
+                        tracing::warn!("历史稳定禁用账号代理启动释放失败: {}", error)
                     }
                 }
                 match reconcile_service.reconcile_pending_pro_plus().await {

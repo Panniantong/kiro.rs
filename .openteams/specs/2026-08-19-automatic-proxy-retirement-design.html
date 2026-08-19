@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kiro RS 失效账号代理自动退役</title>
+  <style>
+    :root { --ink:#172033; --muted:#667085; --line:#d8e0ea; --paper:#fff; --wash:#eef4f2; --accent:#176b5b; --soft:#e5f4ef; --warn:#fff3d6; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:linear-gradient(180deg,var(--wash),#f7f9fc 320px); font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(980px,calc(100% - 32px)); margin:36px auto 72px; }
+    header,section { background:var(--paper); border:1px solid var(--line); border-radius:16px; box-shadow:0 12px 30px rgba(28,45,67,.06); }
+    header { padding:36px 40px; border-top:6px solid var(--accent); }
+    section { margin-top:16px; padding:26px 30px; }
+    h1 { margin:0 0 8px; font-size:clamp(28px,4vw,40px); line-height:1.2; }
+    h2 { margin:0 0 12px; font-size:21px; }
+    p,ul,ol { margin:8px 0; }
+    code { padding:2px 6px; border-radius:6px; background:#edf1f6; font:13px ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .meta { color:var(--muted); }
+    .flow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .step { padding:8px 12px; border-radius:999px; background:var(--soft); color:#104f43; font-weight:650; }
+    .arrow { color:var(--muted); }
+    .note { padding:14px 16px; border-radius:10px; background:var(--warn); }
+    table { width:100%; border-collapse:collapse; }
+    th,td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-size:13px; }
+  </style>
+</head>
+<body><main>
+  <header>
+    <div class="meta">Kiro RS · 自动轮换补丁 · 2026-08-19</div>
+    <h1>失效账号自动释放代理并补位</h1>
+    <p>修复“账号已停用，但账号级代理仍被占用，pending PRO+ 无法补位”的真实生产故障。</p>
+  </header>
+
+  <section>
+    <h2>1. 根因</h2>
+    <p>旧逻辑按账号<strong>当前套餐</strong>判断是否释放代理。生产中，原 PRO+ 账号失效后额度接口可能显示为 <code>KIRO FREE</code>，导致它虽然已是 <code>QuotaExceeded</code> 或持续收到安全封停 403，仍绕过 PRO+ 释放条件并占住代理槽位。</p>
+  </section>
+
+  <section>
+    <h2>2. 目标状态机</h2>
+    <div class="flow">
+      <span class="step">确定性失效</span><span class="arrow">→</span>
+      <span class="step">永久停用</span><span class="arrow">→</span>
+      <span class="step">释放池内代理</span><span class="arrow">→</span>
+      <span class="step">pending 补位</span><span class="arrow">→</span>
+      <span class="step">验出口</span><span class="arrow">→</span>
+      <span class="step">启用</span>
+    </div>
+    <table>
+      <thead><tr><th>信号</th><th>行为</th></tr></thead>
+      <tbody>
+        <tr><td>额度耗尽或 PRO+ 低于既定 10% 阈值</td><td>永久退役，释放池内代理，不再入 pending。</td></tr>
+        <tr><td>403 正文明确包含 Kiro 安全封停</td><td>永久停用并触发稳定失效事件，释放池内代理。</td></tr>
+        <tr><td>普通连续失败、网络错误、普通 401/403</td><td>保留现有短冷却，不释放代理。</td></tr>
+        <tr><td>人工禁用、refresh token 永久失效</td><td>释放池内代理。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>3. 关键判断</h2>
+    <ul>
+      <li>释放依据是“账号稳定失效且绑定的是自动代理池资源”，不再依赖当前套餐名称。</li>
+      <li>只释放代理池内绑定；不清理运营者显式配置、但不属于池的代理。</li>
+      <li>安全封停使用独立永久原因，不复用会在五分钟后自动恢复的 <code>TooManyFailures</code>。</li>
+      <li>补位继续复用现有串行分配锁、出口一致性验证和 pending 队列。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>4. 验收</h2>
+    <ol>
+      <li>套餐已变成 FREE 的额度耗尽账号会释放池内代理。</li>
+      <li>Kiro 安全封停 403 会永久停用，不在五分钟后复活。</li>
+      <li>普通 TooManyFailures 仍按原逻辑自动恢复，不误释放。</li>
+      <li>释放后 pending PRO+ 自动取得代理；出口验证通过才启用。</li>
+      <li>重复事件和服务重启保持幂等，不重复占位或重复入队。</li>
+    </ol>
+    <div class="note"><strong>范围：</strong>只改 Kiro RS 后端账号状态与代理池回收逻辑；不改 New API、edge-gw、cache-rewriter 或渠道配置。</div>
+  </section>
+</main></body>
+</html>

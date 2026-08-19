@@ -664,6 +664,8 @@ enum DisabledReason {
     Manual,
     /// 连续失败达到阈值后自动禁用
     TooManyFailures,
+    /// 上游明确返回账号安全封停，禁止自动恢复
+    UpstreamSuspended,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -1836,6 +1838,59 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告上游明确的账号安全封停。
+    ///
+    /// 这是确定性终态，不进入 TooManyFailures 的五分钟自动恢复；同时发送稳定禁用
+    /// 事件，让 AdminService 释放账号占用的自动代理池资源并触发补位。
+    pub fn report_upstream_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => return entries.iter().any(|entry| !entry.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+
+            Self::release_in_flight_slot(entry);
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::UpstreamSuspended);
+            entry.cooldown_until = None;
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            let import_note = entry.credentials.import_note.clone().unwrap_or_default();
+
+            tracing::error!(
+                credential_id = id,
+                import_note = %import_note,
+                "凭据 #{} 已被 Kiro 上游安全封停，已永久禁用",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .min_by_key(|entry| entry.credentials.priority)
+            {
+                *current_id = next.id;
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("安全封停禁用凭据后持久化失败（不影响本次切换）: {}", error);
+        }
+        let _ = self.stable_disabled_tx.send(id);
+        result
+    }
+
     /// 报告指定凭据触发上游 429 限流。
     ///
     /// 429 是瞬态容量信号，不应永久禁用凭据；仅设置运行时冷却并让调度器
@@ -2144,6 +2199,7 @@ impl MultiTokenManager {
                         match r {
                             DisabledReason::Manual => "Manual",
                             DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::UpstreamSuspended => "UpstreamSuspended",
                             DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
@@ -3693,6 +3749,28 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_upstream_security_suspension_is_stable_disabled_event() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut events = manager.subscribe_stable_disabled();
+
+        assert!(manager.report_upstream_suspended(1));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.disabled_reason.as_deref(), Some("UpstreamSuspended"));
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(events.try_recv().unwrap(), 1);
     }
 
     #[test]
