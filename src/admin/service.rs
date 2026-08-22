@@ -856,13 +856,13 @@ impl AdminService {
         gate_enabled || requested.unwrap_or(true)
     }
 
-    /// ponytail: 只按 Kiro 官方返回的 subscriptionTitle 精确识别，不猜邮箱域名、
-    /// 余额或赠送额度；若 Kiro 日后变更套餐名，再把该规则改成配置项。
+    /// 只按 Kiro 官方返回的付费 Pro 套餐名识别，不猜邮箱域名、余额或赠送额度。
+    /// 当前代理池覆盖 KIRO PRO+ 与 KIRO PRO MAX；若官方再变更套餐名，再显式扩展。
     fn proxy_pool_eligibility(usage: &UsageLimitsResponse) -> ProxyPoolEligibility {
         let subscription_title = usage.subscription_title().map(str::to_owned);
         let eligible = Self::is_kiro_pro_plus(subscription_title.as_deref());
         let reason = if eligible {
-            "官方 subscriptionTitle 为 KIRO PRO+，允许自动分配代理".to_string()
+            "官方 subscriptionTitle 为受支持的付费 KIRO PRO，允许自动分配代理".to_string()
         } else if let Some(title) = subscription_title.as_deref() {
             format!("官方 subscriptionTitle 为 {title:?}，不自动分配代理")
         } else {
@@ -877,7 +877,12 @@ impl AdminService {
 
     fn is_kiro_pro_plus(subscription_title: Option<&str>) -> bool {
         subscription_title
-            .map(|title| title.trim().eq_ignore_ascii_case("KIRO PRO+"))
+            .map(|title| {
+                matches!(
+                    title.trim().to_ascii_uppercase().as_str(),
+                    "KIRO PRO+" | "KIRO PRO MAX"
+                )
+            })
             .unwrap_or(false)
     }
 
@@ -2891,6 +2896,10 @@ mod tests {
             "subscriptionInfo": {"subscriptionTitle": " Kiro Pro+ "}
         }))
         .unwrap();
+        let pro_max: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": "kiro pro max"}
+        }))
+        .unwrap();
         let free: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
             "subscriptionInfo": {"subscriptionTitle": "KIRO FREE"}
         }))
@@ -2900,6 +2909,7 @@ mod tests {
         let eligible = AdminService::proxy_pool_eligibility(&pro_plus);
         assert!(eligible.eligible);
         assert_eq!(eligible.subscription_title.as_deref(), Some(" Kiro Pro+ "));
+        assert!(AdminService::proxy_pool_eligibility(&pro_max).eligible);
         assert!(!AdminService::proxy_pool_eligibility(&free).eligible);
         assert!(!AdminService::proxy_pool_eligibility(&missing).eligible);
     }
