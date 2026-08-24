@@ -28,8 +28,8 @@ use crate::model::config::MaxRelayConfig;
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
-/// PRO+ 账号剩余额度低于 10% 时退出代理池。
-const PRO_PLUS_MIN_REMAINING_RATIO: f64 = 0.10;
+/// PRO+ / PRO MAX 账号剩余额度低于 50 时退出代理池。
+const PRO_PLUS_MIN_REMAINING: f64 = 50.0;
 /// 每分钟检查一次；余额缓存确保同一账号最多每 5 分钟访问一次上游额度接口。
 const PRO_PLUS_QUOTA_GUARD_INTERVAL_SECS: u64 = 60;
 /// 浮点余额接近 0 时视为额度耗尽
@@ -500,7 +500,7 @@ impl AdminService {
         }
     }
 
-    /// 定期刷新启用中的 PRO+ 额度；低于 10% 时由额度退役事件释放代理并补位。
+    /// 定期刷新启用中的 PRO+ 额度；低于 50 时由额度退役事件释放代理并补位。
     pub async fn run_pro_plus_quota_guard(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
             PRO_PLUS_QUOTA_GUARD_INTERVAL_SECS,
@@ -1166,7 +1166,7 @@ impl AdminService {
         Ok(true)
     }
 
-    /// 启动时利用已持久化的余额缓存收口低于 10% 的 PRO+，以及额度归零但
+    /// 启动时利用已持久化的余额缓存收口低于 50 的 PRO+，以及额度归零但
     /// 套餐标签已经变化的代理池账号。人工禁用但额度仍可用的账号保持原样。
     pub fn retire_cached_nonviable_pool_credentials(&self) -> Result<usize, AdminServiceError> {
         if !self.token_manager.get_require_pro_plus_credential_proxy() {
@@ -1334,7 +1334,7 @@ impl AdminService {
             return;
         }
 
-        // PRO+ 的 10% 规则优先于付费超额；其他套餐维持原有 overage 行为。
+        // PRO+ 的 50 额度规则优先于付费超额；其他套餐维持原有 overage 行为。
         if !pro_plus_below_threshold && self.token_manager.is_overage_enabled(balance.id) {
             tracing::info!(
                 "凭据 #{} 余额耗尽但 overage=ENABLED，进入超额、保持启用",
@@ -1345,7 +1345,7 @@ impl AdminService {
 
         let has_available = self.token_manager.report_quota_exhausted(balance.id);
         let reason = if pro_plus_below_threshold {
-            "PRO+ 剩余额度低于 10%"
+            "PRO+ 剩余额度低于 50"
         } else {
             "余额已耗尽"
         };
@@ -1382,7 +1382,7 @@ impl AdminService {
             }
         }
 
-        balance.remaining / balance.usage_limit < PRO_PLUS_MIN_REMAINING_RATIO
+        balance.remaining < PRO_PLUS_MIN_REMAINING
     }
 
     fn is_quota_exhausted_balance(balance: &BalanceResponse) -> bool {
@@ -2089,12 +2089,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pro_plus_quota_threshold_is_strictly_below_ten_percent() {
+    fn test_pro_plus_quota_threshold_is_strictly_below_fifty() {
         assert!(AdminService::is_pro_plus_below_quota_threshold(
-            &pro_plus_balance_response(1, 2000.0, 199.99)
+            &pro_plus_balance_response(1, 2000.0, 49.99)
         ));
         assert!(!AdminService::is_pro_plus_below_quota_threshold(
-            &pro_plus_balance_response(1, 2000.0, 200.0)
+            &pro_plus_balance_response(1, 2000.0, 50.0)
+        ));
+        assert!(!AdminService::is_pro_plus_below_quota_threshold(
+            &pro_plus_balance_response(1, 2000.0, 199.99)
         ));
         assert!(!AdminService::is_pro_plus_below_quota_threshold(
             &balance_response(1, 10000.0, 1.0)
@@ -2564,7 +2567,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overage_enabled_pro_plus_below_ten_percent_is_disabled() {
+    fn test_overage_enabled_pro_plus_below_fifty_is_disabled() {
         let credentials_path = std::env::temp_dir().join(format!(
             "kiro-admin-overage-pro-plus-low-quota-{}.json",
             uuid::Uuid::new_v4()
@@ -2594,7 +2597,7 @@ mod tests {
         );
         let service = AdminService::new(manager.clone(), Vec::<String>::new());
 
-        service.disable_if_quota_exhausted_balance(&pro_plus_balance_response(1, 2000.0, 199.99));
+        service.disable_if_quota_exhausted_balance(&pro_plus_balance_response(1, 2000.0, 49.99));
 
         let first = manager.snapshot().entries.into_iter().next().unwrap();
         assert!(first.disabled);
@@ -3522,7 +3525,7 @@ mod tests {
             1,
             CachedBalance {
                 cached_at: Utc::now().timestamp() as f64,
-                data: pro_plus_balance_response(1, 2000.0, 199.99),
+                data: pro_plus_balance_response(1, 2000.0, 49.99),
             },
         );
         service.balance_cache.lock().insert(
