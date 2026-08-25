@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -1305,6 +1305,7 @@ impl AdminService {
         };
         if let Some(balance) = cached_balance {
             self.disable_if_quota_exhausted_balance(&balance);
+            self.backfill_disabled_reason(id, &balance);
             return Ok(balance);
         }
 
@@ -1324,6 +1325,7 @@ impl AdminService {
         }
         self.save_balance_cache();
         self.disable_if_quota_exhausted_balance(&balance);
+        self.backfill_disabled_reason(id, &balance);
 
         Ok(balance)
     }
@@ -1402,11 +1404,25 @@ impl AdminService {
 
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
-            .token_manager
-            .get_usage_limits_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
+        let usage = match self.token_manager.get_usage_limits_for(id).await {
+            Ok(usage) => usage,
+            Err(error) => {
+                let message = error.to_string();
+                if Self::is_token_dead_balance_error(&message) {
+                    if let Err(reason_error) = self
+                        .token_manager
+                        .set_disabled_reason(id, DisabledReason::InvalidRefreshToken)
+                    {
+                        tracing::warn!(
+                            credential_id = id,
+                            "Token 失效原因标记失败: {}",
+                            reason_error
+                        );
+                    }
+                }
+                return Err(self.classify_balance_error(error, id));
+            }
+        };
 
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
@@ -1449,6 +1465,60 @@ impl AdminService {
         }
 
         Ok(response)
+    }
+
+    /// 余额查询错误中表示"上游 token 已失效/无权限"的特征。
+    fn is_token_dead_balance_error(message: &str) -> bool {
+        message.contains("权限不足")
+            || message.contains("凭证已过期或无效")
+            || message.contains("403")
+            || message.contains("Forbidden")
+    }
+
+    /// 给"已禁用但无原因"的账号补记原因：额度用尽 / 手动禁用。
+    fn backfill_disabled_reason(&self, id: u64, balance: &BalanceResponse) {
+        let entry = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id);
+        let Some(entry) = entry else {
+            return;
+        };
+        if !entry.disabled || entry.disabled_reason.is_some() {
+            return;
+        }
+        let reason = if balance.remaining <= BALANCE_EXHAUSTED_EPSILON {
+            DisabledReason::QuotaExceeded
+        } else {
+            DisabledReason::Manual
+        };
+        if let Err(error) = self.token_manager.set_disabled_reason(id, reason) {
+            tracing::warn!(credential_id = id, "禁用原因补记失败: {}", error);
+        }
+    }
+
+    /// 启动时对"已禁用但无原因"的账号逐个刷新余额，补记具体禁用原因。
+    pub async fn backfill_disabled_reasons(&self) -> Result<usize, AdminServiceError> {
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.disabled && entry.disabled_reason.is_none())
+            .map(|entry| entry.id)
+            .collect();
+        let mut backfilled = 0;
+        for id in ids {
+            match self.get_balance(id).await {
+                Ok(_) => backfilled += 1,
+                Err(error) => {
+                    tracing::warn!(credential_id = id, "禁用原因启动回填失败: {}", error)
+                }
+            }
+        }
+        Ok(backfilled)
     }
 
     /// 添加新凭据
@@ -1508,6 +1578,7 @@ impl AdminService {
             proxy_password,
             // 门禁开启时先以禁用状态入库，完成套餐识别与代理出口验证后再启用。
             disabled: gate_enabled,
+            disabled_reason: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             rpm: None,
@@ -2643,6 +2714,114 @@ mod tests {
         let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(first.disabled, "非 ENABLED 的号余额耗尽应被禁用");
         assert_eq!(first.disabled_reason.as_deref(), Some("QuotaExceeded"));
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_backfill_disabled_reason_marks_quota_or_manual_without_overwrite() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-backfill-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.disabled = true; // 禁用但无原因（加载时派生 Manual）
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred1.clone(), cred2.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred1, cred2],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        // 加载后禁用账号派生为 Manual（既有行为）
+        assert_eq!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("Manual")
+        );
+
+        // backfill 不覆盖已有原因
+        service.backfill_disabled_reason(1, &balance_response(1, 10000.0, 0.0));
+        service.backfill_disabled_reason(2, &balance_response(2, 10000.0, 500.0));
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.entries.iter().find(|e| e.id == 1).unwrap().disabled_reason.as_deref(),
+            Some("Manual")
+        );
+        assert_eq!(
+            snapshot.entries.iter().find(|e| e.id == 2).unwrap().disabled_reason.as_deref(),
+            Some("Manual")
+        );
+
+        // set_disabled_reason 可写入具体原因并持久化
+        manager
+            .set_disabled_reason(1, DisabledReason::QuotaExceeded)
+            .unwrap();
+        manager
+            .set_disabled_reason(2, DisabledReason::InvalidRefreshToken)
+            .unwrap();
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        let p1 = persisted.iter().find(|c| c.id == Some(1)).unwrap();
+        let p2 = persisted.iter().find(|c| c.id == Some(2)).unwrap();
+        assert_eq!(p1.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(p2.disabled_reason.as_deref(), Some("InvalidRefreshToken"));
+
+        // 重新加载后原因不丢失
+        let reloaded = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                persisted.clone(),
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("QuotaExceeded")
+        );
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 2)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("InvalidRefreshToken")
+        );
 
         std::fs::remove_file(&credentials_path).unwrap();
     }

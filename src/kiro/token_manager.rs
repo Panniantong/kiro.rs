@@ -659,7 +659,7 @@ enum SelectOutcome {
 
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
+pub enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
     /// 连续失败达到阈值后自动禁用
@@ -674,6 +674,32 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+}
+impl DisabledReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "Manual",
+            DisabledReason::TooManyFailures => "TooManyFailures",
+            DisabledReason::UpstreamSuspended => "UpstreamSuspended",
+            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+            DisabledReason::QuotaExceeded => "QuotaExceeded",
+            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+            DisabledReason::InvalidConfig => "InvalidConfig",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<DisabledReason> {
+        match value {
+            "Manual" => Some(DisabledReason::Manual),
+            "TooManyFailures" => Some(DisabledReason::TooManyFailures),
+            "UpstreamSuspended" => Some(DisabledReason::UpstreamSuspended),
+            "TooManyRefreshFailures" => Some(DisabledReason::TooManyRefreshFailures),
+            "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
+            "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
+            "InvalidConfig" => Some(DisabledReason::InvalidConfig),
+            _ => None,
+        }
+    }
 }
 
 /// 统计数据持久化条目
@@ -887,8 +913,15 @@ impl MultiTokenManager {
                     failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
+                    // 优先使用文件里持久化的禁用原因；缺失时才派生为 Manual
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        Some(
+                            cred
+                                .disabled_reason
+                                .as_deref()
+                                .and_then(DisabledReason::from_str)
+                                .unwrap_or(DisabledReason::Manual),
+                        )
                     } else {
                         None
                     },
@@ -1578,8 +1611,9 @@ impl MultiTokenManager {
                 .map(|e| {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
+                    // 同步 disabled 状态与禁用原因到凭据对象（重启后原因不丢失）
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_str().to_string());
                     cred
                 })
                 .collect()
@@ -2249,6 +2283,20 @@ impl MultiTokenManager {
         disabled: bool,
     ) -> anyhow::Result<()> {
         self.set_disabled_inner(id, disabled, false)
+    }
+    /// 仅更新凭据的禁用原因（不改变禁用状态），并持久化。
+    /// 用于给历史禁用账号补记具体原因（额度用尽 / Token 失效 / 手动禁用）。
+    pub fn set_disabled_reason(&self, id: u64, reason: DisabledReason) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.disabled_reason = Some(reason);
+        }
+        self.persist_credentials()?;
+        Ok(())
     }
 
     fn set_disabled_inner(

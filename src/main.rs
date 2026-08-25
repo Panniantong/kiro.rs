@@ -211,6 +211,10 @@ async fn main() {
                     ),
                     Err(error) => tracing::warn!("PRO+ 代理等待队列启动收口失败: {}", error),
                 }
+                match reconcile_service.backfill_disabled_reasons().await {
+                    Ok(backfilled) => tracing::info!(backfilled, "历史禁用账号原因回填完成"),
+                    Err(error) => tracing::warn!("历史禁用账号原因回填失败: {}", error),
+                }
             });
             let admin_app = admin::create_admin_router(admin_state);
 

@@ -16,6 +16,30 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+// 禁用原因中文标签（与后端 DisabledReason 对应）
+const DISABLED_REASON_LABELS: Record<string, string> = {
+  QuotaExceeded: '额度用尽',
+  UpstreamSuspended: '上游封停',
+  InvalidRefreshToken: 'Token 失效',
+  TooManyFailures: '连续失败',
+  TooManyRefreshFailures: '刷新失败',
+  InvalidConfig: '配置无效',
+  Manual: '手动禁用',
+}
+
+// 禁用原因对应 Badge 样式：额度/封停/失效 → 红；其他明确原因 → 黄；未知 → 灰
+function disabledReasonVariant(reason?: string) {
+  if (!reason) return 'secondary'
+  if (reason === 'QuotaExceeded' || reason === 'UpstreamSuspended' || reason === 'InvalidRefreshToken') {
+    return 'destructive'
+  }
+  if (reason === 'Manual') return 'secondary'
+  return 'warning'
+}
+
+function disabledReasonLabel(reason?: string) {
+  return reason ? (DISABLED_REASON_LABELS[reason] ?? reason) : '手动/未知'
+}
 import {
   useSetDisabled,
   useSetPriority,
@@ -252,8 +276,10 @@ export function CredentialCard({
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
                 )}
-                {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline">{credential.disabledReason}</Badge>
+                {credential.disabled && (
+                  <Badge variant={disabledReasonVariant(credential.disabledReason) as 'destructive' | 'secondary' | 'warning'}>
+                    {disabledReasonLabel(credential.disabledReason)}
+                  </Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">

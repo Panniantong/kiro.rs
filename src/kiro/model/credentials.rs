@@ -108,6 +108,10 @@ pub struct KiroCredentials {
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
+    /// 禁用原因（持久化展示用；重启后不丢失）。
+    /// 取值与 token_manager::DisabledReason 的字符串一致（QuotaExceeded / UpstreamSuspended / InvalidRefreshToken / Manual 等）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
@@ -363,6 +367,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -495,6 +500,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -529,6 +535,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -646,6 +653,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
