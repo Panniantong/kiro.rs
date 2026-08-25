@@ -20,11 +20,16 @@ pub const KIRO_SOCIAL_PROFILE_ARN: &str =
 
 /// 有效 profileArn：账号自己存了就用；没存按登录方式补占位符。
 /// 用于 getUsageLimits、模型列表与对话请求（上游已把 profileArn 当必填）。
-pub fn effective_profile_arn(credentials: &KiroCredentials) -> String {
+pub fn effective_profile_arn(credentials: &KiroCredentials) -> Option<String> {
     if let Some(arn) = credentials.profile_arn.as_deref() {
         if !arn.is_empty() {
-            return arn.to_string();
+            return Some(arn.to_string());
         }
+    }
+    // API Key（headless）账号没有 profile 概念，上游对它的准入口径与
+    // Builder ID 不同，强带占位符反而会被拒 403，因此不注入。
+    if credentials.is_api_key_credential() {
+        return None;
     }
     if credentials
         .auth_method
@@ -32,9 +37,9 @@ pub fn effective_profile_arn(credentials: &KiroCredentials) -> String {
         .map(|m| m.eq_ignore_ascii_case("social"))
         .unwrap_or(false)
     {
-        KIRO_SOCIAL_PROFILE_ARN.to_string()
+        Some(KIRO_SOCIAL_PROFILE_ARN.to_string())
     } else {
-        KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()
+        Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string())
     }
 }
 

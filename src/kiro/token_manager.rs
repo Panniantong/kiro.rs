@@ -548,9 +548,12 @@ pub(crate) async fn get_usage_limits(
     );
 
     // profileArn 必填：上游已把它当准入条件，不带会 403。
-    // 账号没存就按登录方式补占位符（Builder ID / 社交固定 ARN）。
-    let effective_arn = crate::kiro::model::credentials::effective_profile_arn(credentials);
-    url.push_str(&format!("&profileArn={}", urlencoding::encode(&effective_arn)));
+    // 账号没存就按登录方式补占位符；API Key 账号不注入（上游口径不同）。
+    if let Some(effective_arn) =
+        crate::kiro::model::credentials::effective_profile_arn(credentials)
+    {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(&effective_arn)));
+    }
 
     // 构建 User-Agent headers
     // 上游对客户端版本号设了准入门槛：aws-sdk-js 必须 ≥ 1.0.34，KiroIDE ≥ 0.12.155。
