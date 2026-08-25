@@ -188,7 +188,8 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    // 上游对客户端版本号设了准入门槛（KiroIDE ≥ 0.12.155），低版本会被拒 403
+    "0.12.155".to_string()
 }
 
 fn default_system_version() -> String {

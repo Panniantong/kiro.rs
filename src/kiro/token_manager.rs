@@ -547,17 +547,18 @@ pub(crate) async fn get_usage_limits(
         host
     );
 
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
+    // profileArn 必填：上游已把它当准入条件，不带会 403。
+    // 账号没存就按登录方式补占位符（Builder ID / 社交固定 ARN）。
+    let effective_arn = crate::kiro::model::credentials::effective_profile_arn(credentials);
+    url.push_str(&format!("&profileArn={}", urlencoding::encode(&effective_arn)));
 
     // 构建 User-Agent headers
+    // 上游对客户端版本号设了准入门槛：aws-sdk-js 必须 ≥ 1.0.34，KiroIDE ≥ 0.12.155。
     let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.34 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
     );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 

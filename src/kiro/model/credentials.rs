@@ -9,6 +9,34 @@ use std::path::Path;
 
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
+/// Kiro IDE 源码里给 Builder ID 硬编码的占位符 ARN。
+/// 上游自 2026-08 起把 getUsageLimits / ListAvailableModels / 对话的 profileArn
+/// 改成必填，Builder ID / API Key 账号必须原样带上它，否则 403。
+pub const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+/// Github / Google 社交登录共用的固定 profileArn。
+pub const KIRO_SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
+/// 有效 profileArn：账号自己存了就用；没存按登录方式补占位符。
+/// 用于 getUsageLimits、模型列表与对话请求（上游已把 profileArn 当必填）。
+pub fn effective_profile_arn(credentials: &KiroCredentials) -> String {
+    if let Some(arn) = credentials.profile_arn.as_deref() {
+        if !arn.is_empty() {
+            return arn.to_string();
+        }
+    }
+    if credentials
+        .auth_method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("social"))
+        .unwrap_or(false)
+    {
+        KIRO_SOCIAL_PROFILE_ARN.to_string()
+    } else {
+        KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()
+    }
+}
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
