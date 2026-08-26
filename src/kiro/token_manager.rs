@@ -626,6 +626,10 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// 临时冷却截止时间。429 只设置冷却不禁用；TooManyFailures 到期后自动恢复。
     cooldown_until: Option<DateTime<Utc>>,
+    /// 连续 429 计数（自适应冷却阶梯用；API 成功或长时间无 429 后复位）
+    rate_limit_strikes: u32,
+    /// 最近一次 429 时间（用于陈旧复位与阶梯定位）
+    last_rate_limit_at: Option<DateTime<Utc>>,
     /// API 调用成功次数
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -847,10 +851,13 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// TooManyFailures 自动恢复冷却时间。
 const TOO_MANY_FAILURES_COOLDOWN: StdDuration = StdDuration::from_secs(300);
-/// 429 默认冷却时间。上游 Retry-After 会覆盖该默认值。
-const RATE_LIMIT_DEFAULT_COOLDOWN: StdDuration = StdDuration::from_secs(30);
+/// 429 自适应冷却阶梯默认值：首次不冷却（多数 429 是秒级窗口，重试一下就好），
+/// 连续 429 逐级升冷却。可被 config.rate_limit_cooldown_secs 覆盖。
+const DEFAULT_RATE_LIMIT_LADDER: [u64; 4] = [0, 5, 10, 30];
 /// 429 冷却上限，避免异常 Retry-After 把凭据挂起过久。
 const RATE_LIMIT_MAX_COOLDOWN: StdDuration = StdDuration::from_secs(600);
+/// 距上次 429 超过该时长后，连续计数复位（陈旧不累计）。
+const RATE_LIMIT_STRIKE_RESET: StdDuration = StdDuration::from_secs(120);
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// RPM 滑动窗口长度（60 秒）
@@ -930,6 +937,8 @@ impl MultiTokenManager {
                         None
                     },
                     cooldown_until: None,
+                    rate_limit_strikes: 0,
+                    last_rate_limit_at: None,
                     success_count: 0,
                     last_used_at: None,
                     success_window: VecDeque::new(),
@@ -1749,6 +1758,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.cooldown_until = None;
+                entry.rate_limit_strikes = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(now.to_rfc3339());
                 Self::record_success_slot(entry, now);
@@ -1939,14 +1949,89 @@ impl MultiTokenManager {
 
     /// 报告指定凭据触发上游 429 限流。
     ///
-    /// 429 是瞬态容量信号，不应永久禁用凭据；仅设置运行时冷却并让调度器
-    /// 优先选择其他凭据。冷却到期后凭据自动回到可选池。
-    pub fn report_rate_limited(&self, id: u64, cooldown: Option<StdDuration>) -> bool {
-        self.report_transient_cooldown(
-            id,
-            cooldown.unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN),
-            "上游 429",
-        )
+    /// 429 是瞬态容量信号，不应永久禁用凭据。采用自适应冷却阶梯：
+    /// 首次 429 只计数不冷却（多数 429 是秒级窗口，重试一下就好）；
+    /// 连续 429 逐级升冷却（默认 0/5/10/30s，可用 config.rate_limit_cooldown_secs 覆盖），
+    /// 避免风暴期反复撞墙。成功一次或 120s 无 429 后连续计数复位。
+    /// 上游显式 Retry-After 始终优先于阶梯。
+    pub fn report_rate_limited(&self, id: u64, retry_after: Option<StdDuration>) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let now = Utc::now();
+            Self::recover_due_cooldowns(&mut entries, now);
+
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                Self::release_in_flight_slot(entry);
+                if !entry.disabled {
+                    // 陈旧复位：距上次 429 超过阈值，连续计数重新从第一级开始
+                    let stale = entry
+                        .last_rate_limit_at
+                        .map(|t| now - t > Self::chrono_duration(RATE_LIMIT_STRIKE_RESET))
+                        .unwrap_or(true);
+                    if stale {
+                        entry.rate_limit_strikes = 0;
+                    }
+                    entry.rate_limit_strikes += 1;
+                    entry.last_rate_limit_at = Some(now);
+                    entry.last_used_at = Some(now.to_rfc3339());
+
+                    // 上游显式 Retry-After 优先；否则按连续次数走自适应阶梯
+                    let ladder_secs: &[u64] = self
+                        .config
+                        .rate_limit_cooldown_secs
+                        .as_deref()
+                        .unwrap_or(&DEFAULT_RATE_LIMIT_LADDER);
+                    let cooldown = match retry_after {
+                        Some(d) => d.min(RATE_LIMIT_MAX_COOLDOWN),
+                        None => {
+                            let idx = (entry.rate_limit_strikes as usize)
+                                .saturating_sub(1)
+                                .min(ladder_secs.len().saturating_sub(1));
+                            ladder_secs
+                                .get(idx)
+                                .copied()
+                                .map(StdDuration::from_secs)
+                                .unwrap_or(StdDuration::from_secs(30))
+                        }
+                    };
+
+                    let import_note = entry.credentials.import_note.clone().unwrap_or_default();
+                    if cooldown.is_zero() {
+                        tracing::warn!(
+                            credential_id = id,
+                            import_note = %import_note,
+                            rate_limit_strikes = entry.rate_limit_strikes,
+                            "凭据 #{} 触发上游 429（连续第 {} 次），不冷却直接重选",
+                            id,
+                            entry.rate_limit_strikes
+                        );
+                    } else {
+                        let cooldown_until = now + Self::chrono_duration(cooldown);
+                        entry.cooldown_until = Some(match entry.cooldown_until {
+                            Some(existing) if existing > cooldown_until => existing,
+                            _ => cooldown_until,
+                        });
+                        tracing::warn!(
+                            credential_id = id,
+                            import_note = %import_note,
+                            rate_limit_strikes = entry.rate_limit_strikes,
+                            cooldown_secs = cooldown.as_secs(),
+                            "凭据 #{} 触发上游 429（连续第 {} 次），冷却 {}s 至 {}",
+                            id,
+                            entry.rate_limit_strikes,
+                            cooldown.as_secs(),
+                            entry.cooldown_until.unwrap().to_rfc3339()
+                        );
+                    }
+                }
+            }
+
+            entries
+                .iter()
+                .any(|e| !e.disabled && !Self::is_cooling_down(e, now))
+        };
+        self.save_stats_debounced();
+        result
     }
 
     /// 报告指定凭据额度已用尽
@@ -2750,6 +2835,8 @@ impl MultiTokenManager {
                 disabled: initial_disabled,
                 disabled_reason: None,
                 cooldown_until: None,
+                rate_limit_strikes: 0,
+                last_rate_limit_at: None,
                 success_count: 0,
                 last_used_at: None,
                 success_window: VecDeque::new(),
@@ -3246,6 +3333,8 @@ mod tests {
             disabled: false,
             disabled_reason: None,
             cooldown_until: None,
+            rate_limit_strikes: 0,
+            last_rate_limit_at: None,
             success_count: 0,
             last_used_at: None,
             success_window: VecDeque::new(),
@@ -3993,6 +4082,159 @@ mod tests {
         }
 
         assert_eq!(manager.available_count(), 2);
+    }
+
+    fn two_credential_manager(config: Config) -> MultiTokenManager {
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = ["t1", "t2"]
+            .into_iter()
+            .map(|token| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(token.to_string());
+                credential.expires_at = Some(expires_at.clone());
+                credential
+            })
+            .collect();
+        MultiTokenManager::new(config, credentials, None, None, false).unwrap()
+    }
+
+    /// 阶梯第一级：首次 429 只记 strike、不冷却（多数 429 是秒级窗口，重试一下就好）
+    #[tokio::test]
+    async fn test_rate_limit_first_429_only_counts_strike_without_cooldown() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        assert!(manager.report_rate_limited(1, None));
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 1);
+            assert!(entry.cooldown_until.is_none());
+        }
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    /// 连续 429 逐级升冷却：5s → 10s → 30s 封顶
+    #[tokio::test]
+    async fn test_rate_limit_ladder_escalates_on_consecutive_429() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None); // strike 1 → 0s
+        manager.report_rate_limited(1, None); // strike 2 → 5s
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 2);
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(4) && remain <= Duration::seconds(5));
+        }
+        assert_eq!(manager.available_count(), 1);
+        manager.report_rate_limited(1, None); // strike 3 → 10s
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(9) && remain <= Duration::seconds(10));
+        }
+        manager.report_rate_limited(1, None); // strike 4 → 30s
+        manager.report_rate_limited(1, None); // strike 5 → 仍 30s 封顶
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 5);
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(29) && remain <= Duration::seconds(30));
+        }
+    }
+
+    /// 成功后连续计数复位，下次 429 回到第一级
+    #[tokio::test]
+    async fn test_rate_limit_strikes_reset_on_success() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None);
+        manager.report_rate_limited(1, None); // strike 2 → 5s 冷却
+        manager.report_success(1);
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 0);
+            assert!(entry.cooldown_until.is_none());
+        }
+
+        manager.report_rate_limited(1, None);
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.rate_limit_strikes, 1);
+        assert!(entry.cooldown_until.is_none());
+    }
+
+    /// 距上次 429 超过 120s 视为陈旧，连续计数重新从第一级开始
+    #[tokio::test]
+    async fn test_rate_limit_stale_strikes_reset_after_quiet_period() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None);
+        manager.report_rate_limited(1, None); // strike 2
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.last_rate_limit_at = Some(Utc::now() - Duration::seconds(200));
+            entry.cooldown_until = Some(Utc::now() - Duration::seconds(1)); // 冷却已过期
+        }
+
+        manager.report_rate_limited(1, None);
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.rate_limit_strikes, 1);
+        assert!(entry.cooldown_until.is_none());
+    }
+
+    /// 上游显式 Retry-After 优先于阶梯，首次 429 也直接冷却
+    #[tokio::test]
+    async fn test_rate_limit_retry_after_header_overrides_ladder() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, Some(StdDuration::from_secs(45)));
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.rate_limit_strikes, 1);
+        let remain = entry.cooldown_until.unwrap() - Utc::now();
+        assert!(remain > Duration::seconds(44) && remain <= Duration::seconds(45));
+    }
+
+    /// config.rate_limit_cooldown_secs 可覆盖默认阶梯，末级封顶
+    #[tokio::test]
+    async fn test_rate_limit_custom_ladder_from_config() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.rate_limit_cooldown_secs = Some(vec![1, 2]);
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None); // strike 1 → 1s
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::milliseconds(500) && remain <= Duration::seconds(1));
+        }
+        manager.report_rate_limited(1, None); // strike 2 → 2s
+        manager.report_rate_limited(1, None); // strike 3 → 仍 2s（末级封顶）
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(1) && remain <= Duration::seconds(2));
+        }
     }
 
     #[test]

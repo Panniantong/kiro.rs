@@ -117,6 +117,14 @@ pub struct Config {
     /// 凭据未单独配置 `rpm` 时沿用此值。`None` 或 `0` = 不限制。
     #[serde(default)]
     pub default_rpm: Option<u32>,
+    /// 429 自适应冷却阶梯（秒）。凭据第 N 次连续 429 取 `ladder[min(N-1, len-1)]`。
+    ///
+    /// 默认 `[0, 5, 10, 30]`：首次 429 不冷却只计数（多数 429 是秒级窗口，
+    /// 重试一下就好）；连续 429 逐级升冷却，避免风暴期反复撞墙。
+    /// 0 = 不冷却。上游显式 `Retry-After` 始终优先于阶梯。
+    /// 凭据成功一次或 120s 无 429 后，连续计数复位。
+    #[serde(default)]
+    pub rate_limit_cooldown_secs: Option<Vec<u64>>,
 
     /// 破甲模式：去除/绕过 Kiro 上游自带系统提示词与身份痕迹（默认 false = 最小满分版）
     ///
@@ -260,6 +268,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             default_rpm: None,
+            rate_limit_cooldown_secs: None,
             armor_breaking: default_armor_breaking(),
             overage_passthrough: default_overage_passthrough(),
             require_pro_plus_credential_proxy: default_require_pro_plus_credential_proxy(),
