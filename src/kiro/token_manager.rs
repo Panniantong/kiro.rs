@@ -505,7 +505,7 @@ async fn refresh_idc_token(
     let data: IdcRefreshResponse = response.json().await?;
 
     let mut new_credentials = credentials.clone();
-    new_credentials.access_token = Some(data.access_token);
+    new_credentials.access_token = Some(data.access_token.clone());
 
     if let Some(new_refresh_token) = data.refresh_token {
         new_credentials.refresh_token = Some(new_refresh_token);
@@ -521,7 +521,53 @@ async fn refresh_idc_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
+    // 上游已把 profileArn 改成必填；IdC 账号缺 profileArn 时用占位符会被拒 403。
+    // refresh 后若仍无 profileArn，探测真实 profile 并存下。探测失败不阻塞刷新。
+    if new_credentials.profile_arn.is_none() {
+        if let Some(arn) =
+            list_available_profiles(&new_credentials, config, &data.access_token, proxy).await
+        {
+            new_credentials.profile_arn = Some(arn);
+        }
+    }
+
     Ok(new_credentials)
+}
+
+/// 列出 IdC 账号可用的 profile（上游把 profileArn 当必填后，IdC 必须用真实 profile，
+/// 不能用 Builder ID 占位符）。仅 IdC/Enterprise 有意义；Builder ID / 社交返回 None。
+async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> Option<String> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = format!("https://{}/ListAvailableProfiles", host);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let ua = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+    let client = build_client(proxy, 60, config.tls_backend).ok()?;
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", &ua)
+        .header("x-amz-user-agent", &ua)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .body("{}")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = response.json().await.ok()?;
+    data.get("profiles")?
+        .as_array()?
+        .iter()
+        .find_map(|p| p.get("arn").and_then(|a| a.as_str()).map(String::from))
 }
 
 /// 获取使用额度信息
