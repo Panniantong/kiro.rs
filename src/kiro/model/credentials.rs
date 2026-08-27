@@ -9,6 +9,39 @@ use std::path::Path;
 
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
+/// Kiro IDE 源码里给 Builder ID 硬编码的占位符 ARN。
+/// 上游自 2026-08 起把 getUsageLimits / ListAvailableModels / 对话的 profileArn
+/// 改成必填，Builder ID / API Key 账号必须原样带上它，否则 403。
+pub const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+/// Github / Google 社交登录共用的固定 profileArn。
+pub const KIRO_SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
+/// 有效 profileArn：账号自己存了就用；没存按登录方式补占位符。
+/// 用于 getUsageLimits、模型列表与对话请求（上游已把 profileArn 当必填）。
+pub fn effective_profile_arn(credentials: &KiroCredentials) -> Option<String> {
+    if let Some(arn) = credentials.profile_arn.as_deref() {
+        if !arn.is_empty() {
+            return Some(arn.to_string());
+        }
+    }
+    // API Key（headless）账号没有 profile 概念，上游对它的准入口径与
+    // Builder ID 不同，强带占位符反而会被拒 403，因此不注入。
+    if credentials.is_api_key_credential() {
+        return None;
+    }
+    if credentials
+        .auth_method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("social"))
+        .unwrap_or(false)
+    {
+        Some(KIRO_SOCIAL_PROFILE_ARN.to_string())
+    } else {
+        Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string())
+    }
+}
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -108,6 +141,10 @@ pub struct KiroCredentials {
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
+    /// 禁用原因（持久化展示用；重启后不丢失）。
+    /// 取值与 token_manager::DisabledReason 的字符串一致（QuotaExceeded / UpstreamSuspended / InvalidRefreshToken / Manual 等）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
@@ -363,6 +400,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -495,6 +533,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -529,6 +568,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -646,6 +686,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,

@@ -23,6 +23,8 @@ import {
   useBatchSetRpm,
   useArmorBreaking,
   useSetArmorBreaking,
+  useProPlusProxyGate,
+  useSetProPlusProxyGate,
   useMaxRelay,
   useSetMaxRelay,
 } from '@/hooks/use-credentials'
@@ -76,6 +78,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
   const { data: armorBreakingData, isLoading: isLoadingArmor } = useArmorBreaking()
   const { mutate: setArmorBreaking, isPending: isSettingArmor } = useSetArmorBreaking()
+  const { data: proPlusProxyGateData } = useProPlusProxyGate()
+  const { mutate: setProPlusProxyGate, isPending: isSettingProPlusProxyGate } = useSetProPlusProxyGate()
+  const [proPlusProxyGateEnabled, setProPlusProxyGateEnabled] = useState(true)
+  const [maxAccountsPerProxy, setMaxAccountsPerProxy] = useState('2')
   const { data: maxRelayData } = useMaxRelay()
   const { mutate: setMaxRelay, isPending: isSettingMaxRelay } = useSetMaxRelay()
   const [maxRelayEnabled, setMaxRelayEnabled] = useState(false)
@@ -106,6 +112,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
       setMaxRelayApiKey(maxRelayData.apiKey)
     }
   }, [maxRelayData])
+
+  useEffect(() => {
+    if (proPlusProxyGateData) {
+      setProPlusProxyGateEnabled(proPlusProxyGateData.enabled)
+      setMaxAccountsPerProxy(String(proPlusProxyGateData.maxAccountsPerProxy))
+    }
+  }, [proPlusProxyGateData])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -582,6 +595,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  const handleProPlusProxyGateSave = () => {
+    const parsed = Number(maxAccountsPerProxy)
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      toast.error('每个代理账号数必须是大于 0 的整数')
+      return
+    }
+    setProPlusProxyGate(
+      { enabled: proPlusProxyGateEnabled, maxAccountsPerProxy: parsed },
+      {
+        onSuccess: () => {
+          toast.success(proPlusProxyGateEnabled ? 'PRO+ 代理门禁已开启' : 'PRO+ 代理门禁已关闭')
+        },
+        onError: (error) => {
+          toast.error(`保存失败: ${extractErrorMessage(error)}`)
+        }
+      }
+    )
+  }
+
   // 保存 CC Test 透传配置
   const handleMaxRelaySave = () => {
     const baseUrl = maxRelayBaseUrl.trim()
@@ -748,6 +780,55 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </CardContent>
           </Card>
         </div>
+
+        {/* PRO+ 账号级代理门禁 */}
+        <Card className="mb-6">
+          <CardContent className="py-4">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Network className="h-4 w-4 text-muted-foreground" />
+                  <span className="text-sm font-medium">PRO+ 账号级代理门禁</span>
+                  <Badge variant={proPlusProxyGateEnabled ? 'success' : 'secondary'}>
+                    {proPlusProxyGateEnabled ? '默认保护中' : '已关闭'}
+                  </Badge>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  开启后，KIRO PRO+ 必须自动领取并验证账号级代理；代理容量不足时保持禁用。
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-2 text-sm">
+                  <Switch
+                    checked={proPlusProxyGateEnabled}
+                    onCheckedChange={setProPlusProxyGateEnabled}
+                    disabled={isSettingProPlusProxyGate}
+                  />
+                  启用门禁
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  每个代理账号数
+                  <Input
+                    type="number"
+                    min="1"
+                    step="1"
+                    className="h-8 w-20"
+                    value={maxAccountsPerProxy}
+                    onChange={(event) => setMaxAccountsPerProxy(event.target.value)}
+                    disabled={isSettingProPlusProxyGate}
+                  />
+                </label>
+                <Button
+                  size="sm"
+                  onClick={handleProPlusProxyGateSave}
+                  disabled={isSettingProPlusProxyGate}
+                >
+                  {isSettingProPlusProxyGate ? '保存中...' : '保存'}
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
 
         {/* 全局默认 RPM 配置 */}
         <Card className="mb-6">

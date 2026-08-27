@@ -441,6 +441,14 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                if Self::is_upstream_security_suspension(&body) {
+                    let has_available = self.token_manager.report_upstream_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {}", detail);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {}", detail));
+                    continue;
+                }
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -741,6 +749,14 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                if Self::is_upstream_security_suspension(&body) {
+                    let has_available = self.token_manager.report_upstream_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("{} API 请求失败（所有凭据已用尽）: {}", api_type, detail);
+                    }
+                    last_error = Some(anyhow::anyhow!("{} API 请求失败: {}", api_type, detail));
+                    continue;
+                }
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -888,6 +904,10 @@ impl KiroProvider {
             Some(402..=499) => UpstreamFailureClass::Upstream4xx,
             _ => UpstreamFailureClass::UpstreamOther,
         }
+    }
+
+    fn is_upstream_security_suspension(body: &str) -> bool {
+        body.contains("temporarily is suspended") && body.contains("security precaution")
     }
 
     fn safe_body_summary(body: &str) -> SafeBodySummary {
@@ -1145,6 +1165,19 @@ mod tests {
             .as_str(),
             "quota_exhausted"
         );
+    }
+
+    #[test]
+    fn test_detects_only_explicit_kiro_security_suspension() {
+        assert!(KiroProvider::is_upstream_security_suspension(
+            "Your User ID (example) temporarily is suspended. We've locked your account as a security precaution."
+        ));
+        assert!(!KiroProvider::is_upstream_security_suspension(
+            "The bearer token included in the request is invalid"
+        ));
+        assert!(!KiroProvider::is_upstream_security_suspension(
+            "Access denied for this model"
+        ));
     }
 
     #[test]

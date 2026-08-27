@@ -17,6 +17,8 @@ import type {
   SetDefaultRpmRequest,
   MaxRelayResponse,
   SetMaxRelayRequest,
+  ProPlusProxyGateResponse,
+  SetProPlusProxyGateRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -179,6 +181,18 @@ export async function getArmorBreaking(): Promise<{ enabled: boolean }> {
 // 设置破甲模式
 export async function setArmorBreaking(enabled: boolean): Promise<{ enabled: boolean }> {
   const { data } = await api.put<{ enabled: boolean }>('/config/armor-breaking', { enabled })
+  return data
+}
+
+export async function getProPlusProxyGate(): Promise<ProPlusProxyGateResponse> {
+  const { data } = await api.get<ProPlusProxyGateResponse>('/config/pro-plus-proxy-gate')
+  return data
+}
+
+export async function setProPlusProxyGate(
+  req: SetProPlusProxyGateRequest
+): Promise<ProPlusProxyGateResponse> {
+  const { data } = await api.put<ProPlusProxyGateResponse>('/config/pro-plus-proxy-gate', req)
   return data
 }
 

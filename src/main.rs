@@ -175,9 +175,47 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
+            let quota_events = token_manager.subscribe_quota_exhausted();
+            let stable_disabled_events = token_manager.subscribe_stable_disabled();
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let rotation_service = admin_state.service.clone();
+            tokio::spawn(rotation_service.run_quota_rotation_worker(quota_events));
+            let quota_guard_service = admin_state.service.clone();
+            tokio::spawn(quota_guard_service.run_pro_plus_quota_guard());
+            let disabled_release_service = admin_state.service.clone();
+            tokio::spawn(
+                disabled_release_service
+                    .run_stable_disabled_proxy_release_worker(stable_disabled_events),
+            );
+            let reconcile_service = admin_state.service.clone();
+            tokio::spawn(async move {
+                match reconcile_service.retire_cached_nonviable_pool_credentials() {
+                    Ok(retired) => tracing::info!(retired, "代理池历史额度失效账号启动收口完成"),
+                    Err(error) => tracing::warn!("代理池历史额度失效账号启动收口失败: {}", error),
+                }
+                match reconcile_service.release_stale_disabled_proxy_bindings() {
+                    Ok(released) => {
+                        tracing::info!(released, "历史稳定禁用账号代理启动释放完成")
+                    }
+                    Err(error) => {
+                        tracing::warn!("历史稳定禁用账号代理启动释放失败: {}", error)
+                    }
+                }
+                match reconcile_service.reconcile_pending_pro_plus().await {
+                    Ok((enabled, pending)) => tracing::info!(
+                        "PRO+ 代理等待队列启动收口完成: enabled={} pending={}",
+                        enabled,
+                        pending
+                    ),
+                    Err(error) => tracing::warn!("PRO+ 代理等待队列启动收口失败: {}", error),
+                }
+                match reconcile_service.backfill_disabled_reasons().await {
+                    Ok(backfilled) => tracing::info!(backfilled, "历史禁用账号原因回填完成"),
+                    Err(error) => tracing::warn!("历史禁用账号原因回填失败: {}", error),
+                }
+            });
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
