@@ -447,7 +447,6 @@ async fn refresh_idc_token(
         os_name, node_version
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -455,24 +454,41 @@ async fn refresh_idc_token(
         grant_type: "refresh_token".to_string(),
     };
 
-    let response = match client
-        .post(&refresh_url)
-        .header("content-type", "application/json")
-        .header("x-amz-user-agent", x_amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=4")
-        .header("Connection", "close")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            let error_message = err.to_string();
-            log_token_refresh_failure(credentials, "idc", None, &error_message, true);
-            return Err(err.into());
+    // OIDC 偶发 stale connection / DNS 状态会让 reqwest 在 send 阶段失败。
+    // 仅网络错误重试一次，并重建 Client；HTTP 4xx/5xx 不在这里重试。
+    let response = {
+        let mut attempt = 1;
+        loop {
+            let client = build_client(proxy, 60, config.tls_backend)?;
+            match client
+                .post(&refresh_url)
+                .header("content-type", "application/json")
+                .header("x-amz-user-agent", x_amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", format!("oidc.{}.amazonaws.com", region))
+                .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+                .header("amz-sdk-request", format!("attempt={}; max=2", attempt))
+                .header("Connection", "close")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(response) => break response,
+                Err(err) if attempt < 2 => {
+                    tracing::warn!(
+                        attempt,
+                        error = %err,
+                        "IdC Token 刷新网络错误，重建 Client 后重试"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                Err(err) => {
+                    let error_message = err.to_string();
+                    log_token_refresh_failure(credentials, "idc", None, &error_message, true);
+                    return Err(err.into());
+                }
+            }
         }
     };
 
