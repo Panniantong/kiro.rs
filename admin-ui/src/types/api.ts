@@ -100,6 +100,12 @@ export interface CredentialProxyTestResponse {
   testedAt: string
 }
 
+export interface BatchUpdateCredentialsRequest {
+  ids: number[]
+  importNote?: string
+  priority?: number
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string

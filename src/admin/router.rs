@@ -9,7 +9,8 @@ use super::{
     handlers::{
         add_credential, add_proxy_pool_entries, assign_credential_proxy_from_pool,
         batch_set_credential_proxy, batch_set_credential_rpm, batch_test_credential_proxy,
-        delete_credential, force_refresh_token, get_all_credentials, get_armor_breaking,
+        batch_update_credentials, delete_credential, force_refresh_token, get_all_credentials,
+        get_armor_breaking,
         get_credential_balance, get_default_rpm, get_load_balancing_mode, get_max_relay,
         get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool,
         remove_proxy_pool_entries, reset_failure_count, set_armor_breaking,
@@ -75,6 +76,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/rpm", post(set_credential_rpm))
         .route("/credentials/batch-rpm", post(batch_set_credential_rpm))
+        .route("/credentials/batch-update", post(batch_update_credentials))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

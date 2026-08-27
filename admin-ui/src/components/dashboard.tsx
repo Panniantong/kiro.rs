@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, Activity, LayoutGrid, Table2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, Activity, LayoutGrid, Table2, Shuffle, PencilLine } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -11,6 +11,7 @@ import { CredentialCompactTable } from '@/components/credential-compact-table'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
+import { BatchEditDialog } from '@/components/batch-edit-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import {
@@ -54,6 +55,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
+  const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
@@ -255,13 +257,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 选择管理
   const toggleSelect = (id: number) => {
-    const newSelected = new Set(selectedIds)
-    if (newSelected.has(id)) {
-      newSelected.delete(id)
-    } else {
-      newSelected.add(id)
-    }
-    setSelectedIds(newSelected)
+    setSelectedIds(previous => {
+      const next = new Set(previous)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }
+
+  const invertCurrentViewSelection = () => {
+    setSelectedIds(previous => {
+      const next = new Set(previous)
+      currentCredentials.forEach(credential => {
+        if (next.has(credential.id)) {
+          next.delete(credential.id)
+        } else {
+          next.add(credential.id)
+        }
+      })
+      return next
+    })
   }
 
   const deselectAll = () => {
@@ -1083,6 +1101,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <div className="flex flex-wrap justify-end gap-2">
               {selectedIds.size > 0 && (
                 <>
+                  <Button onClick={invertCurrentViewSelection} size="sm" variant="outline">
+                    <Shuffle className="h-4 w-4 mr-2" />
+                    反选当前视图
+                  </Button>
+                  <Button onClick={() => setBatchEditDialogOpen(true)} size="sm" variant="outline">
+                    <PencilLine className="h-4 w-4 mr-2" />
+                    批量编辑
+                  </Button>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
@@ -1246,6 +1272,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+      />
+
+      <BatchEditDialog
+        open={batchEditDialogOpen}
+        onOpenChange={setBatchEditDialogOpen}
+        credentialIds={Array.from(selectedIds)}
+        onCompleted={deselectAll}
       />
 
       {/* 批量验活对话框 */}

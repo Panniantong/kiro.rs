@@ -11,7 +11,8 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
         BatchCredentialIdsRequest, BatchSetCredentialProxyRequest, BatchSetRpmRequest,
-        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
+        BatchUpdateCredentialsRequest, RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
+        SetCredentialProxyRequest,
         SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetProPlusProxyGateRequest,
         SetRpmRequest, SuccessResponse,
@@ -308,6 +309,21 @@ pub async fn batch_set_credential_rpm(
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-update
+/// 批量更新凭据备注和/或优先级。
+pub async fn batch_update_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchUpdateCredentialsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .batch_update_credentials(&payload.ids, payload.import_note, payload.priority)
+    {
+        Ok(count) => Json(SuccessResponse::new(format!("已更新 {} 个凭据", count))).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

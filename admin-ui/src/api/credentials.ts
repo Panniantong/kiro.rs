@@ -8,6 +8,7 @@ import type {
   SetPriorityRequest,
   SetCredentialProxyRequest,
   BatchSetCredentialProxyRequest,
+  BatchUpdateCredentialsRequest,
   CredentialProxyTestResponse,
   AddCredentialRequest,
   AddCredentialResponse,
@@ -82,6 +83,14 @@ export async function batchSetCredentialProxy(
   req: BatchSetCredentialProxyRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>('/credentials/batch-proxy', req)
+  return data
+}
+
+// 批量更新凭据备注和/或优先级。
+export async function batchUpdateCredentials(
+  req: BatchUpdateCredentialsRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/batch-update', req)
   return data
 }
 

@@ -1815,6 +1815,21 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))
     }
 
+    /// 批量更新多个凭据的备注和/或优先级。
+    pub fn batch_update_credentials(
+        &self,
+        ids: &[u64],
+        import_note: Option<String>,
+        priority: Option<u32>,
+    ) -> Result<usize, AdminServiceError> {
+        let import_note = import_note
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.token_manager
+            .batch_update_credentials(ids, import_note, priority)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))
+    }
+
     /// 获取全局默认 RPM
     pub fn get_default_rpm(&self) -> DefaultRpmResponse {
         DefaultRpmResponse {

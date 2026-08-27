@@ -410,6 +410,20 @@ pub struct BatchSetRpmRequest {
     pub rpm: Option<u32>,
 }
 
+/// 批量更新凭据备注和/或优先级。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchUpdateCredentialsRequest {
+    /// 目标凭据 ID 列表。
+    pub ids: Vec<u64>,
+    /// 新备注；缺省表示不修改。传入后会覆盖原 importNote。
+    #[serde(default)]
+    pub import_note: Option<String>,
+    /// 新优先级；缺省表示不修改。
+    #[serde(default)]
+    pub priority: Option<u32>,
+}
+
 /// 全局默认 RPM 响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
