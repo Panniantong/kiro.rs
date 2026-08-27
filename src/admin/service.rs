@@ -1822,12 +1822,29 @@ impl AdminService {
         import_note: Option<String>,
         priority: Option<u32>,
     ) -> Result<usize, AdminServiceError> {
+        if ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
         let import_note = import_note
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        if import_note.is_none() && priority.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "备注和优先级至少需要提供一项".to_string(),
+            ));
+        }
         self.token_manager
             .batch_update_credentials(ids, import_note, priority)
-            .map_err(|error| AdminServiceError::InternalError(error.to_string()))
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("凭据不存在") || message.contains("至少需要") {
+                    AdminServiceError::InvalidCredential(message)
+                } else {
+                    AdminServiceError::InternalError(message)
+                }
+            })
     }
 
     /// 获取全局默认 RPM
