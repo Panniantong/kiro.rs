@@ -96,9 +96,11 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
-    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// Client 缓存：key = (credential id, effective proxy config)。
+    ///
+    /// 每个凭据使用独立连接池，避免所有账号共享一条 HTTP/2 连接并在高并发下
+    /// 触发单连接 stream 排队；同一凭据仍会稳定复用自己的 Client。
+    client_cache: Mutex<HashMap<(u64, Option<ProxyConfig>), Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -109,16 +111,22 @@ pub struct KiroProvider {
 
 pub type KiroByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
-pub struct KiroStreamResponse {
-    response: reqwest::Response,
+/// 一次需要由响应语义确认结果的流式上游尝试。
+///
+/// 未显式确认成功或空流时，析构会按“请求未完成”释放 in-flight，覆盖下游取消、
+/// Body 被丢弃等无法走到 EOF 的路径。`active` 保证每个预留最多结算一次。
+pub struct DeferredStreamAttempt {
+    token_manager: Arc<MultiTokenManager>,
     credential_id: u64,
+    active: bool,
 }
 
-impl KiroStreamResponse {
-    fn new(response: reqwest::Response, credential_id: u64) -> Self {
+impl DeferredStreamAttempt {
+    fn new(token_manager: Arc<MultiTokenManager>, credential_id: u64) -> Self {
         Self {
-            response,
+            token_manager,
             credential_id,
+            active: true,
         }
     }
 
@@ -126,8 +134,75 @@ impl KiroStreamResponse {
         self.credential_id
     }
 
+    pub fn confirm_success(&mut self) {
+        if self.active {
+            self.token_manager.report_success(self.credential_id);
+            self.active = false;
+        }
+    }
+
+    pub fn report_empty_retry(&mut self) -> bool {
+        if !self.active {
+            return self.token_manager.available_count() > 0;
+        }
+        let available = self.token_manager.report_transient_cooldown(
+            self.credential_id,
+            Duration::from_secs(1),
+            "上游 2xx 空流",
+        );
+        self.active = false;
+        available
+    }
+}
+
+impl Drop for DeferredStreamAttempt {
+    fn drop(&mut self) {
+        if self.active {
+            self.token_manager
+                .report_attempt_finished_without_success(self.credential_id);
+            self.active = false;
+        }
+    }
+}
+
+pub struct KiroStreamResponse {
+    response: reqwest::Response,
+    deferred_attempt: Option<DeferredStreamAttempt>,
+}
+
+impl KiroStreamResponse {
+    fn new(response: reqwest::Response, _credential_id: u64) -> Self {
+        Self {
+            response,
+            deferred_attempt: None,
+        }
+    }
+
+    fn new_deferred(
+        response: reqwest::Response,
+        credential_id: u64,
+        token_manager: Arc<MultiTokenManager>,
+    ) -> Self {
+        Self {
+            response,
+            deferred_attempt: Some(DeferredStreamAttempt::new(token_manager, credential_id)),
+        }
+    }
+
     pub fn bytes_stream(self) -> KiroByteStream {
         Box::pin(self.response.bytes_stream())
+    }
+
+    pub fn into_deferred_parts(self) -> (KiroByteStream, DeferredStreamAttempt) {
+        let Self {
+            response,
+            deferred_attempt,
+            ..
+        } = self;
+        (
+            Box::pin(response.bytes_stream()),
+            deferred_attempt.expect("deferred stream response must carry an attempt lease"),
+        )
     }
 }
 
@@ -151,16 +226,11 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client
-        let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
-        let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
 
         Self {
             token_manager,
             global_proxy: proxy,
-            client_cache: Mutex::new(cache),
+            client_cache: Mutex::new(HashMap::new()),
             tls_backend,
             endpoints,
             default_endpoint,
@@ -174,13 +244,17 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let credential_id = credentials
+            .id
+            .ok_or_else(|| anyhow::anyhow!("凭据缺少 ID，无法创建独立 HTTP 客户端"))?;
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let cache_key = (credential_id, effective.clone());
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&cache_key) {
             return Ok(client.clone());
         }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        cache.insert(cache_key, client.clone());
         Ok(client)
     }
 
@@ -218,28 +292,23 @@ impl KiroProvider {
 
     /// 发送需要在流结束后确认语义成功的流式请求。
     ///
-    /// HTTP 2xx 只说明上游接受了请求，不代表流里有可交付内容。调用方必须在
-    /// 验证到非空文本或完整 tool_use 后调用 [`Self::report_stream_success`]；空流
-    /// 或读取失败则调用 [`Self::report_empty_stream_retry`] 释放本次 in-flight。
+    /// HTTP 2xx 只说明上游接受了请求，不代表流里有可交付内容。返回值携带
+    /// [`DeferredStreamAttempt`]；调用方验证到非空文本或完整 tool_use 后确认成功，
+    /// 空流或读取失败则报告重试。若下游取消导致返回值被丢弃，租约会自动释放
+    /// 本次 in-flight。
     pub async fn call_api_stream_deferred(
         &self,
         request_body: &str,
     ) -> anyhow::Result<KiroStreamResponse> {
         self.call_api_with_retry(request_body, true, false)
             .await
-            .map(|(response, credential_id)| KiroStreamResponse::new(response, credential_id))
-    }
-
-    pub fn report_stream_success(&self, credential_id: u64) {
-        self.token_manager.report_success(credential_id);
-    }
-
-    pub fn report_empty_stream_retry(&self, credential_id: u64) -> bool {
-        self.token_manager.report_transient_cooldown(
-            credential_id,
-            Duration::from_secs(1),
-            "上游 2xx 空流",
-        )
+            .map(|(response, credential_id)| {
+                KiroStreamResponse::new_deferred(
+                    response,
+                    credential_id,
+                    self.token_manager.clone(),
+                )
+            })
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -1224,6 +1293,34 @@ mod tests {
         assert!(summary.truncated);
     }
 
+    #[test]
+    fn test_http_clients_are_isolated_by_credential() {
+        let config = Config::default();
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                base_url: "http://127.0.0.1".to_string(),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "test".into());
+
+        let first = KiroCredentials {
+            id: Some(1),
+            ..Default::default()
+        };
+        let second = KiroCredentials {
+            id: Some(2),
+            ..Default::default()
+        };
+
+        provider.client_for(&first).unwrap();
+        provider.client_for(&second).unwrap();
+
+        assert_eq!(provider.client_cache.lock().len(), 2);
+    }
+
     async fn rate_limit_first_credential(headers: HeaderMap) -> Response {
         let token = headers
             .get("x-test-token")
@@ -1292,9 +1389,11 @@ mod tests {
         });
 
         let config = Config::default();
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("token".to_string());
-        cred.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        let cred = KiroCredentials {
+            access_token: Some("token".to_string()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
 
         let manager =
             Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
@@ -1308,11 +1407,47 @@ mod tests {
         let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
 
         let response = provider.call_api_stream_deferred("{}").await.unwrap();
-        let credential_id = response.credential_id();
+        let (_body_stream, mut attempt) = response.into_deferred_parts();
         assert_eq!(manager.snapshot().entries[0].success_count, 0);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 1);
 
-        provider.report_stream_success(credential_id);
+        attempt.confirm_success();
         assert_eq!(manager.snapshot().entries[0].success_count, 1);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn test_dropping_deferred_stream_attempt_releases_in_flight_slot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api", post(always_ok));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = Config::default();
+        let cred = KiroCredentials {
+            access_token: Some("token".to_string()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint {
+                base_url: format!("http://{}", addr),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
+
+        let response = provider.call_api_stream_deferred("{}").await.unwrap();
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 1);
+        drop(response);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+        assert_eq!(manager.snapshot().entries[0].success_count, 0);
     }
 
     #[tokio::test]

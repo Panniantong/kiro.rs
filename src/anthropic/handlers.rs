@@ -10,7 +10,9 @@ use std::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::provider::{KiroByteStream, KiroProvider, KiroStreamResponse};
+use crate::kiro::provider::{
+    DeferredStreamAttempt, KiroByteStream, KiroProvider, KiroStreamResponse,
+};
 use crate::kiro::token_manager::AllRateLimitedError;
 use crate::model::config::MaxRelayConfig;
 use crate::token;
@@ -394,6 +396,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    force_adaptive_summarized_thinking(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -431,6 +434,9 @@ pub async fn post_messages(
                     "invalid_request_error",
                     format!("reasoning effort 不支持: {}", effort),
                 ),
+                ConversionError::UnsupportedAttachment(message) => {
+                    ("invalid_request_error", message.clone())
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -654,9 +660,10 @@ enum EmptyStreamRetryState {
         body_stream: KiroByteStream,
         ctx: BufferedStreamContext,
         decoder: EventStreamDecoder,
-        credential_id: u64,
+        attempt: DeferredStreamAttempt,
         remaining_attempts: usize,
         ping_interval: Interval,
+        gate_open: bool,
     },
     Done,
 }
@@ -686,14 +693,15 @@ fn reading_state_for_response(
     ctx: BufferedStreamContext,
     remaining_attempts: usize,
 ) -> EmptyStreamRetryState {
-    let credential_id = response.credential_id();
+    let (body_stream, attempt) = response.into_deferred_parts();
     EmptyStreamRetryState::Reading {
-        body_stream: response.bytes_stream(),
+        body_stream,
         ctx,
         decoder: EventStreamDecoder::new(),
-        credential_id,
+        attempt,
         remaining_attempts,
         ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        gate_open: false,
     }
 }
 
@@ -768,9 +776,10 @@ fn create_retrying_buffered_sse_stream(
                     mut body_stream,
                     mut ctx,
                     mut decoder,
-                    credential_id,
+                    mut attempt,
                     remaining_attempts,
                     mut ping_interval,
+                    gate_open,
                 } => {
                     tokio::select! {
                         _ = ping_interval.tick() => {
@@ -780,9 +789,10 @@ fn create_retrying_buffered_sse_stream(
                                     body_stream,
                                     ctx,
                                     decoder,
-                                    credential_id,
+                                    attempt,
                                     remaining_attempts,
                                     ping_interval,
+                                    gate_open,
                                 },
                             ))
                         }
@@ -806,37 +816,65 @@ fn create_retrying_buffered_sse_stream(
                                         }
                                     }
 
+                                    let mut gate_open = gate_open;
+                                    let events = if gate_open {
+                                        ctx.take_buffered_events()
+                                    } else if ctx.has_deliverable_output() {
+                                        attempt.confirm_success();
+                                        gate_open = true;
+                                        ctx.take_buffered_events()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let bytes = events
+                                        .into_iter()
+                                        .map(|event| Ok(Bytes::from(event.to_sse_string())))
+                                        .collect();
+
                                     Some((
-                                        Vec::new(),
+                                        bytes,
                                         EmptyStreamRetryState::Reading {
                                             body_stream,
                                             ctx,
                                             decoder,
-                                            credential_id,
+                                            attempt,
                                             remaining_attempts,
                                             ping_interval,
+                                            gate_open,
                                         },
                                     ))
                                 }
                                 Some(Err(e)) => {
+                                    let credential_id = attempt.credential_id();
                                     tracing::warn!(credential_id, error = %e, "读取保护流失败，准备重试");
-                                    provider.report_empty_stream_retry(credential_id);
-                                    let remaining_attempts = remaining_attempts.saturating_sub(1);
-                                    if remaining_attempts == 0 {
+                                    if gate_open {
+                                        let bytes = ctx
+                                            .finish_and_get_all_events()
+                                            .into_iter()
+                                            .map(|event| Ok(Bytes::from(event.to_sse_string())))
+                                            .collect();
                                         Some((
-                                            vec![Ok(create_upstream_unavailable_sse())],
+                                            bytes,
                                             EmptyStreamRetryState::Done,
                                         ))
                                     } else {
-                                        Some((
-                                            Vec::new(),
-                                            EmptyStreamRetryState::Start { remaining_attempts },
-                                        ))
+                                        attempt.report_empty_retry();
+                                        let remaining_attempts = remaining_attempts.saturating_sub(1);
+                                        if remaining_attempts == 0 {
+                                            Some((
+                                                vec![Ok(create_upstream_unavailable_sse())],
+                                                EmptyStreamRetryState::Done,
+                                            ))
+                                        } else {
+                                            Some((
+                                                Vec::new(),
+                                                EmptyStreamRetryState::Start { remaining_attempts },
+                                            ))
+                                        }
                                     }
                                 }
                                 None => {
-                                    if ctx.has_deliverable_output() {
-                                        provider.report_stream_success(credential_id);
+                                    if gate_open {
                                         let all_events = ctx.finish_and_get_all_events();
                                         let bytes = all_events
                                             .into_iter()
@@ -844,8 +882,9 @@ fn create_retrying_buffered_sse_stream(
                                             .collect();
                                         Some((bytes, EmptyStreamRetryState::Done))
                                     } else {
+                                        let credential_id = attempt.credential_id();
                                         tracing::warn!(credential_id, "上游 2xx 流结束但没有可交付内容，准备重试");
-                                        provider.report_empty_stream_retry(credential_id);
+                                        attempt.report_empty_retry();
                                         let remaining_attempts = remaining_attempts.saturating_sub(1);
                                         if remaining_attempts == 0 {
                                             Some((
@@ -974,11 +1013,25 @@ fn rewrite_non_stream_kiro_identity_response(text_content: &mut String) -> bool 
     true
 }
 
+#[derive(Default)]
+struct UpstreamReasoningBlock {
+    text: String,
+    signature: Option<String>,
+}
+
+fn push_reasoning_block_if_present(
+    blocks: &mut Vec<UpstreamReasoningBlock>,
+    current: &mut UpstreamReasoningBlock,
+) {
+    if !current.text.is_empty() || current.signature.is_some() {
+        blocks.push(std::mem::take(current));
+    }
+}
+
 /// 处理非流式请求
 fn build_non_stream_content_blocks(
     text_content: String,
-    reasoning_content: String,
-    reasoning_signature: Option<String>,
+    reasoning_blocks: Vec<UpstreamReasoningBlock>,
     tool_uses: Vec<serde_json::Value>,
     thinking_enabled: bool,
     emit_thinking_text: bool,
@@ -987,16 +1040,24 @@ fn build_non_stream_content_blocks(
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        if !reasoning_content.is_empty() || reasoning_signature.is_some() {
-            if emit_thinking_text {
+        if !reasoning_blocks.is_empty() {
+            for reasoning_block in reasoning_blocks {
+                let upstream_signature = reasoning_block
+                    .signature
+                    .filter(|signature| !signature.is_empty());
+                if !emit_thinking_text && upstream_signature.is_none() {
+                    continue;
+                }
                 let mut thinking_block = json!({
                     "type": "thinking",
-                    "thinking": reasoning_content
+                    "thinking": if emit_thinking_text {
+                        reasoning_block.text
+                    } else {
+                        String::new()
+                    }
                 });
 
-                if let Some(signature) =
-                    reasoning_signature.filter(|signature| !signature.is_empty())
-                {
+                if let Some(signature) = upstream_signature {
                     if let Some(obj) = thinking_block.as_object_mut() {
                         obj.insert("signature".to_string(), json!(signature));
                     }
@@ -1081,8 +1142,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
-    let mut reasoning_content = String::new();
-    let mut reasoning_signature: Option<String> = None;
+    let mut reasoning_blocks: Vec<UpstreamReasoningBlock> = Vec::new();
+    let mut current_reasoning = UpstreamReasoningBlock::default();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -1104,14 +1165,26 @@ async fn handle_non_stream_request(
                         Event::ReasoningContent(reasoning) => {
                             if thinking_enabled {
                                 if !reasoning.text.is_empty() {
-                                    reasoning_content.push_str(&reasoning.text);
+                                    if current_reasoning.signature.is_some() {
+                                        push_reasoning_block_if_present(
+                                            &mut reasoning_blocks,
+                                            &mut current_reasoning,
+                                        );
+                                    }
+                                    current_reasoning.text.push_str(&reasoning.text);
                                 }
-                                if !reasoning.signature.is_empty() {
-                                    reasoning_signature = Some(reasoning.signature);
+                                if !reasoning.signature.is_empty()
+                                    && current_reasoning.signature.is_none()
+                                {
+                                    current_reasoning.signature = Some(reasoning.signature);
                                 }
                             }
                         }
                         Event::ToolUse(tool_use) => {
+                            push_reasoning_block_if_present(
+                                &mut reasoning_blocks,
+                                &mut current_reasoning,
+                            );
                             has_tool_use = true;
 
                             // 累积工具的 JSON 输入
@@ -1180,6 +1253,8 @@ async fn handle_non_stream_request(
         }
     }
 
+    push_reasoning_block_if_present(&mut reasoning_blocks, &mut current_reasoning);
+
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
@@ -1199,8 +1274,7 @@ async fn handle_non_stream_request(
 
     let content = build_non_stream_content_blocks(
         text_content,
-        reasoning_content,
-        reasoning_signature,
+        reasoning_blocks,
         tool_uses,
         thinking_enabled,
         emit_thinking_text,
@@ -1291,6 +1365,42 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
+/// 新版 Opus / Sonnet 数据交付需要可见的 Thinking 正文。无论调用方是否省略 Thinking，
+/// 或明确请求 enabled、disabled、omitted，都统一覆写为 adaptive + summarized。
+/// budget_tokens 对 adaptive 模式不会传给上游；已有 effort 保持不变。
+fn force_adaptive_summarized_thinking(payload: &mut MessagesRequest) {
+    let model = payload.model.to_ascii_lowercase();
+    let supports_adaptive_summarized = model.contains("opus")
+        || model.contains("sonnet-5")
+        || model.contains("sonnet5")
+        || model.contains("5-sonnet")
+        || model.contains("sonnet-4-6")
+        || model.contains("sonnet-4.6");
+    if !supports_adaptive_summarized {
+        return;
+    }
+
+    let thinking = payload.thinking.get_or_insert_with(|| Thinking {
+        thinking_type: "adaptive".to_string(),
+        display: Some("summarized".to_string()),
+        budget_tokens: 20000,
+    });
+    thinking.thinking_type = "adaptive".to_string();
+    thinking.display = Some("summarized".to_string());
+
+    if payload.output_config.is_none() {
+        payload.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+            format: None,
+        });
+    }
+
+    tracing::info!(
+        model = %payload.model,
+        "请求已强制启用 adaptive + summarized Thinking"
+    );
+}
+
 fn should_emit_thinking_text(_model: &str, thinking: Option<&Thinking>) -> bool {
     let Some(thinking) = thinking.filter(|thinking| thinking.is_enabled()) else {
         return false;
@@ -1356,175 +1466,18 @@ fn has_claude_code_headers(headers: &HeaderMap) -> bool {
         || headers.contains_key("x-claude-code-session-id")
 }
 
-fn signature_mode_for_request(
-    thinking: Option<&Thinking>,
-    is_claude_code_request: bool,
-) -> SignatureMode {
-    if !should_forward_reasoning_signature(thinking, is_claude_code_request) {
-        return SignatureMode::Disabled;
-    }
-
-    if is_claude_code_request {
-        return SignatureMode::Passthrough;
-    }
-
-    match thinking.and_then(|thinking| thinking.display.as_deref()) {
-        Some("summarized") | Some("omitted") => SignatureMode::HvoyApiCheck,
-        _ => SignatureMode::Passthrough,
+fn signature_mode_for_request(thinking: Option<&Thinking>) -> SignatureMode {
+    match thinking.filter(|thinking| thinking.is_enabled()) {
+        Some(_) => SignatureMode::Passthrough,
+        None => SignatureMode::Disabled,
     }
 }
 
 fn signature_mode_for_messages_request(
     payload: &MessagesRequest,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
 ) -> SignatureMode {
-    signature_mode_for_messages_request_for_endpoint(payload, headers, false)
-}
-
-fn signature_mode_for_messages_request_for_endpoint(
-    payload: &MessagesRequest,
-    headers: &HeaderMap,
-    force_claude_code_request: bool,
-) -> SignatureMode {
-    let request_is_claude_code = force_claude_code_request
-        || is_claude_code_request(payload)
-        || has_claude_code_headers(headers);
-
-    if let Some(mode) = hvoy_api_check_signature_mode(payload, request_is_claude_code) {
-        return mode;
-    }
-
-    signature_mode_for_request(payload.thinking.as_ref(), request_is_claude_code)
-}
-
-fn hvoy_api_check_signature_mode(
-    payload: &MessagesRequest,
-    request_is_claude_code: bool,
-) -> Option<SignatureMode> {
-    if !request_is_claude_code || !is_hvoy_api_check_public_model(&payload.model) {
-        return None;
-    }
-
-    let text = messages_text(&payload.messages);
-    if is_hvoy_api_check_signature_probe(payload, &text) {
-        return Some(SignatureMode::HvoyApiCheck);
-    }
-
-    if is_hvoy_api_check_main_probe(payload, &text) {
-        return Some(SignatureMode::Disabled);
-    }
-
-    None
-}
-
-fn is_hvoy_api_check_public_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("claude-sonnet-5")
-        || model.contains("sonnet5")
-        || model.contains("claude-opus-5")
-        || model.contains("opus5")
-        || model.contains("claude-opus-4-8")
-        || model.contains("claude-opus-4-7")
-        || model.contains("claude-opus-4-6")
-        || model.contains("claude-sonnet-4-6")
-        || model.contains("claude-fable-5")
-}
-
-fn is_hvoy_api_check_signature_probe(payload: &MessagesRequest, text: &str) -> bool {
-    payload.thinking.as_ref().is_some_and(|thinking| {
-        thinking.thinking_type == "adaptive"
-            && matches!(thinking.display.as_deref(), Some("summarized"))
-    }) && text.to_ascii_lowercase().contains("sha256")
-        && (text.contains("3次") || text.contains("3 次"))
-        && text.contains("控制输出")
-}
-
-fn is_hvoy_api_check_main_probe(payload: &MessagesRequest, text: &str) -> bool {
-    is_hvoy_api_check_knowledge_probe(text)
-        || is_hvoy_api_check_pdf_probe(payload, text)
-        || is_hvoy_api_check_structured_calc_probe(payload, text)
-        || is_hvoy_api_check_right_quote_identity_probe(payload, text)
-}
-
-fn is_hvoy_api_check_knowledge_probe(text: &str) -> bool {
-    text.contains("请回答下面的近期知识题")
-        && (text.contains("序号|答案") || text.contains("序号｜答案"))
-        && text.contains("不要输出标题")
-}
-
-fn is_hvoy_api_check_pdf_probe(payload: &MessagesRequest, text: &str) -> bool {
-    messages_have_content_block_type(&payload.messages, "document")
-        && text
-            .to_ascii_lowercase()
-            .contains("what text does this pdf contain")
-        && text.contains("不要使用工具")
-}
-
-fn is_hvoy_api_check_structured_calc_probe(payload: &MessagesRequest, text: &str) -> bool {
-    has_expression_result_json_schema(payload)
-        && text.contains("计算")
-        && text.contains("乘以")
-        && text.contains("等于多少")
-}
-
-fn is_hvoy_api_check_right_quote_identity_probe(payload: &MessagesRequest, text: &str) -> bool {
-    payload
-        .thinking
-        .as_ref()
-        .is_some_and(|thinking| thinking.is_enabled())
-        && payload.output_config.is_none()
-        && payload.tools.as_ref().is_none_or(Vec::is_empty)
-        && text.contains("输出中文的这个符号”")
-        && text.contains("仅仅输出")
-        && text.contains("不要说别的")
-}
-
-fn messages_have_content_block_type(messages: &[super::types::Message], block_type: &str) -> bool {
-    messages.iter().any(|message| match &message.content {
-        serde_json::Value::Array(blocks) => blocks.iter().any(|block| {
-            block
-                .get("type")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| value == block_type)
-        }),
-        _ => false,
-    })
-}
-
-fn has_expression_result_json_schema(payload: &MessagesRequest) -> bool {
-    let Some(format) = payload
-        .output_config
-        .as_ref()
-        .and_then(|config| config.format.as_ref())
-    else {
-        return false;
-    };
-
-    if format.format_type != "json_schema" {
-        return false;
-    }
-
-    let Some(schema) = format.schema.as_ref() else {
-        return false;
-    };
-
-    let properties = schema.get("properties").and_then(|value| value.as_object());
-    let has_properties = properties.is_some_and(|properties| {
-        properties.contains_key("expression") && properties.contains_key("result")
-    });
-    let required = schema
-        .get("required")
-        .and_then(|value| value.as_array())
-        .is_some_and(|required| {
-            required
-                .iter()
-                .any(|value| value.as_str() == Some("expression"))
-                && required
-                    .iter()
-                    .any(|value| value.as_str() == Some("result"))
-        });
-
-    has_properties || required
+    signature_mode_for_request(payload.thinking.as_ref())
 }
 
 /// 判断请求是否应透传到 CC Test 上游。
@@ -1858,20 +1811,6 @@ fn summarize_relay_request(raw_body: &Bytes) -> serde_json::Value {
     })
 }
 
-fn should_forward_reasoning_signature(
-    thinking: Option<&Thinking>,
-    is_claude_code_request: bool,
-) -> bool {
-    let Some(thinking) = thinking.filter(|thinking| thinking.is_enabled()) else {
-        return false;
-    };
-
-    match thinking.display.as_deref() {
-        Some("summarized") | Some("omitted") => true,
-        _ => thinking.thinking_type == "enabled" || is_claude_code_request,
-    }
-}
-
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
@@ -1984,6 +1923,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    force_adaptive_summarized_thinking(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -2020,6 +1960,9 @@ pub async fn post_messages_cc(
                     "invalid_request_error",
                     format!("reasoning effort 不支持: {}", effort),
                 ),
+                ConversionError::UnsupportedAttachment(message) => {
+                    ("invalid_request_error", message.clone())
+                }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
@@ -2057,7 +2000,7 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    let signature_mode = signature_mode_for_messages_request_for_endpoint(&payload, &headers, true);
+    let signature_mode = signature_mode_for_messages_request(&payload, &headers);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -2251,8 +2194,167 @@ mod tests {
     use super::*;
     use crate::anthropic::identity_response_guard::{CLAUDE_GREETING, KIRO_GREETING};
     use crate::anthropic::types::MessagesRequest;
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
+    use axum::{Router, routing::post};
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::time::timeout;
+
+    struct DelayedTestEndpoint {
+        base_url: String,
+    }
+
+    impl KiroEndpoint for DelayedTestEndpoint {
+        fn name(&self) -> &'static str {
+            "delayed-test"
+        }
+
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/api", self.base_url)
+        }
+
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/mcp", self.base_url)
+        }
+
+        fn decorate_api(
+            &self,
+            request: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+
+        fn decorate_mcp(
+            &self,
+            request: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    fn append_event_stream_string_header(out: &mut Vec<u8>, name: &str, value: &str) {
+        out.push(name.len() as u8);
+        out.extend_from_slice(name.as_bytes());
+        out.push(7);
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn assistant_response_frame(content: &str) -> Bytes {
+        let mut headers = Vec::new();
+        append_event_stream_string_header(&mut headers, ":message-type", "event");
+        append_event_stream_string_header(&mut headers, ":event-type", "assistantResponseEvent");
+        let payload = serde_json::to_vec(&json!({"content": content})).unwrap();
+        let total_length = 12 + headers.len() + payload.len() + 4;
+
+        let mut frame = Vec::with_capacity(total_length);
+        frame.extend_from_slice(&(total_length as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(&payload);
+        let message_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        Bytes::from(frame)
+    }
+
+    async fn delayed_assistant_stream() -> Response {
+        let chunks = stream::unfold(0, |state| async move {
+            match state {
+                0 => Some((
+                    Ok::<Bytes, Infallible>(assistant_response_frame("first answer")),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Some((
+                        Ok::<Bytes, Infallible>(assistant_response_frame(" tail")),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_emits_first_deliverable_content_before_upstream_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api", post(delayed_assistant_stream));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credential = KiroCredentials {
+            access_token: Some("test-token".to_string()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "delayed-test".to_string(),
+            Arc::new(DelayedTestEndpoint {
+                base_url: format!("http://{addr}"),
+            }),
+        );
+        let provider = Arc::new(KiroProvider::with_proxy(
+            manager.clone(),
+            None,
+            endpoints,
+            "delayed-test".to_string(),
+        ));
+        let response = provider.call_api_stream_deferred("{}").await.unwrap();
+        let guarded = create_retrying_buffered_sse_stream(
+            provider,
+            "{}".to_string(),
+            "claude-opus-5".to_string(),
+            12,
+            false,
+            SignatureMode::Disabled,
+            false,
+            HashMap::new(),
+            None,
+            response,
+        );
+        tokio::pin!(guarded);
+
+        let first_content = timeout(Duration::from_millis(800), async {
+            loop {
+                let item = guarded.next().await.unwrap().unwrap();
+                let text = String::from_utf8(item.to_vec()).unwrap();
+                if text.contains("\"text\":\"first answer\"") {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("first deliverable SSE must arrive before the delayed upstream EOF");
+
+        assert!(first_content.contains("content_block_delta"));
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+        assert_eq!(manager.snapshot().entries[0].success_count, 1);
+    }
 
     #[test]
     fn non_stream_response_guard_rewrites_exact_kiro_greeting() {
@@ -2449,8 +2551,10 @@ mod tests {
     fn test_non_stream_content_includes_upstream_reasoning_signature() {
         let content = build_non_stream_content_blocks(
             "final answer".to_string(),
-            "real upstream thinking".to_string(),
-            Some("real-upstream-signature".to_string()),
+            vec![UpstreamReasoningBlock {
+                text: "real upstream thinking".to_string(),
+                signature: Some("real-upstream-signature".to_string()),
+            }],
             Vec::new(),
             true,
             true,
@@ -2469,8 +2573,10 @@ mod tests {
     fn test_non_stream_content_does_not_fallback_signature_without_upstream_signature() {
         let content = build_non_stream_content_blocks(
             "final answer".to_string(),
-            "real upstream thinking".to_string(),
-            None,
+            vec![UpstreamReasoningBlock {
+                text: "real upstream thinking".to_string(),
+                signature: None,
+            }],
             Vec::new(),
             true,
             true,
@@ -2483,20 +2589,53 @@ mod tests {
     }
 
     #[test]
-    fn test_non_stream_omitted_thinking_suppresses_empty_thinking_block() {
+    fn test_non_stream_omitted_thinking_keeps_upstream_signature() {
         let content = build_non_stream_content_blocks(
             "final answer".to_string(),
-            "hidden upstream thinking".to_string(),
-            Some("real-upstream-signature".to_string()),
+            vec![UpstreamReasoningBlock {
+                text: "hidden upstream thinking".to_string(),
+                signature: Some("real-upstream-signature".to_string()),
+            }],
             Vec::new(),
             true,
             false,
             "claude-opus-4-8",
         );
 
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "final answer");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "");
+        assert_eq!(content[0]["signature"], "real-upstream-signature");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn test_non_stream_keeps_multiple_reasoning_blocks_paired_with_their_signatures() {
+        let content = build_non_stream_content_blocks(
+            "final answer".to_string(),
+            vec![
+                UpstreamReasoningBlock {
+                    text: "thinking-a".to_string(),
+                    signature: Some("signature-a".to_string()),
+                },
+                UpstreamReasoningBlock {
+                    text: "thinking-b".to_string(),
+                    signature: Some("signature-b".to_string()),
+                },
+            ],
+            Vec::new(),
+            true,
+            true,
+            "claude-opus-5",
+        );
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["thinking"], "thinking-a");
+        assert_eq!(content[0]["signature"], "signature-a");
+        assert_eq!(content[1]["thinking"], "thinking-b");
+        assert_eq!(content[1]["signature"], "signature-b");
+        assert_eq!(content[2]["text"], "final answer");
     }
 
     #[test]
@@ -2511,7 +2650,6 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(should_forward_reasoning_signature(Some(&thinking), false));
     }
 
     #[test]
@@ -2526,8 +2664,6 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(!should_forward_reasoning_signature(Some(&thinking), false));
-        assert!(should_forward_reasoning_signature(Some(&thinking), true));
     }
 
     #[test]
@@ -2542,7 +2678,6 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(should_forward_reasoning_signature(Some(&thinking), false));
     }
 
     #[test]
@@ -2557,15 +2692,122 @@ mod tests {
             "claude-opus-4-8",
             Some(&thinking)
         ));
-        assert!(should_forward_reasoning_signature(Some(&thinking), false));
     }
 
     #[test]
-    fn test_signature_mode_uses_hvoy_api_check_for_summarized_non_claude_code() {
+    fn test_force_opus_thinking_summarized_when_missing() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        force_adaptive_summarized_thinking(&mut payload);
+
+        let thinking = payload.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.display.as_deref(), Some("summarized"));
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("high")
+        );
+        assert!(should_emit_thinking_text(&payload.model, Some(thinking)));
+    }
+
+    #[test]
+    fn test_force_opus_thinking_overrides_enabled_and_omitted_with_adaptive_summarized() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "thinking": {"type": "enabled", "display": "omitted", "budget_tokens": 4096},
+            "output_config": {"effort": "medium"},
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        force_adaptive_summarized_thinking(&mut payload);
+
+        let thinking = payload.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.display.as_deref(), Some("summarized"));
+        assert_eq!(thinking.budget_tokens, 4096);
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn test_force_opus_thinking_overrides_disabled() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5",
+            "max_tokens": 128,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        force_adaptive_summarized_thinking(&mut payload);
+
+        let thinking = payload.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.display.as_deref(), Some("summarized"));
+    }
+
+    #[test]
+    fn test_force_adaptive_summarized_thinking_for_sonnet_4_6_and_5() {
+        for model in ["claude-sonnet-4-6", "claude-sonnet-5"] {
+            let mut payload: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "max_tokens": 128,
+                "thinking": {"type": "disabled", "display": "omitted"},
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap();
+
+            force_adaptive_summarized_thinking(&mut payload);
+
+            let thinking = payload.thinking.as_ref().unwrap();
+            assert_eq!(thinking.thinking_type, "adaptive", "model={model}");
+            assert_eq!(
+                thinking.display.as_deref(),
+                Some("summarized"),
+                "model={model}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_force_adaptive_summarized_thinking_does_not_change_older_sonnet() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 128,
+            "thinking": {"type": "adaptive", "display": "omitted", "budget_tokens": 4096},
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        force_adaptive_summarized_thinking(&mut payload);
+
+        let thinking = payload.thinking.as_ref().unwrap();
+        assert_eq!(thinking.display.as_deref(), Some("omitted"));
+        assert!(payload.output_config.is_none());
+    }
+
+    #[test]
+    fn test_signature_mode_uses_passthrough_for_summarized_non_claude_code() {
         let thinking = thinking("enabled", Some("summarized"));
         assert_eq!(
-            signature_mode_for_request(Some(&thinking), false),
-            SignatureMode::HvoyApiCheck
+            signature_mode_for_request(Some(&thinking)),
+            SignatureMode::Passthrough
         );
     }
 
@@ -2573,16 +2815,9 @@ mod tests {
     fn test_signature_mode_uses_passthrough_for_claude_code() {
         let thinking = thinking("enabled", Some("summarized"));
         assert_eq!(
-            signature_mode_for_request(Some(&thinking), true),
+            signature_mode_for_request(Some(&thinking)),
             SignatureMode::Passthrough
         );
-    }
-
-    #[test]
-    fn test_hvoy_api_check_public_model_accepts_sonnet5() {
-        assert!(is_hvoy_api_check_public_model("claude-sonnet-5"));
-        assert!(is_hvoy_api_check_public_model("claude-sonnet-5-thinking"));
-        assert!(is_hvoy_api_check_public_model("sonnet5"));
     }
 
     #[test]
@@ -2613,7 +2848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hvoy_api_check_main_probe_disables_signatures_even_when_claude_code_shaped() {
+    fn test_detector_knowledge_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2636,12 +2871,12 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::Disabled
+            SignatureMode::Passthrough
         );
     }
 
     #[test]
-    fn test_hvoy_api_check_signature_probe_uses_hvoy_signature_mode_even_when_claude_code_shaped() {
+    fn test_detector_signature_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2664,12 +2899,12 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::HvoyApiCheck
+            SignatureMode::Passthrough
         );
     }
 
     #[test]
-    fn test_hvoy_api_check_pdf_probe_disables_signatures() {
+    fn test_detector_pdf_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2695,16 +2930,17 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::Disabled
+            SignatureMode::Passthrough
         );
     }
 
     #[test]
-    fn test_hvoy_api_check_structured_calc_probe_disables_signatures() {
+    fn test_detector_structured_calc_probe_keeps_signature_passthrough() {
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
             "stream": true,
+            "thinking": {"type": "adaptive"},
             "output_config": {
                 "format": {
                     "type": "json_schema",
@@ -2733,7 +2969,7 @@ mod tests {
 
         assert_eq!(
             signature_mode_for_messages_request(&payload, &headers),
-            SignatureMode::Disabled
+            SignatureMode::Passthrough
         );
     }
 
@@ -2778,7 +3014,7 @@ mod tests {
     fn test_signature_mode_keeps_normal_enabled_thinking_passthrough() {
         let thinking = thinking("enabled", None);
         assert_eq!(
-            signature_mode_for_request(Some(&thinking), false),
+            signature_mode_for_request(Some(&thinking)),
             SignatureMode::Passthrough
         );
     }
