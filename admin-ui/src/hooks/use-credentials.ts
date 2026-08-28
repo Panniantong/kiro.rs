@@ -23,6 +23,7 @@ import {
   setProPlusProxyGate,
   getMaxRelay,
   setMaxRelay,
+  getProxyPool,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
@@ -37,6 +38,14 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+export function useProxyPool() {
+  return useQuery({
+    queryKey: ['proxyPool'],
+    queryFn: getProxyPool,
+    refetchInterval: 30000,
   })
 }
 

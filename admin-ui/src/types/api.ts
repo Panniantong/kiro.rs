@@ -145,6 +145,48 @@ export interface AddCredentialResponse {
   proxyPoolEligibility?: ProxyPoolEligibility
 }
 
+export interface ProxyAssignedCredentialStatus {
+  credentialId: number
+  email?: string
+  subscriptionTitle?: string
+  importNote?: string
+  disabled: boolean
+  disabledReason?: string
+  remaining?: number
+  usageLimit?: number
+  balanceCachedAt?: number
+  health: 'healthy' | 'abnormal' | 'unknown'
+}
+
+export interface ProxyPoolEntryStatus {
+  proxyUrl: string
+  assignedCredentialIds: number[]
+  assignedCredentials: ProxyAssignedCredentialStatus[]
+  assignedCount: number
+  remainingSlots: number
+  healthyCount: number
+  abnormalCount: number
+  unknownCount: number
+}
+
+export interface ProxyPoolResponse {
+  maxAccountsPerProxy: number
+  total: number
+  totalCapacity: number
+  assignedSlots: number
+  availableSlots: number
+  emptyProxyCount: number
+  partialProxyCount: number
+  fullProxyCount: number
+  healthyAssignedCount: number
+  abnormalAssignedCount: number
+  unknownAssignedCount: number
+  pendingCredentialCount: number
+  unboundEnabledCount: number
+  emptyReason?: string
+  proxies: ProxyPoolEntryStatus[]
+}
+
 // RPM 限流请求
 export interface SetRpmRequest {
   rpm: number | null

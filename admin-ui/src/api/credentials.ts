@@ -20,6 +20,7 @@ import type {
   SetMaxRelayRequest,
   ProPlusProxyGateResponse,
   SetProPlusProxyGateRequest,
+  ProxyPoolResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -97,6 +98,12 @@ export async function batchUpdateCredentials(
 // 测试账号实际会使用的代理出口 IP。
 export async function testCredentialProxy(id: number): Promise<CredentialProxyTestResponse> {
   const { data } = await api.post<CredentialProxyTestResponse>(`/credentials/${id}/proxy/test`)
+  return data
+}
+
+// 获取代理池容量与占用健康状态。
+export async function getProxyPool(): Promise<ProxyPoolResponse> {
+  const { data } = await api.get<ProxyPoolResponse>('/proxy-pool')
   return data
 }
 

@@ -14,6 +14,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { BatchEditDialog } from '@/components/batch-edit-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ProxyPoolStatusCard } from '@/components/proxy-pool-status-card'
 import {
   useCredentials,
   useDeleteCredential,
@@ -27,6 +28,7 @@ import {
   useSetArmorBreaking,
   useProPlusProxyGate,
   useSetProPlusProxyGate,
+  useProxyPool,
   useMaxRelay,
   useSetMaxRelay,
 } from '@/hooks/use-credentials'
@@ -91,6 +93,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setArmorBreaking, isPending: isSettingArmor } = useSetArmorBreaking()
   const { data: proPlusProxyGateData } = useProPlusProxyGate()
   const { mutate: setProPlusProxyGate, isPending: isSettingProPlusProxyGate } = useSetProPlusProxyGate()
+  const { data: proxyPoolData, isLoading: isLoadingProxyPool } = useProxyPool()
   const [proPlusProxyGateEnabled, setProPlusProxyGateEnabled] = useState(true)
   const [maxAccountsPerProxy, setMaxAccountsPerProxy] = useState('2')
   const { data: maxRelayData } = useMaxRelay()
@@ -893,20 +896,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         </div>
 
-        {/* PRO+ 账号级代理门禁 */}
+        {/* 全账号代理门禁 */}
         <Card className="mb-6">
           <CardContent className="py-4">
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <Network className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm font-medium">PRO+ 账号级代理门禁</span>
+                  <span className="text-sm font-medium">全账号代理门禁</span>
                   <Badge variant={proPlusProxyGateEnabled ? 'success' : 'secondary'}>
                     {proPlusProxyGateEnabled ? '默认保护中' : '已关闭'}
                   </Badge>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  开启后，KIRO PRO+ 必须自动领取并验证账号级代理；代理容量不足时保持禁用。
+                  开启后，所有新导入或重新启用的账号都必须领取并验证代理；容量不足时进入等待队列，绝不回退直连。
                 </p>
               </div>
               <div className="flex items-center gap-3">
@@ -941,6 +944,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </CardContent>
         </Card>
+
+        <ProxyPoolStatusCard data={proxyPoolData} isLoading={isLoadingProxyPool} />
 
         {/* 全局默认 RPM 配置 */}
         <Card className="mb-6">

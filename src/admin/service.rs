@@ -19,10 +19,11 @@ use super::types::{
     AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse, BalanceResponse,
     BatchSetCredentialProxyRequest, CredentialProxyTestResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse, MaxRelayResponse,
-    OveragePassthroughResponse, ProPlusProxyGateResponse, ProxyPoolAssignmentSkip,
-    ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, RemoveProxyPoolEntriesRequest,
-    SetArmorBreakingRequest, SetCredentialProxyRequest, SetLoadBalancingModeRequest,
-    SetMaxRelayRequest, SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
+    OveragePassthroughResponse, ProPlusProxyGateResponse, ProxyAssignedCredentialStatus,
+    ProxyPoolAssignmentSkip, ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse,
+    RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
+    SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
+    SetProPlusProxyGateRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -414,10 +415,6 @@ impl AdminService {
                     continue;
                 }
             };
-            if !Self::is_kiro_pro_plus(credentials.subscription_title.as_deref()) {
-                self.clear_proxy_pending(id)?;
-                continue;
-            }
 
             if !Self::has_credential_proxy(&credentials) {
                 let _allocation_guard = self.allocation_lock.lock().await;
@@ -578,37 +575,129 @@ impl AdminService {
     /// 获取代理池及当前账号占用情况。已绑定但后来从池移除的账号不计入可分配池。
     pub fn get_proxy_pool(&self) -> ProxyPoolResponse {
         let snapshot = self.token_manager.snapshot();
+        let balance_cache = self.balance_cache.lock().clone();
+        let max_accounts_per_proxy = self.token_manager.get_max_accounts_per_proxy();
         let pool = self.proxy_pool.lock();
         let proxies = pool
             .proxies
             .iter()
             .map(|entry| {
-                let assigned_credential_ids: Vec<u64> = snapshot
+                let assigned_credentials: Vec<ProxyAssignedCredentialStatus> = snapshot
                     .entries
                     .iter()
                     .filter(|credential| {
                         credential.proxy_url.as_deref() == Some(entry.proxy_url.as_str())
                     })
-                    .map(|credential| credential.id)
+                    .map(|credential| {
+                        let balance = balance_cache.get(&credential.id);
+                        let remaining = balance.map(|cached| cached.data.remaining);
+                        let usage_limit = balance.map(|cached| cached.data.usage_limit);
+                        let health = if credential.disabled
+                            || matches!(
+                                (remaining, usage_limit),
+                                (Some(value), Some(limit))
+                                    if limit > 0.0 && value <= BALANCE_EXHAUSTED_EPSILON
+                            )
+                        {
+                            "abnormal"
+                        } else if remaining.is_some() && usage_limit.is_some() {
+                            "healthy"
+                        } else {
+                            "unknown"
+                        };
+                        ProxyAssignedCredentialStatus {
+                            credential_id: credential.id,
+                            email: credential.email.clone(),
+                            subscription_title: credential.subscription_title.clone(),
+                            import_note: credential.import_note.clone(),
+                            disabled: credential.disabled,
+                            disabled_reason: credential.disabled_reason.clone(),
+                            remaining,
+                            usage_limit,
+                            balance_cached_at: balance.map(|cached| cached.cached_at),
+                            health: health.to_string(),
+                        }
+                    })
                     .collect();
-                let assigned_count = assigned_credential_ids.len();
+                let assigned_credential_ids = assigned_credentials
+                    .iter()
+                    .map(|credential| credential.credential_id)
+                    .collect::<Vec<_>>();
+                let assigned_count = assigned_credentials.len();
+                let healthy_count = assigned_credentials
+                    .iter()
+                    .filter(|credential| credential.health == "healthy")
+                    .count();
+                let abnormal_count = assigned_credentials
+                    .iter()
+                    .filter(|credential| credential.health == "abnormal")
+                    .count();
+                let unknown_count = assigned_count - healthy_count - abnormal_count;
                 ProxyPoolEntryStatus {
                     proxy_url: Self::redact_proxy_url(&entry.proxy_url),
                     assigned_credential_ids,
+                    assigned_credentials,
                     assigned_count,
-                    remaining_slots: self
-                        .token_manager
-                        .get_max_accounts_per_proxy()
-                        .saturating_sub(assigned_count),
+                    remaining_slots: max_accounts_per_proxy.saturating_sub(assigned_count),
+                    healthy_count,
+                    abnormal_count,
+                    unknown_count,
                 }
             })
             .collect::<Vec<_>>();
+        let assigned_slots = proxies.iter().map(|entry| entry.assigned_count).sum();
         let available_slots = proxies.iter().map(|entry| entry.remaining_slots).sum();
+        let empty_proxy_count = proxies
+            .iter()
+            .filter(|entry| entry.assigned_count == 0)
+            .count();
+        let full_proxy_count = proxies
+            .iter()
+            .filter(|entry| entry.remaining_slots == 0)
+            .count();
+        let partial_proxy_count = proxies.len() - empty_proxy_count - full_proxy_count;
+        let healthy_assigned_count = proxies.iter().map(|entry| entry.healthy_count).sum();
+        let abnormal_assigned_count = proxies.iter().map(|entry| entry.abnormal_count).sum();
+        let unknown_assigned_count = proxies.iter().map(|entry| entry.unknown_count).sum();
+        let pending_credential_count = pool.pending_credential_ids.len();
+        let unbound_enabled_count = snapshot
+            .entries
+            .iter()
+            .filter(|credential| !credential.disabled && !credential.has_proxy)
+            .count();
+        let empty_reason = if pending_credential_count > 0 && available_slots == 0 {
+            Some(format!("代理池已满，{} 个账号等待分配", pending_credential_count))
+        } else if pending_credential_count > 0 {
+            Some(format!(
+                "有空位但仍有 {} 个账号等待：代理出口验证失败或账号不可用",
+                pending_credential_count
+            ))
+        } else if available_slots > 0 && unbound_enabled_count > 0 {
+            Some(format!(
+                "{} 个历史启用账号未绑定代理，未在部署时批量下线迁移",
+                unbound_enabled_count
+            ))
+        } else if available_slots > 0 {
+            Some("暂无待分配账号".to_string())
+        } else {
+            None
+        };
 
         ProxyPoolResponse {
-            max_accounts_per_proxy: self.token_manager.get_max_accounts_per_proxy(),
+            max_accounts_per_proxy,
             total: proxies.len(),
+            total_capacity: proxies.len() * max_accounts_per_proxy,
+            assigned_slots,
             available_slots,
+            empty_proxy_count,
+            partial_proxy_count,
+            full_proxy_count,
+            healthy_assigned_count,
+            abnormal_assigned_count,
+            unknown_assigned_count,
+            pending_credential_count,
+            unbound_enabled_count,
+            empty_reason,
             proxies,
         }
     }
@@ -857,20 +946,18 @@ impl AdminService {
         gate_enabled || requested.unwrap_or(true)
     }
 
-    /// 只按 Kiro 官方返回的付费 Pro 套餐名识别，不猜邮箱域名、余额或赠送额度。
-    /// 当前代理池覆盖 KIRO PRO+ 与 KIRO PRO MAX；若官方再变更套餐名，再显式扩展。
+    /// 全账号代理门禁开启后，不再按订阅类型区分代理资格。
     fn proxy_pool_eligibility(usage: &UsageLimitsResponse) -> ProxyPoolEligibility {
         let subscription_title = usage.subscription_title().map(str::to_owned);
-        let eligible = Self::is_kiro_pro_plus(subscription_title.as_deref());
-        let reason = if eligible {
-            "官方 subscriptionTitle 为受支持的付费 KIRO PRO，允许自动分配代理".to_string()
-        } else if let Some(title) = subscription_title.as_deref() {
-            format!("官方 subscriptionTitle 为 {title:?}，不自动分配代理")
-        } else {
-            "官方 getUsageLimits 未返回 subscriptionTitle，不自动分配代理".to_string()
-        };
+        let reason = subscription_title
+            .as_deref()
+            .map(|title| format!("全账号代理门禁已开启，{title:?} 允许自动分配代理"))
+            .unwrap_or_else(|| {
+                "全账号代理门禁已开启；即使未返回 subscriptionTitle 也允许分配代理"
+                    .to_string()
+            });
         ProxyPoolEligibility {
-            eligible,
+            eligible: true,
             subscription_title,
             reason,
         }
@@ -923,7 +1010,6 @@ impl AdminService {
 
     fn requires_proxy_before_enable(&self, credentials: &KiroCredentials) -> bool {
         self.token_manager.get_require_pro_plus_credential_proxy()
-            && Self::is_kiro_pro_plus(credentials.subscription_title.as_deref())
             && !Self::has_credential_proxy(credentials)
     }
 
@@ -1039,27 +1125,19 @@ impl AdminService {
             .0;
         if self.requires_proxy_before_enable(&credentials) {
             return Err(AdminServiceError::InvalidCredential(format!(
-                "凭据 #{} 已识别为 KIRO PRO+，请先绑定账号级代理 IP 后再启用",
+                "凭据 #{} 尚未绑定代理；请先绑定账号级代理 IP 后再启用",
                 id
             )));
         }
         Ok(())
     }
 
-    /// HTTP 启用入口的最终门禁：PRO+ 不仅要有账号级代理，还必须验证实际出口一致。
+    /// HTTP 启用入口的最终门禁：所有账号不仅要有账号级代理，还必须验证实际出口一致。
     pub async fn ensure_proxy_verified_before_enable(
         &self,
         id: u64,
     ) -> Result<(), AdminServiceError> {
         if !self.token_manager.get_require_pro_plus_credential_proxy() {
-            return Ok(());
-        }
-        let credentials = self
-            .token_manager
-            .credential_and_effective_proxy(id)
-            .map_err(|error| self.classify_error(error, id))?
-            .0;
-        if !Self::is_kiro_pro_plus(credentials.subscription_title.as_deref()) {
             return Ok(());
         }
         self.ensure_can_enable(id)?;
@@ -1601,9 +1679,11 @@ impl AdminService {
                 }
                 Err(error) => (
                     Some(ProxyPoolEligibility {
-                        eligible: false,
+                        eligible: true,
                         subscription_title: None,
-                        reason: format!("官方 getUsageLimits 查询失败，不自动分配代理: {error}"),
+                        reason: format!(
+                            "套餐识别失败，但全账号代理门禁要求仍分配代理: {error}"
+                        ),
                     }),
                     None,
                 ),
@@ -1696,33 +1776,26 @@ impl AdminService {
                 .credential_and_effective_proxy(credential_id)
                 .map_err(|error| self.classify_error(error, credential_id))?
                 .0;
-            if Self::is_kiro_pro_plus(credentials.subscription_title.as_deref()) {
-                activation_requires_proxy = true;
-                if Self::has_credential_proxy(&credentials) {
-                    match self.test_credential_proxy(credential_id).await {
-                        Ok(result) if Self::proxy_test_matches_expected_egress(&result) => {
-                            self.set_disabled(credential_id, false)?;
-                            self.clear_proxy_pending(credential_id)?;
-                            activation_requires_proxy = false;
-                        }
-                        Ok(_) | Err(_) => {
-                            proxy_test_failed = true;
-                            self.token_manager
-                                .set_disabled_without_release_event(credential_id, true)
-                                .map_err(|error| self.classify_error(error, credential_id))?;
-                            self.release_disabled_credential_proxy(credential_id, false)?;
-                            assigned_proxy = None;
-                            self.mark_proxy_pending(credential_id)?;
-                        }
+            activation_requires_proxy = true;
+            if Self::has_credential_proxy(&credentials) {
+                match self.test_credential_proxy(credential_id).await {
+                    Ok(result) if Self::proxy_test_matches_expected_egress(&result) => {
+                        self.set_disabled(credential_id, false)?;
+                        self.clear_proxy_pending(credential_id)?;
+                        activation_requires_proxy = false;
                     }
-                } else {
-                    self.mark_proxy_pending(credential_id)?;
+                    Ok(_) | Err(_) => {
+                        proxy_test_failed = true;
+                        self.token_manager
+                            .set_disabled_without_release_event(credential_id, true)
+                            .map_err(|error| self.classify_error(error, credential_id))?;
+                        self.release_disabled_credential_proxy(credential_id, false)?;
+                        assigned_proxy = None;
+                        self.mark_proxy_pending(credential_id)?;
+                    }
                 }
-            } else if subscription_inspected {
-                // 非 PRO+ 不受门禁影响，套餐识别完成后恢复默认启用行为。
-                self.token_manager
-                    .set_disabled(credential_id, false)
-                    .map_err(|error| self.classify_error(error, credential_id))?;
+            } else {
+                self.mark_proxy_pending(credential_id)?;
             }
         }
 
@@ -1735,12 +1808,12 @@ impl AdminService {
                 )
             } else if activation_requires_proxy {
                 format!(
-                    "凭据添加成功，ID: {}；KIRO PRO+ 待绑定账号级代理后启用",
+                    "凭据添加成功，ID: {}；待绑定账号级代理后启用",
                     credential_id
                 )
             } else if gate_enabled && !subscription_inspected {
                 format!(
-                    "凭据添加成功，ID: {}；套餐识别失败，凭据保持禁用",
+                    "凭据添加成功，ID: {}；套餐识别失败，但代理已验证并启用",
                     credential_id
                 )
             } else {
@@ -2914,6 +2987,17 @@ mod tests {
         assert_eq!(pool.available_slots, 1);
         assert_eq!(pool.proxies[0].assigned_count, 2);
         assert_eq!(pool.proxies[1].assigned_count, 1);
+        assert_eq!(pool.total_capacity, 4);
+        assert_eq!(pool.assigned_slots, 3);
+        assert_eq!(pool.empty_proxy_count, 0);
+        assert_eq!(pool.partial_proxy_count, 1);
+        assert_eq!(pool.full_proxy_count, 1);
+        assert_eq!(pool.healthy_assigned_count, 0);
+        assert_eq!(pool.abnormal_assigned_count, 0);
+        assert_eq!(pool.unknown_assigned_count, 3);
+        assert_eq!(pool.pending_credential_count, 0);
+        assert_eq!(pool.unbound_enabled_count, 0);
+        assert_eq!(pool.empty_reason.as_deref(), Some("暂无待分配账号"));
         assert_eq!(
             service.next_proxy_pool_entry().unwrap().unwrap().proxy_url,
             "http://proxy-two.example:443"
@@ -3106,7 +3190,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_pool_only_accepts_kiro_pro_plus_subscription_title() {
+    fn test_proxy_pool_accepts_all_subscription_types() {
         let pro_plus: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
             "subscriptionInfo": {"subscriptionTitle": " Kiro Pro+ "}
         }))
@@ -3115,18 +3199,43 @@ mod tests {
             "subscriptionInfo": {"subscriptionTitle": "kiro pro max"}
         }))
         .unwrap();
+        let power: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": "KIRO POWER"}
+        }))
+        .unwrap();
         let free: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
             "subscriptionInfo": {"subscriptionTitle": "KIRO FREE"}
         }))
         .unwrap();
         let missing: UsageLimitsResponse = serde_json::from_value(serde_json::json!({})).unwrap();
 
-        let eligible = AdminService::proxy_pool_eligibility(&pro_plus);
-        assert!(eligible.eligible);
-        assert_eq!(eligible.subscription_title.as_deref(), Some(" Kiro Pro+ "));
-        assert!(AdminService::proxy_pool_eligibility(&pro_max).eligible);
-        assert!(!AdminService::proxy_pool_eligibility(&free).eligible);
-        assert!(!AdminService::proxy_pool_eligibility(&missing).eligible);
+        for usage in [&pro_plus, &pro_max, &power, &free, &missing] {
+            assert!(AdminService::proxy_pool_eligibility(usage).eligible);
+        }
+        assert_eq!(
+            AdminService::proxy_pool_eligibility(&pro_plus)
+                .subscription_title
+                .as_deref(),
+            Some(" Kiro Pro+ ")
+        );
+    }
+
+    #[test]
+    fn test_enabled_gate_requires_proxy_for_every_subscription_type() {
+        let mut config = Config::default();
+        config.require_pro_plus_credential_proxy = true;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+
+        for title in ["KIRO FREE", "KIRO POWER", "KIRO PRO+", "KIRO PRO MAX"] {
+            let mut credential = KiroCredentials::default();
+            credential.subscription_title = Some(title.to_string());
+            assert!(service.requires_proxy_before_enable(&credential));
+            credential.proxy_url = Some("socks5://203.0.113.9:443".to_string());
+            assert!(!service.requires_proxy_before_enable(&credential));
+        }
     }
 
     #[test]
