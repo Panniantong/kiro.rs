@@ -1780,9 +1780,15 @@ impl AdminService {
             if Self::has_credential_proxy(&credentials) {
                 match self.test_credential_proxy(credential_id).await {
                     Ok(result) if Self::proxy_test_matches_expected_egress(&result) => {
-                        self.set_disabled(credential_id, false)?;
                         self.clear_proxy_pending(credential_id)?;
                         activation_requires_proxy = false;
+                        if subscription_inspected {
+                            self.set_disabled(credential_id, false)?;
+                        } else {
+                            self.token_manager
+                                .set_disabled_without_release_event(credential_id, true)
+                                .map_err(|error| self.classify_error(error, credential_id))?;
+                        }
                     }
                     Ok(_) | Err(_) => {
                         proxy_test_failed = true;
@@ -1813,7 +1819,7 @@ impl AdminService {
                 )
             } else if gate_enabled && !subscription_inspected {
                 format!(
-                    "凭据添加成功，ID: {}；套餐识别失败，但代理已验证并启用",
+                    "凭据添加成功，ID: {}；代理已绑定并验证，但套餐识别失败，凭据保持禁用",
                     credential_id
                 )
             } else {
