@@ -945,7 +945,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </CardContent>
         </Card>
 
-        <ProxyPoolStatusCard data={proxyPoolData} isLoading={isLoadingProxyPool} />
+        <ProxyPoolStatusCard
+          data={proxyPoolData}
+          isLoading={isLoadingProxyPool}
+          credentials={data?.credentials || []}
+          onChanged={() => {
+            refetch()
+            queryClient.invalidateQueries({ queryKey: ['proxyPool'] })
+          }}
+        />
 
         {/* 全局默认 RPM 配置 */}
         <Card className="mb-6">
