@@ -12,10 +12,11 @@ use super::{
         batch_update_credentials, delete_credential, force_refresh_token, get_all_credentials,
         get_armor_breaking,
         get_credential_balance, get_default_rpm, get_load_balancing_mode, get_max_relay,
-        get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool,
-        remove_proxy_pool_entries, reset_failure_count, set_armor_breaking,
-        set_credential_disabled, set_credential_priority, set_credential_proxy, set_credential_rpm,
-        set_default_rpm, set_load_balancing_mode, set_max_relay, set_overage_passthrough,
+        get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool, manual_bind_proxy,
+        manual_unbind_proxy, remove_proxy_pool_entries, reset_failure_count,
+        set_armor_breaking, set_credential_disabled, set_credential_priority, set_credential_proxy,
+        set_credential_rpm, set_default_rpm, set_load_balancing_mode, set_max_relay,
+        set_overage_passthrough,
         set_pro_plus_proxy_gate, test_credential_proxy,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -77,6 +78,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/rpm", post(set_credential_rpm))
         .route("/credentials/batch-rpm", post(batch_set_credential_rpm))
         .route("/credentials/batch-update", post(batch_update_credentials))
+        .route("/proxy-pool/bind", post(manual_bind_proxy))
+        .route("/proxy-pool/unbind", post(manual_unbind_proxy))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

@@ -18,12 +18,12 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
     AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse, BalanceResponse,
     BatchSetCredentialProxyRequest, CredentialProxyTestResponse, CredentialStatusItem,
-    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse, MaxRelayResponse,
-    OveragePassthroughResponse, ProPlusProxyGateResponse, ProxyAssignedCredentialStatus,
-    ProxyPoolAssignmentSkip, ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse,
-    RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
-    SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
-    SetProPlusProxyGateRequest,
+    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
+    ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
+    ProPlusProxyGateResponse, ProxyAssignedCredentialStatus, ProxyPoolAssignmentSkip,
+    ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, RemoveProxyPoolEntriesRequest,
+    SetArmorBreakingRequest, SetCredentialProxyRequest, SetLoadBalancingModeRequest,
+    SetMaxRelayRequest, SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -400,7 +400,7 @@ impl AdminService {
         })
     }
 
-    /// 为因容量不足或出口验证失败而等待的 PRO+ 自动补绑；只有验出口通过才启用。
+    /// 为代理不足或出口验证失败的所有账号自动补绑；只有出口验证通过才启用。
     pub async fn reconcile_pending_pro_plus(&self) -> Result<(usize, usize), AdminServiceError> {
         if !self.token_manager.get_require_pro_plus_credential_proxy() {
             return Ok((0, self.pending_proxy_ids().len()));
@@ -456,8 +456,6 @@ impl AdminService {
 
         Ok((enabled_count, self.pending_proxy_ids().len()))
     }
-
-    /// 监听真实请求与余额策略产生的退役事件，永久退役旧 PRO+ 后立即补位。
     pub async fn run_quota_rotation_worker(
         self: Arc<Self>,
         mut events: tokio::sync::broadcast::Receiver<u64>,
@@ -703,6 +701,123 @@ impl AdminService {
     }
 
     /// 追加代理池条目。重复 URL 会更新认证信息但不会产生重复槽位。
+
+    /// 从代理池手动绑定账号，并验证实际出口。
+    pub async fn manual_bind_proxy(
+        &self,
+        proxy_url: String,
+        credential_ids: Vec<u64>,
+    ) -> Result<ManualProxyOperationResponse, AdminServiceError> {
+        if credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        let _allocation_guard = self.allocation_lock.lock().await;
+        let proxy_url = proxy_url.trim_end_matches('/').to_string();
+        let proxy = self
+            .proxy_pool
+            .lock()
+            .proxies
+            .iter()
+            .find(|proxy| proxy.proxy_url.trim_end_matches('/') == proxy_url)
+            .cloned()
+            .ok_or_else(|| AdminServiceError::InvalidCredential("代理不在代理池中".to_string()))?;
+        self.ensure_proxy_binding_capacity(&proxy.proxy_url, &credential_ids)?;
+
+        let mut updated = Vec::new();
+        let mut failed = Vec::new();
+        for id in credential_ids {
+            let credentials = self
+                .token_manager
+                .credential_and_effective_proxy(id)
+                .map_err(|error| self.classify_error(error, id))?
+                .0;
+            if Self::has_credential_proxy(&credentials) {
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号已有代理绑定，请先解除占用".to_string(),
+                });
+                continue;
+            }
+            self.token_manager
+                .set_credential_proxy(
+                    id,
+                    Some(proxy.proxy_url.clone()),
+                    proxy.proxy_username.clone(),
+                    proxy.proxy_password.clone(),
+                )
+                .map_err(|error| self.classify_error(error, id))?;
+            match self.test_credential_proxy(id).await {
+                Ok(result) if Self::proxy_test_matches_expected_egress(&result) => {
+                    self.set_disabled(id, false)?;
+                    self.clear_proxy_pending(id)?;
+                    updated.push(id);
+                }
+                Ok(_) | Err(_) => {
+                    self.token_manager
+                        .set_credential_proxy(id, None, None, None)
+                        .map_err(|error| self.classify_error(error, id))?;
+                    self.mark_proxy_pending(id)?;
+                    failed.push(ProxyPoolAssignmentSkip {
+                        credential_id: id,
+                        reason: "代理出口验证失败，已释放绑定并保持等待".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(ManualProxyOperationResponse {
+            updated_credential_ids: updated,
+            failed,
+            pending_credential_ids: self.pending_proxy_ids(),
+        })
+    }
+
+    /// 手动解除账号的代理池占用；启用账号会先禁用，避免解绑后直连。
+    pub async fn manual_unbind_proxy(
+        &self,
+        credential_ids: Vec<u64>,
+    ) -> Result<ManualProxyOperationResponse, AdminServiceError> {
+        if credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        let _allocation_guard = self.allocation_lock.lock().await;
+        let mut updated = Vec::new();
+        let mut failed = Vec::new();
+        for id in credential_ids {
+            let entry = self
+                .token_manager
+                .snapshot()
+                .entries
+                .into_iter()
+                .find(|entry| entry.id == id)
+                .ok_or(AdminServiceError::NotFound { id })?;
+            if !entry.has_proxy {
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号没有代理占用".to_string(),
+                });
+                continue;
+            }
+            if !entry.disabled {
+                self.token_manager
+                    .set_disabled_without_release_event(id, true)
+                    .map_err(|error| self.classify_error(error, id))?;
+            }
+            self.token_manager
+                .set_credential_proxy(id, None, None, None)
+                .map_err(|error| self.classify_error(error, id))?;
+            self.clear_proxy_pending(id)?;
+            updated.push(id);
+        }
+        Ok(ManualProxyOperationResponse {
+            updated_credential_ids: updated,
+            failed,
+            pending_credential_ids: self.pending_proxy_ids(),
+        })
+    }
     pub fn add_proxy_pool_entries(
         &self,
         req: AddProxyPoolEntriesRequest,

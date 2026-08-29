@@ -17,10 +17,13 @@ import type {
   DefaultRpmResponse,
   SetDefaultRpmRequest,
   MaxRelayResponse,
-  SetMaxRelayRequest,
   ProPlusProxyGateResponse,
   SetProPlusProxyGateRequest,
+  SetMaxRelayRequest,
   ProxyPoolResponse,
+  ManualProxyBindRequest,
+  ManualProxyUnbindRequest,
+  ManualProxyOperationResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -104,6 +107,20 @@ export async function testCredentialProxy(id: number): Promise<CredentialProxyTe
 // 获取代理池容量与占用健康状态。
 export async function getProxyPool(): Promise<ProxyPoolResponse> {
   const { data } = await api.get<ProxyPoolResponse>('/proxy-pool')
+  return data
+}
+
+export async function manualBindProxy(
+  req: ManualProxyBindRequest
+): Promise<ManualProxyOperationResponse> {
+  const { data } = await api.post<ManualProxyOperationResponse>('/proxy-pool/bind', req)
+  return data
+}
+
+export async function manualUnbindProxy(
+  req: ManualProxyUnbindRequest
+): Promise<ManualProxyOperationResponse> {
+  const { data } = await api.post<ManualProxyOperationResponse>('/proxy-pool/unbind', req)
   return data
 }
 

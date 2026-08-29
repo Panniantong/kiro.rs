@@ -242,6 +242,29 @@ pub struct ProxyAssignedCredentialStatus {
 /// 批量代理测试的目标凭据。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ManualProxyBindRequest {
+    pub proxy_url: String,
+    pub credential_ids: Vec<u64>,
+}
+
+/// 从账号手动解除代理池占用。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualProxyUnbindRequest {
+    pub credential_ids: Vec<u64>,
+}
+
+/// 手动代理操作结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualProxyOperationResponse {
+    pub updated_credential_ids: Vec<u64>,
+    pub failed: Vec<ProxyPoolAssignmentSkip>,
+    pub pending_credential_ids: Vec<u64>,
+}
+/// 代理池手动操作请求使用独立类型，避免与批量代理测试混淆。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BatchCredentialIdsRequest {
     pub ids: Vec<u64>,
 }

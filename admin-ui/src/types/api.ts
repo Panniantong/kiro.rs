@@ -187,6 +187,21 @@ export interface ProxyPoolResponse {
   proxies: ProxyPoolEntryStatus[]
 }
 
+export interface ManualProxyOperationResponse {
+  updatedCredentialIds: number[]
+  failed: Array<{ credentialId: number; reason: string }>
+  pendingCredentialIds: number[]
+}
+
+export interface ManualProxyBindRequest {
+  proxyUrl: string
+  credentialIds: number[]
+}
+
+export interface ManualProxyUnbindRequest {
+  credentialIds: number[]
+}
+
 // RPM 限流请求
 export interface SetRpmRequest {
   rpm: number | null
