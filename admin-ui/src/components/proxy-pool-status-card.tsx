@@ -83,12 +83,9 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
   }
 
   const candidates = bindingProxy
-    ? credentials.filter(credential =>
-      !credential.hasProxy &&
-      !credential.disabled &&
-      (bindingProxy.remainingSlots + bindingProxy.assignedCount > bindingProxy.assignedCount)
-    )
+    ? credentials.filter(credential => !credential.hasProxy && bindingProxy.remainingSlots > 0)
     : []
+
 
   return (
     <>
