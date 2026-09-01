@@ -97,8 +97,19 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
     if (!file) return
     const text = await file.text()
     const proxies = Array.from(new Set(text.split(/\r?\n/).flatMap(line => {
-      const match = line.match(/(?:socks5|https?):\/\/[^\s,"']+/i)
-      return match ? [match[0].replace(/[\]\)]+$/, '')] : []
+      const clean = line.trim()
+      if (!clean) return []
+      const url = clean.match(/(?:socks5|https?):\/\/[^\s,"']+/i)
+      if (url) return [url[0].replace(/[\]\)]+$/, '')]
+      // 兼容代理服务商 CSV：ip:port,username,password,...
+      const columns = clean.split(',').map(column => column.trim().replace(/^"|"$/g, ''))
+      const hostPort = columns[0]
+      const username = columns[1]
+      const password = columns[2]
+      if (/^[^:]+:\d+$/.test(hostPort) && username && password) {
+        return [`socks5://${username}:${password}@${hostPort}`]
+      }
+      return []
     })))
     if (proxies.length === 0) {
       toast.error('文件中没有识别到代理地址')
