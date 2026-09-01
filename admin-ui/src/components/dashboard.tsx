@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network } from 'lucide-react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, Activity, LayoutGrid, Table2, Shuffle, PencilLine } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -7,11 +7,14 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
+import { CredentialCompactTable } from '@/components/credential-compact-table'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
+import { BatchEditDialog } from '@/components/batch-edit-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ProxyPoolStatusCard } from '@/components/proxy-pool-status-card'
 import {
   useCredentials,
   useDeleteCredential,
@@ -25,6 +28,7 @@ import {
   useSetArmorBreaking,
   useProPlusProxyGate,
   useSetProPlusProxyGate,
+  useProxyPool,
   useMaxRelay,
   useSetMaxRelay,
 } from '@/hooks/use-credentials'
@@ -38,6 +42,13 @@ interface DashboardProps {
   onLogout: () => void
 }
 
+type CredentialViewMode = 'cards' | 'available-compact' | 'all-compact'
+
+function getInitialCredentialView(): CredentialViewMode {
+  const stored = storage.getCredentialView()
+  return stored === 'available-compact' || stored === 'all-compact' ? stored : 'cards'
+}
+
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
@@ -46,6 +57,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
+  const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
@@ -57,6 +69,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
+  const [viewMode, setViewMode] = useState<CredentialViewMode>(getInitialCredentialView)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -80,6 +93,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setArmorBreaking, isPending: isSettingArmor } = useSetArmorBreaking()
   const { data: proPlusProxyGateData } = useProPlusProxyGate()
   const { mutate: setProPlusProxyGate, isPending: isSettingProPlusProxyGate } = useSetProPlusProxyGate()
+  const { data: proxyPoolData, isLoading: isLoadingProxyPool } = useProxyPool()
   const [proPlusProxyGateEnabled, setProPlusProxyGateEnabled] = useState(true)
   const [maxAccountsPerProxy, setMaxAccountsPerProxy] = useState('2')
   const { data: maxRelayData } = useMaxRelay()
@@ -88,12 +102,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [maxRelayBaseUrl, setMaxRelayBaseUrl] = useState('')
   const [maxRelayApiKey, setMaxRelayApiKey] = useState('')
 
-  // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  const sortedCredentials = useMemo(() => {
+    return [...(data?.credentials || [])].sort((a, b) => {
+      if (a.disabled !== b.disabled) return a.disabled ? 1 : -1
+      if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1
+      if (a.priority !== b.priority) return a.priority - b.priority
+      return a.id - b.id
+    })
+  }, [data?.credentials])
+
+  const enabledCredentials = sortedCredentials.filter(credential => !credential.disabled)
+  const viewCredentials = viewMode === 'available-compact' ? enabledCredentials : sortedCredentials
+  const totalPages = viewMode === 'cards' ? Math.ceil(sortedCredentials.length / itemsPerPage) : 1
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const currentCredentials = viewMode === 'cards'
+    ? sortedCredentials.slice(startIndex, endIndex)
+    : viewCredentials
+  const disabledCredentialCount = sortedCredentials.filter(credential => credential.disabled).length
+  const globalCurrentRpm = enabledCredentials.reduce((sum, credential) => sum + credential.currentRpm, 0)
+  const globalPeakRpm1h = enabledCredentials.reduce((sum, credential) => sum + credential.peakRpm1h, 0)
+  const globalThrottled1h = enabledCredentials.reduce((sum, credential) => sum + credential.throttled1h, 0)
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
@@ -103,6 +132,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [data?.credentials.length])
+
+  useEffect(() => {
+    storage.setCredentialView(viewMode)
+    setCurrentPage(1)
+    setSelectedIds(new Set())
+  }, [viewMode])
 
   // CC Test 透传配置加载后回填到本地表单
   useEffect(() => {
@@ -154,6 +189,54 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }, [data?.credentials])
 
+  // 紧凑视图自动补齐可用凭据余额；四路并发，避免瞬间打爆上游。
+  useEffect(() => {
+    if (viewMode === 'cards' || !data?.credentials) return
+
+    const ids = currentCredentials
+      .filter(credential =>
+        !credential.disabled &&
+        !balanceMap.has(credential.id) &&
+        !loadingBalanceIds.has(credential.id)
+      )
+      .map(credential => credential.id)
+
+    if (ids.length === 0) return
+
+    let cancelled = false
+
+    const load = async () => {
+      for (let index = 0; index < ids.length; index += 4) {
+        if (cancelled) break
+        const chunk = ids.slice(index, index + 4)
+
+        setLoadingBalanceIds(prev => new Set([...prev, ...chunk]))
+        const results = await Promise.allSettled(chunk.map(id => getCredentialBalance(id)))
+
+        if (cancelled) break
+        setBalanceMap(prev => {
+          const next = new Map(prev)
+          results.forEach((result, resultIndex) => {
+            if (result.status === 'fulfilled') {
+              next.set(chunk[resultIndex], result.value)
+            }
+          })
+          return next
+        })
+        setLoadingBalanceIds(prev => {
+          const next = new Set(prev)
+          chunk.forEach(id => next.delete(id))
+          return next
+        })
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [viewMode, data?.credentials])
+
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
     document.documentElement.classList.toggle('dark')
@@ -177,13 +260,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 选择管理
   const toggleSelect = (id: number) => {
-    const newSelected = new Set(selectedIds)
-    if (newSelected.has(id)) {
-      newSelected.delete(id)
-    } else {
-      newSelected.add(id)
-    }
-    setSelectedIds(newSelected)
+    setSelectedIds(previous => {
+      const next = new Set(previous)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }
+
+  const invertCurrentViewSelection = () => {
+    setSelectedIds(previous => {
+      const next = new Set(previous)
+      currentCredentials.forEach(credential => {
+        if (next.has(credential.id)) {
+          next.delete(credential.id)
+        } else {
+          next.add(credential.id)
+        }
+      })
+      return next
+    })
   }
 
   const deselectAll = () => {
@@ -605,7 +704,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       { enabled: proPlusProxyGateEnabled, maxAccountsPerProxy: parsed },
       {
         onSuccess: () => {
-          toast.success(proPlusProxyGateEnabled ? 'PRO+ 代理门禁已开启' : 'PRO+ 代理门禁已关闭')
+          toast.success(proPlusProxyGateEnabled ? '代理门禁已开启' : '已允许 Power 1 万积分账号无代理启用')
         },
         onError: (error) => {
           toast.error(`保存失败: ${extractErrorMessage(error)}`)
@@ -721,7 +820,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
             </Button>
             <Button
-              variant={armorBreakingData?.enabled ? 'default' : 'outline'}
+              variant="outline"
               size="sm"
               onClick={handleToggleArmorBreaking}
               disabled={isLoadingArmor || isSettingArmor}
@@ -745,7 +844,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -766,6 +865,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
             </CardContent>
           </Card>
+          <Card className="overflow-hidden border-sky-200/70 bg-gradient-to-br from-sky-50 to-background dark:border-sky-900 dark:from-sky-950/35">
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+                <Activity className="h-4 w-4 text-sky-600" />
+                全局 RPM
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="font-mono text-2xl font-bold tabular-nums text-sky-700 dark:text-sky-300">
+                {globalCurrentRpm}
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                近 1h 峰值 {globalPeakRpm1h} · 本地被限 {globalThrottled1h}
+              </div>
+            </CardContent>
+          </Card>
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -781,20 +896,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         </div>
 
-        {/* PRO+ 账号级代理门禁 */}
+        {/* 企业号无代理启用开关 */}
         <Card className="mb-6">
           <CardContent className="py-4">
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <Network className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm font-medium">PRO+ 账号级代理门禁</span>
+                  <span className="text-sm font-medium">Power 1 万积分无代理启用</span>
                   <Badge variant={proPlusProxyGateEnabled ? 'success' : 'secondary'}>
-                    {proPlusProxyGateEnabled ? '默认保护中' : '已关闭'}
+                    {proPlusProxyGateEnabled ? '仅代理启用' : '允许 Power 无代理'}
                   </Badge>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  开启后，KIRO PRO+ 必须自动领取并验证账号级代理；代理容量不足时保持禁用。
+                  关闭门禁后，仅官方识别为 KIRO POWER（1 万积分档）的账号可无代理启用；其它套餐仍必须绑定并验证账号级代理。
                 </p>
               </div>
               <div className="flex items-center gap-3">
@@ -804,7 +919,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     onCheckedChange={setProPlusProxyGateEnabled}
                     disabled={isSettingProPlusProxyGate}
                   />
-                  启用门禁
+                  代理门禁
                 </label>
                 <label className="flex items-center gap-2 text-sm">
                   每个代理账号数
@@ -829,6 +944,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </CardContent>
         </Card>
+
+        <ProxyPoolStatusCard
+          data={proxyPoolData}
+          isLoading={isLoadingProxyPool}
+          credentials={data?.credentials || []}
+          onChanged={() => {
+            refetch()
+            queryClient.invalidateQueries({ queryKey: ['proxyPool'] })
+          }}
+        />
 
         {/* 全局默认 RPM 配置 */}
         <Card className="mb-6">
@@ -945,9 +1070,38 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
+              <div className="inline-flex items-center gap-1 rounded-lg border bg-muted/25 p-1">
+                <Button
+                  size="sm"
+                  variant={viewMode === 'cards' ? 'default' : 'ghost'}
+                  className="h-8 gap-1.5"
+                  onClick={() => setViewMode('cards')}
+                >
+                  <LayoutGrid className="h-3.5 w-3.5" />
+                  卡片
+                </Button>
+                <Button
+                  size="sm"
+                  variant={viewMode === 'available-compact' ? 'default' : 'ghost'}
+                  className="h-8 gap-1.5"
+                  onClick={() => setViewMode('available-compact')}
+                >
+                  <Table2 className="h-3.5 w-3.5" />
+                  可用紧凑 · {enabledCredentials.length}
+                </Button>
+                <Button
+                  size="sm"
+                  variant={viewMode === 'all-compact' ? 'default' : 'ghost'}
+                  className="h-8 gap-1.5"
+                  onClick={() => setViewMode('all-compact')}
+                >
+                  <Table2 className="h-3.5 w-3.5" />
+                  全部紧凑 · {sortedCredentials.length}
+                </Button>
+              </div>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -957,9 +1111,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               {selectedIds.size > 0 && (
                 <>
+                  <Button onClick={invertCurrentViewSelection} size="sm" variant="outline">
+                    <Shuffle className="h-4 w-4 mr-2" />
+                    反选当前视图
+                  </Button>
+                  <Button onClick={() => setBatchEditDialogOpen(true)} size="sm" variant="outline">
+                    <PencilLine className="h-4 w-4 mr-2" />
+                    批量编辑
+                  </Button>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
@@ -1048,7 +1210,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 暂无凭据
               </CardContent>
             </Card>
-          ) : (
+          ) : viewMode === 'cards' ? (
             <>
               <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
                 {currentCredentials.map((credential) => (
@@ -1064,24 +1226,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 ))}
               </div>
 
-              {/* 分页控件 */}
               {totalPages > 1 && (
                 <div className="flex justify-center items-center gap-4 mt-6">
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                    onClick={() => setCurrentPage(page => Math.max(1, page - 1))}
                     disabled={currentPage === 1}
                   >
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页（共 {sortedCredentials.length} 个凭据）
                   </span>
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                    onClick={() => setCurrentPage(page => Math.min(totalPages, page + 1))}
                     disabled={currentPage === totalPages}
                   >
                     下一页
@@ -1089,6 +1250,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </>
+          ) : (
+            <CredentialCompactTable
+              credentials={currentCredentials}
+              balances={balanceMap}
+              loadingBalanceIds={loadingBalanceIds}
+              selectedIds={selectedIds}
+              onToggleSelect={toggleSelect}
+            />
           )}
         </div>
       </main>
@@ -1116,6 +1285,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+      />
+
+      <BatchEditDialog
+        open={batchEditDialogOpen}
+        onOpenChange={setBatchEditDialogOpen}
+        credentialIds={Array.from(selectedIds)}
+        onCompleted={deselectAll}
       />
 
       {/* 批量验活对话框 */}

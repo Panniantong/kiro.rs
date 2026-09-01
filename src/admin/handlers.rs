@@ -11,8 +11,10 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
         BatchCredentialIdsRequest, BatchSetCredentialProxyRequest, BatchSetRpmRequest,
-        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
-        SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+        BatchUpdateCredentialsRequest, ManualProxyBindRequest, ManualProxyUnbindRequest,
+        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
+        SetCredentialProxyRequest, SetDefaultRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetProPlusProxyGateRequest,
         SetRpmRequest, SuccessResponse,
     },
@@ -124,6 +126,34 @@ pub async fn assign_credential_proxy_from_pool(
 /// 返回自动分配代理池及每个代理的动态容量占用；不回显代理认证信息。
 pub async fn get_proxy_pool(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_proxy_pool())
+}
+
+/// POST /api/admin/proxy-pool/bind
+/// 从指定代理池条目手动绑定账号，并验证出口。
+pub async fn manual_bind_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<ManualProxyBindRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .manual_bind_proxy(payload.proxy_url, payload.credential_ids)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/unbind
+/// 手动解除账号的代理池占用。
+pub async fn manual_unbind_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<ManualProxyUnbindRequest>,
+) -> impl IntoResponse {
+    match state.service.manual_unbind_proxy(payload.credential_ids).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/proxy-pool
@@ -308,6 +338,21 @@ pub async fn batch_set_credential_rpm(
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-update
+/// 批量更新凭据备注和/或优先级。
+pub async fn batch_update_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchUpdateCredentialsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .batch_update_credentials(&payload.ids, payload.import_note, payload.priority)
+    {
+        Ok(count) => Json(SuccessResponse::new(format!("已更新 {} 个凭据", count))).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

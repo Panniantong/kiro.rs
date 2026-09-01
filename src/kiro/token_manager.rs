@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2500,6 +2500,51 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量更新凭据备注和/或优先级；先校验全部 ID，再一次性持久化。
+    pub fn batch_update_credentials(
+        &self,
+        ids: &[u64],
+        import_note: Option<String>,
+        priority: Option<u32>,
+    ) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            bail!("至少需要一个凭据 ID");
+        }
+        if import_note.is_none() && priority.is_none() {
+            bail!("备注和优先级至少需要提供一项");
+        }
+
+        let target_ids: HashSet<u64> = ids.iter().copied().collect();
+        {
+            let mut entries = self.entries.lock();
+            let existing_ids: HashSet<u64> = entries
+                .iter()
+                .filter(|entry| target_ids.contains(&entry.id))
+                .map(|entry| entry.id)
+                .collect();
+            if existing_ids.len() != target_ids.len() {
+                let mut missing: Vec<u64> = target_ids.difference(&existing_ids).copied().collect();
+                missing.sort_unstable();
+                bail!("凭据不存在: {:?}", missing);
+            }
+
+            for entry in entries.iter_mut().filter(|entry| target_ids.contains(&entry.id)) {
+                if let Some(note) = &import_note {
+                    entry.credentials.import_note = Some(note.clone());
+                }
+                if let Some(value) = priority {
+                    entry.credentials.priority = value;
+                }
+            }
+        }
+
+        if priority.is_some() {
+            self.select_highest_priority();
+        }
+        self.persist_credentials()?;
+        Ok(target_ids.len())
+    }
+
     /// 设置凭据级代理绑定（Admin API）。
     ///
     /// 同一代理可以绑定给多个凭据；这用于一个住宅 IP 挂多个账号、额度耗尽后继续
@@ -4729,6 +4774,74 @@ mod tests {
     }
 
     // ============ 凭据级 Region 优先级测试 ============
+
+    #[test]
+    fn test_batch_update_credentials_persists_and_is_atomic() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-batch-update-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.import_note = Some("old-a".to_string());
+        first.priority = 9;
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.import_note = Some("old-b".to_string());
+        second.priority = 8;
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&vec![first.clone(), second.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .batch_update_credentials(&[1, 2], Some("same-group".to_string()), Some(3))
+                .unwrap(),
+            2
+        );
+        let snapshot = manager.snapshot();
+        for entry in &snapshot.entries {
+            assert_eq!(entry.import_note.as_deref(), Some("same-group"));
+            assert_eq!(entry.priority, 3);
+        }
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.iter().all(|credential| {
+            credential.import_note.as_deref() == Some("same-group") && credential.priority == 3
+        }));
+
+        // 任一 ID 不存在时整批失败，已有账号不应被部分更新。
+        assert!(
+            manager
+                .batch_update_credentials(&[1, 999], Some("must-not-apply".to_string()), None)
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .import_note
+                .as_deref(),
+            Some("same-group")
+        );
+        assert!(manager.batch_update_credentials(&[1], None, None).is_err());
+
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn test_credential_region_priority_uses_credential_auth_region() {

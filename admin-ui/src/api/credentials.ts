@@ -8,6 +8,7 @@ import type {
   SetPriorityRequest,
   SetCredentialProxyRequest,
   BatchSetCredentialProxyRequest,
+  BatchUpdateCredentialsRequest,
   CredentialProxyTestResponse,
   AddCredentialRequest,
   AddCredentialResponse,
@@ -16,9 +17,15 @@ import type {
   DefaultRpmResponse,
   SetDefaultRpmRequest,
   MaxRelayResponse,
-  SetMaxRelayRequest,
   ProPlusProxyGateResponse,
   SetProPlusProxyGateRequest,
+  SetMaxRelayRequest,
+  ProxyPoolResponse,
+  ManualProxyBindRequest,
+  ManualProxyUnbindRequest,
+  ManualProxyOperationResponse,
+  AddProxyPoolEntriesRequest,
+  RemoveProxyPoolEntriesRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -85,9 +92,51 @@ export async function batchSetCredentialProxy(
   return data
 }
 
+// 批量更新凭据备注和/或优先级。
+export async function batchUpdateCredentials(
+  req: BatchUpdateCredentialsRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/batch-update', req)
+  return data
+}
+
 // 测试账号实际会使用的代理出口 IP。
 export async function testCredentialProxy(id: number): Promise<CredentialProxyTestResponse> {
   const { data } = await api.post<CredentialProxyTestResponse>(`/credentials/${id}/proxy/test`)
+  return data
+}
+
+// 获取代理池容量与占用健康状态。
+export async function getProxyPool(): Promise<ProxyPoolResponse> {
+  const { data } = await api.get<ProxyPoolResponse>('/proxy-pool')
+  return data
+}
+
+export async function manualBindProxy(
+  req: ManualProxyBindRequest
+): Promise<ManualProxyOperationResponse> {
+  const { data } = await api.post<ManualProxyOperationResponse>('/proxy-pool/bind', req)
+  return data
+}
+
+export async function manualUnbindProxy(
+  req: ManualProxyUnbindRequest
+): Promise<ManualProxyOperationResponse> {
+  const { data } = await api.post<ManualProxyOperationResponse>('/proxy-pool/unbind', req)
+  return data
+}
+
+export async function addProxyPoolEntries(
+  req: AddProxyPoolEntriesRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/proxy-pool', req)
+  return data
+}
+
+export async function removeProxyPoolEntries(
+  req: RemoveProxyPoolEntriesRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>('/proxy-pool', { data: req })
   return data
 }
 

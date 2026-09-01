@@ -100,6 +100,12 @@ export interface CredentialProxyTestResponse {
   testedAt: string
 }
 
+export interface BatchUpdateCredentialsRequest {
+  ids: number[]
+  importNote?: string
+  priority?: number
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -137,6 +143,71 @@ export interface AddCredentialResponse {
   assignedProxyFromPool: boolean
   activationRequiresProxy: boolean
   proxyPoolEligibility?: ProxyPoolEligibility
+}
+
+export interface ProxyAssignedCredentialStatus {
+  credentialId: number
+  email?: string
+  subscriptionTitle?: string
+  importNote?: string
+  disabled: boolean
+  disabledReason?: string
+  remaining?: number
+  usageLimit?: number
+  balanceCachedAt?: number
+  health: 'healthy' | 'abnormal' | 'unknown'
+}
+
+export interface ProxyPoolEntryStatus {
+  proxyUrl: string
+  assignedCredentialIds: number[]
+  assignedCredentials: ProxyAssignedCredentialStatus[]
+  assignedCount: number
+  remainingSlots: number
+  healthyCount: number
+  abnormalCount: number
+  unknownCount: number
+}
+
+export interface ProxyPoolResponse {
+  maxAccountsPerProxy: number
+  total: number
+  totalCapacity: number
+  assignedSlots: number
+  availableSlots: number
+  emptyProxyCount: number
+  partialProxyCount: number
+  fullProxyCount: number
+  healthyAssignedCount: number
+  abnormalAssignedCount: number
+  unknownAssignedCount: number
+  pendingCredentialCount: number
+  unboundEnabledCount: number
+  emptyReason?: string
+  proxies: ProxyPoolEntryStatus[]
+}
+
+export interface ManualProxyOperationResponse {
+  updatedCredentialIds: number[]
+  failed: Array<{ credentialId: number; reason: string }>
+  pendingCredentialIds: number[]
+}
+
+export interface ManualProxyBindRequest {
+  proxyUrl: string
+  credentialIds: number[]
+}
+
+export interface ManualProxyUnbindRequest {
+  credentialIds: number[]
+}
+
+export interface AddProxyPoolEntriesRequest {
+  proxies: SetCredentialProxyRequest[]
+}
+
+export interface RemoveProxyPoolEntriesRequest {
+  proxyUrls: string[]
 }
 
 // RPM 限流请求

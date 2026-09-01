@@ -177,7 +177,18 @@ pub struct ProxyPoolResponse {
     /// 每个代理最多绑定的账号数。
     pub max_accounts_per_proxy: usize,
     pub total: usize,
+    pub total_capacity: usize,
+    pub assigned_slots: usize,
     pub available_slots: usize,
+    pub empty_proxy_count: usize,
+    pub partial_proxy_count: usize,
+    pub full_proxy_count: usize,
+    pub healthy_assigned_count: usize,
+    pub abnormal_assigned_count: usize,
+    pub unknown_assigned_count: usize,
+    pub pending_credential_count: usize,
+    pub unbound_enabled_count: usize,
+    pub empty_reason: Option<String>,
     pub proxies: Vec<ProxyPoolEntryStatus>,
 }
 
@@ -203,11 +214,55 @@ pub struct SetProPlusProxyGateRequest {
 pub struct ProxyPoolEntryStatus {
     pub proxy_url: String,
     pub assigned_credential_ids: Vec<u64>,
+    pub assigned_credentials: Vec<ProxyAssignedCredentialStatus>,
     pub assigned_count: usize,
     pub remaining_slots: usize,
+    pub healthy_count: usize,
+    pub abnormal_count: usize,
+    pub unknown_count: usize,
+}
+
+/// 代理下绑定账号的健康摘要。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyAssignedCredentialStatus {
+    pub credential_id: u64,
+    pub email: Option<String>,
+    pub subscription_title: Option<String>,
+    pub import_note: Option<String>,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
+    pub remaining: Option<f64>,
+    pub usage_limit: Option<f64>,
+    pub balance_cached_at: Option<f64>,
+    /// healthy / abnormal / unknown
+    pub health: String,
 }
 
 /// 批量代理测试的目标凭据。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualProxyBindRequest {
+    pub proxy_url: String,
+    pub credential_ids: Vec<u64>,
+}
+
+/// 从账号手动解除代理池占用。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualProxyUnbindRequest {
+    pub credential_ids: Vec<u64>,
+}
+
+/// 手动代理操作结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualProxyOperationResponse {
+    pub updated_credential_ids: Vec<u64>,
+    pub failed: Vec<ProxyPoolAssignmentSkip>,
+    pub pending_credential_ids: Vec<u64>,
+}
+/// 代理池手动操作请求使用独立类型，避免与批量代理测试混淆。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchCredentialIdsRequest {
@@ -408,6 +463,20 @@ pub struct BatchSetRpmRequest {
     /// RPM 上限。null/缺省 = 跟随全局默认；0 = 不限制
     #[serde(default)]
     pub rpm: Option<u32>,
+}
+
+/// 批量更新凭据备注和/或优先级。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchUpdateCredentialsRequest {
+    /// 目标凭据 ID 列表。
+    pub ids: Vec<u64>,
+    /// 新备注；缺省表示不修改。传入后会覆盖原 importNote。
+    #[serde(default)]
+    pub import_note: Option<String>,
+    /// 新优先级；缺省表示不修改。
+    #[serde(default)]
+    pub priority: Option<u32>,
 }
 
 /// 全局默认 RPM 响应

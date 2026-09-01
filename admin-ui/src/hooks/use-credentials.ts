@@ -14,6 +14,7 @@ import {
   setLoadBalancingMode,
   setCredentialRpm,
   batchSetCredentialRpm,
+  batchUpdateCredentials,
   getDefaultRpm,
   setDefaultRpm,
   getArmorBreaking,
@@ -22,6 +23,7 @@ import {
   setProPlusProxyGate,
   getMaxRelay,
   setMaxRelay,
+  getProxyPool,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
@@ -36,6 +38,14 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+export function useProxyPool() {
+  return useQuery({
+    queryKey: ['proxyPool'],
+    queryFn: getProxyPool,
+    refetchInterval: 30000,
   })
 }
 
@@ -173,6 +183,17 @@ export function useBatchSetRpm() {
   return useMutation({
     mutationFn: ({ ids, rpm }: { ids: number[]; rpm: number | null }) =>
       batchSetCredentialRpm(ids, rpm),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量更新凭据备注和/或优先级。
+export function useBatchUpdateCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: batchUpdateCredentials,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
