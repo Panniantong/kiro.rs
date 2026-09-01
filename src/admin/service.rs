@@ -470,9 +470,6 @@ impl AdminService {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
 
-            if !self.token_manager.get_require_pro_plus_credential_proxy() {
-                continue;
-            }
             match self.retire_quota_exhausted_pool_credential(id) {
                 Ok(true) => match self.reconcile_pending_pro_plus().await {
                     Ok((enabled, pending)) => tracing::info!(
@@ -545,9 +542,6 @@ impl AdminService {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
 
-            if !self.token_manager.get_require_pro_plus_credential_proxy() {
-                continue;
-            }
             match self.release_disabled_credential_proxy(id, true) {
                 Ok(true) => match self.reconcile_pending_pro_plus().await {
                     Ok((enabled, pending)) => tracing::info!(
@@ -1123,9 +1117,23 @@ impl AdminService {
             .any(|proxy| proxy.proxy_url == proxy_url)
     }
 
+    /// 无代理例外只给官方识别为 KIRO POWER（固定 1 万积分档）的账号。
+    fn is_power_10k_without_proxy_allowed(credentials: &KiroCredentials) -> bool {
+        credentials
+            .subscription_title
+            .as_deref()
+            .map(|title| title.trim().eq_ignore_ascii_case("KIRO POWER"))
+            .unwrap_or(false)
+    }
+
     fn requires_proxy_before_enable(&self, credentials: &KiroCredentials) -> bool {
-        self.token_manager.get_require_pro_plus_credential_proxy()
-            && !Self::has_credential_proxy(credentials)
+        if Self::has_credential_proxy(credentials) {
+            return false;
+        }
+        if self.token_manager.get_require_pro_plus_credential_proxy() {
+            return true;
+        }
+        !Self::is_power_10k_without_proxy_allowed(credentials)
     }
 
     /// 释放稳定禁用账号占用的自动代理池资源。
@@ -1137,9 +1145,6 @@ impl AdminService {
         id: u64,
         clear_pending: bool,
     ) -> Result<bool, AdminServiceError> {
-        if !self.token_manager.get_require_pro_plus_credential_proxy() {
-            return Ok(false);
-        }
         let snapshot = self.token_manager.snapshot();
         let Some(entry) = snapshot.entries.into_iter().find(|entry| entry.id == id) else {
             return Err(AdminServiceError::NotFound { id });
@@ -1179,9 +1184,6 @@ impl AdminService {
     /// 专用退役流程处理。其余稳定禁用均释放代理。历史代理验证失败账号若仍在
     /// pending 队列，则保留等待身份但释放失败绑定。
     pub fn release_stale_disabled_proxy_bindings(&self) -> Result<usize, AdminServiceError> {
-        if !self.token_manager.get_require_pro_plus_credential_proxy() {
-            return Ok(0);
-        }
         let pending_ids: HashSet<u64> = self.pending_proxy_ids().into_iter().collect();
         let proxy_pool_urls: HashSet<String> = self
             .proxy_pool
@@ -1362,9 +1364,6 @@ impl AdminService {
     /// 启动时利用已持久化的余额缓存收口低于 50 的 PRO+，以及额度归零但
     /// 套餐标签已经变化的代理池账号。人工禁用但额度仍可用的账号保持原样。
     pub fn retire_cached_nonviable_pool_credentials(&self) -> Result<usize, AdminServiceError> {
-        if !self.token_manager.get_require_pro_plus_credential_proxy() {
-            return Ok(0);
-        }
         let proxy_pool_urls: HashSet<String> = self
             .proxy_pool
             .lock()
@@ -2591,7 +2590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kiro_pro_plus_can_enable_without_credential_proxy_when_gate_is_off() {
+    fn test_power_10k_can_enable_without_credential_proxy_when_gate_is_off() {
         let credentials_path = std::env::temp_dir().join(format!(
             "kiro-admin-pro-plus-proxy-gate-off-{}.json",
             uuid::Uuid::new_v4()
@@ -2599,7 +2598,7 @@ mod tests {
         let mut credential = KiroCredentials::default();
         credential.id = Some(1);
         credential.machine_id = Some("machine-1".to_string());
-        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.subscription_title = Some("KIRO POWER".to_string());
         credential.disabled = true;
         std::fs::write(
             &credentials_path,
@@ -2645,7 +2644,7 @@ mod tests {
         let mut credential = KiroCredentials::default();
         credential.id = Some(1);
         credential.machine_id = Some("machine-1".to_string());
-        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.subscription_title = Some("KIRO POWER".to_string());
         credential.disabled = true;
         std::fs::write(
             &credentials_path,
@@ -3373,6 +3372,26 @@ mod tests {
     }
 
     #[test]
+    fn test_disabled_gate_allows_only_power_10k_without_proxy() {
+        let mut config = Config::default();
+        config.require_pro_plus_credential_proxy = false;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+
+        let mut power = KiroCredentials::default();
+        power.subscription_title = Some("KIRO POWER".to_string());
+        assert!(!service.requires_proxy_before_enable(&power));
+
+        for title in ["KIRO FREE", "KIRO PRO+", "KIRO PRO MAX"] {
+            let mut credential = KiroCredentials::default();
+            credential.subscription_title = Some(title.to_string());
+            assert!(service.requires_proxy_before_enable(&credential));
+        }
+    }
+
+    #[test]
     fn test_quota_exhausted_pro_plus_releases_proxy_and_never_requeues() {
         let test_dir = std::env::temp_dir().join(format!(
             "kiro-admin-quota-retirement-{}",
@@ -3527,9 +3546,12 @@ mod tests {
             serde_json::to_string(&vec![credential.clone()]).unwrap(),
         )
         .unwrap();
+        let mut config = Config::default();
+        // 无代理例外开关关闭时，失效账号的解绑仍必须运行。
+        config.require_pro_plus_credential_proxy = false;
         let manager = Arc::new(
             MultiTokenManager::new(
-                Config::default(),
+                config,
                 vec![credential],
                 None,
                 Some(credentials_path.clone()),

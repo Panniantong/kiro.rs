@@ -704,7 +704,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       { enabled: proPlusProxyGateEnabled, maxAccountsPerProxy: parsed },
       {
         onSuccess: () => {
-          toast.success(proPlusProxyGateEnabled ? 'PRO+ 代理门禁已开启' : 'PRO+ 代理门禁已关闭')
+          toast.success(proPlusProxyGateEnabled ? '代理门禁已开启' : '已允许 Power 1 万积分账号无代理启用')
         },
         onError: (error) => {
           toast.error(`保存失败: ${extractErrorMessage(error)}`)
@@ -896,20 +896,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         </div>
 
-        {/* 全账号代理门禁 */}
+        {/* 企业号无代理启用开关 */}
         <Card className="mb-6">
           <CardContent className="py-4">
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <Network className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm font-medium">全账号代理门禁</span>
+                  <span className="text-sm font-medium">Power 1 万积分无代理启用</span>
                   <Badge variant={proPlusProxyGateEnabled ? 'success' : 'secondary'}>
-                    {proPlusProxyGateEnabled ? '默认保护中' : '已关闭'}
+                    {proPlusProxyGateEnabled ? '仅代理启用' : '允许 Power 无代理'}
                   </Badge>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  开启后，所有新导入或重新启用的账号都必须领取并验证代理；容量不足时进入等待队列，绝不回退直连。
+                  关闭门禁后，仅官方识别为 KIRO POWER（1 万积分档）的账号可无代理启用；其它套餐仍必须绑定并验证账号级代理。
                 </p>
               </div>
               <div className="flex items-center gap-3">
@@ -919,7 +919,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     onCheckedChange={setProPlusProxyGateEnabled}
                     disabled={isSettingProPlusProxyGate}
                   />
-                  启用门禁
+                  代理门禁
                 </label>
                 <label className="flex items-center gap-2 text-sm">
                   每个代理账号数
