@@ -12,7 +12,7 @@ use super::{
         AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
         BatchCredentialIdsRequest, BatchSetCredentialProxyRequest, BatchSetRpmRequest,
         BatchUpdateCredentialsRequest, ManualProxyBindRequest, ManualProxyUnbindRequest,
-        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
+        RemoveProxyPoolEntriesRequest, RecoverQuotaRetiredRequest, SetArmorBreakingRequest,
         SetCredentialProxyRequest, SetDefaultRpmRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetProPlusProxyGateRequest,
@@ -237,6 +237,16 @@ pub async fn reset_failure_count(
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn recover_quota_retired(
+    State(state): State<AdminState>,
+    Json(payload): Json<RecoverQuotaRetiredRequest>,
+) -> impl IntoResponse {
+    match state.service.recover_quota_retired(payload).await {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

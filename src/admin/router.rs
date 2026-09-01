@@ -13,7 +13,7 @@ use super::{
         get_armor_breaking,
         get_credential_balance, get_default_rpm, get_load_balancing_mode, get_max_relay,
         get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool, manual_bind_proxy,
-        manual_unbind_proxy, remove_proxy_pool_entries, reset_failure_count,
+        manual_unbind_proxy, remove_proxy_pool_entries, recover_quota_retired, reset_failure_count,
         set_armor_breaking, set_credential_disabled, set_credential_priority, set_credential_proxy,
         set_credential_rpm, set_default_rpm, set_load_balancing_mode, set_max_relay,
         set_overage_passthrough,
@@ -73,6 +73,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(batch_test_credential_proxy),
         )
         .route("/credentials/{id}/reset", post(reset_failure_count))
+        .route("/credentials/batch-recover-quota-retired", post(recover_quota_retired))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/rpm", post(set_credential_rpm))

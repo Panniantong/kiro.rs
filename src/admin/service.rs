@@ -22,6 +22,7 @@ use super::types::{
     ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
     ProPlusProxyGateResponse, ProxyAssignedCredentialStatus, ProxyPoolAssignmentSkip,
     ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, RemoveProxyPoolEntriesRequest,
+    RecoverQuotaRetiredRequest, RecoverQuotaRetiredResponse,
     SetArmorBreakingRequest, SetCredentialProxyRequest, SetLoadBalancingModeRequest,
     SetMaxRelayRequest, SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
 };
@@ -1476,6 +1477,32 @@ impl AdminService {
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub async fn recover_quota_retired(
+        &self,
+        req: RecoverQuotaRetiredRequest,
+    ) -> Result<RecoverQuotaRetiredResponse, AdminServiceError> {
+        let _ = self.assign_credentials_proxy_from_pool(AssignCredentialProxyFromPoolRequest { ids: req.ids.clone() }).await?;
+        let mut recovered = Vec::new();
+        let mut skipped = Vec::new();
+        for id in req.ids {
+            let balance = self.get_balance(id).await?;
+            if balance.remaining <= 0.0 {
+                skipped.push(ProxyPoolAssignmentSkip { credential_id: id, reason: "余额仍为 0，未恢复".to_string() });
+                continue;
+            }
+            {
+                let mut pool = self.proxy_pool.lock();
+                pool.retired_quota_credential_ids.retain(|retired_id| *retired_id != id);
+                self.persist_proxy_pool(&pool)?;
+            }
+            match self.token_manager.reset_and_enable(id) {
+                Ok(()) => recovered.push(id),
+                Err(error) => skipped.push(ProxyPoolAssignmentSkip { credential_id: id, reason: error.to_string() }),
+            }
+        }
+        Ok(RecoverQuotaRetiredResponse { recovered_credential_ids: recovered, skipped })
     }
 
     /// 获取凭据余额（带缓存）

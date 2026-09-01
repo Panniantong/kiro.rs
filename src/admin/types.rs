@@ -269,6 +269,17 @@ pub struct BatchCredentialIdsRequest {
     pub ids: Vec<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverQuotaRetiredRequest { pub ids: Vec<u64> }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverQuotaRetiredResponse {
+    pub recovered_credential_ids: Vec<u64>,
+    pub skipped: Vec<ProxyPoolAssignmentSkip>,
+}
+
 /// 一次账号级代理出口测试结果。
 ///
 /// 不回显代理用户名或密码；`proxy_url` 已脱敏。
