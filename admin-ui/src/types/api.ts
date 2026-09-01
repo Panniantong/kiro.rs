@@ -202,6 +202,14 @@ export interface ManualProxyUnbindRequest {
   credentialIds: number[]
 }
 
+export interface AddProxyPoolEntriesRequest {
+  proxies: SetCredentialProxyRequest[]
+}
+
+export interface RemoveProxyPoolEntriesRequest {
+  proxyUrls: string[]
+}
+
 // RPM 限流请求
 export interface SetRpmRequest {
   rpm: number | null

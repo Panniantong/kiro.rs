@@ -24,6 +24,8 @@ import type {
   ManualProxyBindRequest,
   ManualProxyUnbindRequest,
   ManualProxyOperationResponse,
+  AddProxyPoolEntriesRequest,
+  RemoveProxyPoolEntriesRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -121,6 +123,20 @@ export async function manualUnbindProxy(
   req: ManualProxyUnbindRequest
 ): Promise<ManualProxyOperationResponse> {
   const { data } = await api.post<ManualProxyOperationResponse>('/proxy-pool/unbind', req)
+  return data
+}
+
+export async function addProxyPoolEntries(
+  req: AddProxyPoolEntriesRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/proxy-pool', req)
+  return data
+}
+
+export async function removeProxyPoolEntries(
+  req: RemoveProxyPoolEntriesRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>('/proxy-pool', { data: req })
   return data
 }
 

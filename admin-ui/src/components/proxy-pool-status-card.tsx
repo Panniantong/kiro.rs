@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { AlertTriangle, CheckCircle2, CircleHelp, Network, Unplug, UserPlus } from 'lucide-react'
+import type { ChangeEvent } from 'react'
+import { AlertTriangle, CheckCircle2, CircleHelp, Network, Plus, Trash2, Unplug, UserPlus } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,7 +14,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { manualBindProxy, manualUnbindProxy } from '@/api/credentials'
+import { addProxyPoolEntries, manualBindProxy, manualUnbindProxy, removeProxyPoolEntries } from '@/api/credentials'
 import type { CredentialStatusItem, ProxyPoolEntryStatus, ProxyPoolResponse } from '@/types/api'
 
 interface ProxyPoolStatusCardProps {
@@ -27,6 +28,7 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
   const [bindingProxy, setBindingProxy] = useState<ProxyPoolEntryStatus | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [working, setWorking] = useState(false)
+  const [selectedProxies, setSelectedProxies] = useState<Set<string>>(new Set())
   const utilization = data && data.totalCapacity > 0
     ? Math.min(100, (data.assignedSlots / data.totalCapacity) * 100)
     : 0
@@ -82,6 +84,54 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
     }
   }
 
+  const toggleProxy = (url: string) => setSelectedProxies(previous => {
+    const next = new Set(previous)
+    if (next.has(url)) next.delete(url)
+    else next.add(url)
+    return next
+  })
+
+  const importProxyFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    const text = await file.text()
+    const proxies = Array.from(new Set(text.split(/\r?\n/).flatMap(line => {
+      const match = line.match(/(?:socks5|https?):\/\/[^\s,"']+/i)
+      return match ? [match[0].replace(/[\]\)]+$/, '')] : []
+    })))
+    if (proxies.length === 0) {
+      toast.error('文件中没有识别到代理地址')
+      return
+    }
+    setWorking(true)
+    try {
+      const result = await addProxyPoolEntries({ proxies: proxies.map(proxyUrl => ({ proxyUrl })) })
+      toast.success(`${result.message}，识别 ${proxies.length} 条`)
+      onChanged()
+    } catch (error) {
+      toast.error(`导入代理失败：${(error as Error).message}`)
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  const removeSelected = async () => {
+    if (selectedProxies.size === 0) return
+    if (!confirm(`确定从代理池移除 ${selectedProxies.size} 个代理吗？已绑定账号不会被删除。`)) return
+    setWorking(true)
+    try {
+      const result = await removeProxyPoolEntries({ proxyUrls: Array.from(selectedProxies) })
+      toast.success(result.message)
+      setSelectedProxies(new Set())
+      onChanged()
+    } catch (error) {
+      toast.error(`删除代理失败：${(error as Error).message}`)
+    } finally {
+      setWorking(false)
+    }
+  }
+
   const candidates = bindingProxy
     ? credentials.filter(credential => !credential.hasProxy && bindingProxy.remainingSlots > 0)
     : []
@@ -97,6 +147,9 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
               代理池状态
             </CardTitle>
             <div className="flex flex-wrap gap-2">
+              <input id="proxy-import-file" type="file" accept=".txt,.csv,text/plain,text/csv" className="hidden" onChange={importProxyFile} disabled={working} />
+              <Button size="sm" variant="outline" className="gap-1.5" onClick={() => document.getElementById('proxy-import-file')?.click()} disabled={working}><Plus className="h-3.5 w-3.5" />导入代理</Button>
+              {selectedProxies.size > 0 && <Button size="sm" variant="destructive" className="gap-1.5" onClick={removeSelected} disabled={working}><Trash2 className="h-3.5 w-3.5" />删除选中 ({selectedProxies.size})</Button>}
               <Badge variant={data?.pendingCredentialCount ? 'warning' : 'success'}>等待 {data?.pendingCredentialCount ?? 0}</Badge>
               <Badge variant="outline">历史未绑定 {data?.unboundEnabledCount ?? 0}</Badge>
             </div>
@@ -123,7 +176,7 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
             <details className="group rounded-lg border" open>
               <summary className="cursor-pointer select-none px-4 py-3 text-sm font-medium">查看 {data.proxies.length} 个代理的占用明细</summary>
               <div className="grid gap-3 border-t bg-muted/10 p-3 lg:grid-cols-2 xl:grid-cols-3">
-                {data.proxies.map(proxy => <ProxyEntry key={proxy.proxyUrl} proxy={proxy} onBind={() => openBind(proxy)} onUnbind={unbind} working={working} />)}
+                {data.proxies.map(proxy => <ProxyEntry key={proxy.proxyUrl} proxy={proxy} selected={selectedProxies.has(proxy.proxyUrl)} onSelect={() => toggleProxy(proxy.proxyUrl)} onBind={() => openBind(proxy)} onUnbind={unbind} working={working} />)}
               </div>
             </details>
           )}
@@ -150,8 +203,8 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
   )
 }
 
-function ProxyEntry({ proxy, onBind, onUnbind, working }: { proxy: ProxyPoolEntryStatus; onBind: () => void; onUnbind: (id: number) => void; working: boolean }) {
-  return <div className="rounded-lg border bg-background p-3 text-xs"><div className="flex items-start justify-between gap-2"><div className="min-w-0 truncate font-mono font-medium" title={proxy.proxyUrl}>{proxy.proxyUrl}</div><Badge variant={proxy.assignedCount === 0 ? 'secondary' : proxy.abnormalCount > 0 ? 'destructive' : 'success'}>{proxy.assignedCount}/{proxy.assignedCount + proxy.remainingSlots}</Badge></div><div className="mt-2 flex flex-wrap gap-1"><Badge variant="success">正常 {proxy.healthyCount}</Badge><Badge variant={proxy.abnormalCount > 0 ? 'destructive' : 'outline'}>异常 {proxy.abnormalCount}</Badge><Badge variant="outline">未知 {proxy.unknownCount}</Badge>{proxy.assignedCount === 0 && <Badge variant="secondary">空置</Badge>}</div><div className="mt-3 space-y-1.5">{proxy.assignedCredentials.length === 0 ? <div className="text-muted-foreground">暂无绑定账号</div> : proxy.assignedCredentials.map(credential => <div key={credential.credentialId} className="flex items-center justify-between gap-2 rounded bg-muted/35 px-2 py-1.5"><div className="min-w-0"><div className="truncate font-medium">#{credential.credentialId} {credential.email || credential.subscriptionTitle || '未知账号'}</div><div className="text-muted-foreground">{credential.remaining == null || credential.usageLimit == null ? '余额未知' : `剩余 ${credential.remaining.toFixed(0)} / ${credential.usageLimit.toFixed(0)}`}</div></div><div className="flex items-center gap-1">{credential.health === 'healthy' ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : credential.health === 'abnormal' ? <AlertTriangle className="h-4 w-4 text-red-500" /> : <CircleHelp className="h-4 w-4 text-muted-foreground" />}<Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => onUnbind(credential.credentialId)} disabled={working}><Unplug className="h-3.5 w-3.5" /></Button></div></div>)}</div>{proxy.remainingSlots > 0 && <Button size="sm" variant="outline" className="mt-3 w-full gap-1.5" onClick={onBind} disabled={working}><UserPlus className="h-3.5 w-3.5" />手动绑定账号</Button>}</div>
+function ProxyEntry({ proxy, selected, onSelect, onBind, onUnbind, working }: { proxy: ProxyPoolEntryStatus; selected: boolean; onSelect: () => void; onBind: () => void; onUnbind: (id: number) => void; working: boolean }) {
+  return <div className="rounded-lg border bg-background p-3 text-xs"><div className="flex items-start justify-between gap-2"><label className="flex min-w-0 items-center gap-2"><Checkbox checked={selected} onCheckedChange={onSelect} /><span className="truncate font-mono font-medium" title={proxy.proxyUrl}>{proxy.proxyUrl}</span></label><Badge variant={proxy.assignedCount === 0 ? 'secondary' : proxy.abnormalCount > 0 ? 'destructive' : 'success'}>{proxy.assignedCount}/{proxy.assignedCount + proxy.remainingSlots}</Badge></div><div className="mt-2 flex flex-wrap gap-1"><Badge variant="success">正常 {proxy.healthyCount}</Badge><Badge variant={proxy.abnormalCount > 0 ? 'destructive' : 'outline'}>异常 {proxy.abnormalCount}</Badge><Badge variant="outline">未知 {proxy.unknownCount}</Badge>{proxy.assignedCount === 0 && <Badge variant="secondary">空置</Badge>}</div><div className="mt-3 space-y-1.5">{proxy.assignedCredentials.length === 0 ? <div className="text-muted-foreground">暂无绑定账号</div> : proxy.assignedCredentials.map(credential => <div key={credential.credentialId} className="flex items-center justify-between gap-2 rounded bg-muted/35 px-2 py-1.5"><div className="min-w-0"><div className="truncate font-medium">#{credential.credentialId} {credential.email || credential.subscriptionTitle || '未知账号'}</div><div className="text-muted-foreground">{credential.remaining == null || credential.usageLimit == null ? '余额未知' : `剩余 ${credential.remaining.toFixed(0)} / ${credential.usageLimit.toFixed(0)}`}</div></div><div className="flex items-center gap-1">{credential.health === 'healthy' ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : credential.health === 'abnormal' ? <AlertTriangle className="h-4 w-4 text-red-500" /> : <CircleHelp className="h-4 w-4 text-muted-foreground" />}<Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => onUnbind(credential.credentialId)} disabled={working}><Unplug className="h-3.5 w-3.5" /></Button></div></div>)}</div>{proxy.remainingSlots > 0 && <Button size="sm" variant="outline" className="mt-3 w-full gap-1.5" onClick={onBind} disabled={working}><UserPlus className="h-3.5 w-3.5" />手动绑定账号</Button>}</div>
 }
 
 function Metric({ label, value, tone = 'default' }: { label: string; value: string | number; tone?: 'default' | 'blue' | 'green' | 'red' }) { const toneClass = tone === 'blue' ? 'text-sky-700 dark:text-sky-300' : tone === 'green' ? 'text-green-700 dark:text-green-300' : tone === 'red' ? 'text-red-600 dark:text-red-400' : 'text-foreground'; return <div className="rounded-lg border bg-muted/15 px-3 py-3"><div className="text-xs text-muted-foreground">{label}</div><div className={`mt-1 font-mono text-xl font-bold tabular-nums ${toneClass}`}>{value}</div></div> }
