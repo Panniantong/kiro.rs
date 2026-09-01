@@ -885,8 +885,14 @@ impl AdminService {
 
         let mut pool = self.proxy_pool.lock();
         let before = pool.proxies.len();
-        pool.proxies
-            .retain(|entry| !urls.contains(&entry.proxy_url));
+        // GET /proxy-pool deliberately redacts proxy credentials before sending
+        // them to the admin UI. Accept both the persisted URL and that redacted
+        // representation here, otherwise a URL copied from the page can never
+        // match the stored entry and deletion silently removes zero rows.
+        pool.proxies.retain(|entry| {
+            !urls.contains(&entry.proxy_url)
+                && !urls.contains(&Self::redact_proxy_url(&entry.proxy_url))
+        });
         let removed = before - pool.proxies.len();
         self.persist_proxy_pool(&pool)?;
         Ok(removed)
