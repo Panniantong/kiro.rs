@@ -24,6 +24,8 @@ import {
   getMaxRelay,
   setMaxRelay,
   getProxyPool,
+  testProxyPoolEntry,
+  batchGetCredentialBalance,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
@@ -46,6 +48,23 @@ export function useProxyPool() {
     queryKey: ['proxyPool'],
     queryFn: getProxyPool,
     refetchInterval: 30000,
+  })
+}
+
+export function useTestProxyPoolEntry() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (proxyUrl: string) => testProxyPoolEntry(proxyUrl),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxyPool'] })
+    },
+  })
+}
+
+export function useBatchCredentialBalance() {
+  return useMutation({
+    mutationFn: ({ ids, forceRefresh = false }: { ids: number[]; forceRefresh?: boolean }) =>
+      batchGetCredentialBalance(ids, forceRefresh),
   })
 }
 

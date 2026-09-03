@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kiro RS 账号运营观察与代理恢复门禁</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.65 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f6f8fb; }
+    body { max-width: 1080px; margin: 0 auto; padding: 40px 24px 72px; background: #fff; }
+    h1, h2, h3 { color: #0b1830; line-height: 1.25; }
+    h1 { margin-top: 0; font-size: 2rem; }
+    h2 { margin-top: 2.4rem; border-bottom: 1px solid #dbe2ed; padding-bottom: .35rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    code { background: #eef2f7; padding: .1em .3em; border-radius: 4px; }
+    pre { overflow: auto; background: #111827; color: #e5e7eb; padding: 16px; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; }
+    th, td { border: 1px solid #dbe2ed; padding: 9px 10px; text-align: left; vertical-align: top; }
+    th { background: #eef3f9; }
+    .meta { color: #536178; }
+    .risk { border-left: 4px solid #d97706; background: #fff7ed; padding: 10px 14px; }
+    .ok { border-left: 4px solid #15803d; background: #f0fdf4; padding: 10px 14px; }
+  </style>
+</head>
+<body>
+  <h1>Kiro RS 账号运营观察与代理恢复门禁</h1>
+  <p class="meta">日期：2026-09-03　状态：已实现，待隔离部署验证　基线：FluxNode fork <code>fluxnode/fix-kam-import-duplicate-refresh</code></p>
+
+  <h2>1. 问题与目标</h2>
+  <p>运营需要在紧凑模式观察最近被禁用、但并非额度耗尽的账号；在手动挂载代理时查看禁用账号额度；理解禁用原因与重启可能性；并能区分代理出口故障与账号本身故障。现有实现已经有余额、代理池和出口测试能力，但查询范围、状态语义、错误归因和自动补位时序不统一。</p>
+  <div class="ok"><strong>目标：</strong>让“查余额—测代理—测账号—恢复”成为一条可追踪闭环。余额查询不自动启用账号；代理绑定只有在代理侧与账号侧检查均通过后才提交。</div>
+
+  <h2>2. 已确认的业务口径</h2>
+  <ul>
+    <li>“近 3 天”按当前禁用生命周期的 <code>disabledAt</code>，使用滚动 72 小时。</li>
+    <li>自动余额查询只覆盖当前禁用、<code>disabledAt &gt;= now - 72h</code>、且原因不是 <code>QuotaExceeded</code> 的账号。</li>
+    <li>手动绑定选择器可查看全部禁用账号；默认使用余额缓存，选中后允许显式查询。</li>
+    <li>余额查询、代理测试、账号测试是观察动作，不直接清除禁用、重置失败计数或启用账号。</li>
+    <li>只有后端恢复判定通过，才允许绑定/启用；前端不能绕过恢复门禁调用旧启用路径。</li>
+  </ul>
+
+  <h2>3. 状态模型</h2>
+  <h3>3.1 凭据持久化</h3>
+  <p>在 <code>KiroCredentials</code> 增加可选字段 <code>disabledAt: Option&lt;String&gt;</code>。字段向后兼容，旧数据缺失时保持 <code>null</code>，不推断历史时间。</p>
+  <ul>
+    <li>禁用从 false 变为 true 时写入 RFC3339 当前时间。</li>
+    <li>禁用原因变化但仍处于禁用状态时，不刷新时间。</li>
+    <li>恢复为启用时清除当前禁用生命周期的 <code>disabledAt</code>。</li>
+  </ul>
+
+  <h3>3.2 恢复元数据</h3>
+  <p>后端根据 <code>DisabledReason</code>返回统一的恢复元数据，前端不复制业务规则：</p>
+  <pre><code>{
+  "recoveryClass": "never | conditional | manual",
+  "recoveryChecks": [
+    "balance_positive",
+    "proxy_egress_passed",
+    "account_probe_passed",
+    "token_refresh_passed",
+    "config_fixed",
+    "quota_reset_observed"
+  ]
+}</code></pre>
+
+  <table>
+    <thead><tr><th>原因</th><th>含义</th><th>自动恢复</th><th>人工恢复前置</th></tr></thead>
+    <tbody>
+      <tr><td><code>QuotaExceeded</code></td><td>官方额度耗尽</td><td>否</td><td>确认额度重置且余额大于 0，或使用额度退役恢复流程</td></tr>
+      <tr><td><code>UpstreamSuspended</code></td><td>上游暂停/封停</td><td>否</td><td>不提供直接重启</td></tr>
+      <tr><td><code>InvalidRefreshToken</code></td><td>refresh token 无效</td><td>否</td><td>重新导入有效凭据</td></tr>
+      <tr><td><code>TooManyRefreshFailures</code></td><td>刷新连续失败</td><td>否</td><td>Token 刷新与账号探针均成功</td></tr>
+      <tr><td><code>TooManyFailures</code></td><td>请求连续失败</td><td>否</td><td>代理、账号探针成功后清失败计数</td></tr>
+      <tr><td><code>InvalidConfig</code></td><td>配置不合法</td><td>否</td><td>配置校验及账号探针成功</td></tr>
+      <tr><td><code>Manual</code></td><td>运营主动禁用</td><td>否</td><td>人工明确恢复且检查通过</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.3 余额探针</h3>
+  <p>复用现有 5 分钟余额缓存，增加状态摘要，明确区分：</p>
+  <ul>
+    <li><code>notChecked</code>：未查询；</li>
+    <li><code>checking</code>：请求中；</li>
+    <li><code>success</code>：已拿到额度；余额为 0 仍显示 0；</li>
+    <li><code>failed</code>：请求失败并附安全的错误分类；</li>
+    <li>旧缓存过期时显示旧值并标记过期，不冒充最新值。</li>
+  </ul>
+  <p>新增只读批量查询接口 <code>POST /credentials/batch-balance</code>，请求包含账号 ID 与显式 <code>forceRefresh</code>，响应按账号返回结果。服务端负责缓存、并发限制和单账号失败隔离。</p>
+
+  <h2>4. 代理与账号双层验真</h2>
+  <h3>4.1 代理侧探针</h3>
+  <p>新增代理池条目的独立测试，不依赖账号凭据：检查 URL 解析、认证、连接、出口 IP 和目标探针。返回 <code>proxyProbe</code>，包括状态、出口 IP、延迟、测试时间和失败分类。</p>
+  <p>出口 IP 相等校验只在代理 URL host 是字面 IP 且条目要求固定出口时启用。域名代理不能因为“域名不是 IP”被误判为出口不符。</p>
+
+  <h3>4.2 账号侧探针</h3>
+  <p>使用候选代理访问 Kiro 的轻量 <code>getUsageLimits</code> 路径，验证 Token、Profile、套餐、额度和上游响应。不上模型、不产生对话请求。返回 <code>accountProbe</code>，错误分类分开记录：</p>
+  <ul>
+    <li>代理连接/认证/出口问题 → 代理故障；</li>
+    <li><code>invalid_grant</code>、账号封停、账号拒绝 → 账号故障；</li>
+    <li>上游 429/5xx 或响应格式异常 → 上游/兼容性故障，不直接判账号失效；</li>
+    <li>余额为 0 → 额度状态，不是代理故障。</li>
+  </ul>
+
+  <h3>4.3 手动绑定</h3>
+  <pre><code>测试代理
+  → 选择账号（含禁用账号）
+  → 用候选代理测试账号
+  → 仅对双通过账号提交绑定并恢复
+  → 每个失败账号独立返回分类</code></pre>
+  <p>批量允许部分成功。失败账号不占槽，保持禁用并进入待处理队列；代理侧失败不会覆盖账号原有禁用原因。</p>
+
+  <h3>4.4 自动补位</h3>
+  <p>自动补位、按池分配、手动绑定统一进入同一恢复门禁。补位触发包括启动、新增代理、新增待绑定账号、额度释放、禁用释放、手动解绑和门禁开启。探针期间不持有长时间分配锁；提交时短锁重检账号未被占用且槽位仍可用。</p>
+  <ul>
+    <li>代理探针失败：记录代理失败，释放候选槽，账号继续等待。</li>
+    <li>代理通过但账号探针失败：不启用、不长期占槽，保留账号错误分类。</li>
+    <li>双探针通过：提交代理绑定，清除待绑定状态，按恢复规则启用。</li>
+    <li>失败重试采用冷却与退避，避免坏代理或坏账号造成重试风暴。</li>
+  </ul>
+
+  <h2>5. 控制台</h2>
+  <ul>
+    <li>紧凑模式增加“查询近 72 小时异常余额”，不再过滤掉符合条件的禁用账号。</li>
+    <li>手动绑定弹窗支持启用/禁用、禁用原因、最近 72 小时和余额状态筛选。</li>
+    <li>账号行显示余额状态、禁用原因说明、恢复分类和缺少的检查项。</li>
+    <li>代理池明细显示未验证、验证中、通过、失败、出口未校验和最近测试时间。</li>
+    <li>账号绑定明细分别显示代理探针、账号探针和最终恢复判定。</li>
+    <li>“绑定并验证”不等于强制启用；后端判定未通过时保持禁用。</li>
+  </ul>
+
+  <h2>6. 实施与验证</h2>
+  <ol>
+    <li>先完成状态字段、余额批量查询、原因说明和双探针响应。</li>
+    <li>再切换手动绑定、自动补位和按池分配到统一门禁。</li>
+    <li>在隔离 Kiro RS 测试容器/测试渠道验证，不重启生产 8992/8993/8994。</li>
+    <li>覆盖正常代理/账号、坏代理、坏 Token、额度耗尽、近 72 小时禁用、手动解绑补位、域名代理等场景。</li>
+    <li>隔离证据通过后，生产灰度仍需明确授权。</li>
+  </ol>
+
+  <h2>7. 非目标与风险</h2>
+  <div class="risk">
+    <ul>
+      <li>不把余额查询变成自动启用或自动重置；不改变用户请求语义。</li>
+      <li>不输出代理用户名、密码、完整凭据或 API key。</li>
+      <li>未知历史 <code>disabledAt</code> 不伪造为最近禁用。</li>
+      <li>代理出口通过不代表账号有效，必须保留第二层账号探针。</li>
+      <li>生产容器不在本规格内自动重启。</li>
+    </ul>
+  </div>
+</body>
+</html>

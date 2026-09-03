@@ -146,6 +146,11 @@ pub struct KiroCredentials {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
 
+    /// 当前禁用生命周期的开始时间（RFC3339）。
+    /// 旧凭据没有可靠历史时间时保持 None，不回填伪造时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -401,6 +406,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -534,6 +540,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -569,6 +576,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
@@ -687,6 +695,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
             rpm: None,

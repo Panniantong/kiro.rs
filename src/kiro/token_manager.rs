@@ -562,7 +562,10 @@ async fn list_available_profiles(
     let host = format!("q.{}.amazonaws.com", region);
     let url = format!("https://{}/ListAvailableProfiles", host);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let ua = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", config.kiro_version, machine_id);
+    let ua = format!(
+        "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+        config.kiro_version, machine_id
+    );
     let client = build_client(proxy, 60, config.tls_backend).ok()?;
     let response = client
         .post(&url)
@@ -611,10 +614,12 @@ pub(crate) async fn get_usage_limits(
 
     // profileArn 必填：上游已把它当准入条件，不带会 403。
     // 账号没存就按登录方式补占位符；API Key 账号不注入（上游口径不同）。
-    if let Some(effective_arn) =
-        crate::kiro::model::credentials::effective_profile_arn(credentials)
+    if let Some(effective_arn) = crate::kiro::model::credentials::effective_profile_arn(credentials)
     {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(&effective_arn)));
+        url.push_str(&format!(
+            "&profileArn={}",
+            urlencoding::encode(&effective_arn)
+        ));
     }
 
     // 构建 User-Agent headers
@@ -829,6 +834,9 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 当前禁用生命周期的开始时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -989,8 +997,7 @@ impl MultiTokenManager {
                     // 优先使用文件里持久化的禁用原因；缺失时才派生为 Manual
                     disabled_reason: if cred.disabled {
                         Some(
-                            cred
-                                .disabled_reason
+                            cred.disabled_reason
                                 .as_deref()
                                 .and_then(DisabledReason::from_str)
                                 .unwrap_or(DisabledReason::Manual),
@@ -1025,6 +1032,9 @@ impl MultiTokenManager {
                     "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
                     entry.id
                 );
+                if !entry.disabled {
+                    entry.credentials.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+                }
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::InvalidConfig);
             }
@@ -1159,6 +1169,7 @@ impl MultiTokenManager {
 
             entry.cooldown_until = None;
             if entry.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                entry.credentials.disabled_at = None;
                 entry.disabled = false;
                 entry.disabled_reason = None;
                 entry.failure_count = 0;
@@ -1476,6 +1487,7 @@ impl MultiTokenManager {
                             );
                             for e in entries.iter_mut() {
                                 if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                    e.credentials.disabled_at = None;
                                     e.disabled = false;
                                     e.disabled_reason = None;
                                     e.failure_count = 0;
@@ -1920,6 +1932,9 @@ impl MultiTokenManager {
             );
 
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                if !entry.disabled {
+                    entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
+                }
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 let cooldown_until = Utc::now() + Self::chrono_duration(TOO_MANY_FAILURES_COOLDOWN);
@@ -1975,6 +1990,7 @@ impl MultiTokenManager {
             }
 
             Self::release_in_flight_slot(entry);
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::UpstreamSuspended);
             entry.cooldown_until = None;
@@ -2117,6 +2133,7 @@ impl MultiTokenManager {
             }
 
             Self::release_in_flight_slot(entry);
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.cooldown_until = None;
@@ -2196,6 +2213,7 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
             entry.cooldown_until = None;
@@ -2255,6 +2273,7 @@ impl MultiTokenManager {
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
             entry.cooldown_until = None;
@@ -2400,6 +2419,7 @@ impl MultiTokenManager {
                         }
                         .to_string()
                     }),
+                    disabled_at: e.credentials.disabled_at.clone(),
                     endpoint: e.credentials.endpoint.clone(),
                     rpm: e.credentials.rpm,
                     effective_rpm,
@@ -2462,6 +2482,11 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if disabled && !entry.disabled {
+                entry.credentials.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+            } else if !disabled {
+                entry.credentials.disabled_at = None;
+            }
             entry.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
@@ -2528,7 +2553,10 @@ impl MultiTokenManager {
                 bail!("凭据不存在: {:?}", missing);
             }
 
-            for entry in entries.iter_mut().filter(|entry| target_ids.contains(&entry.id)) {
+            for entry in entries
+                .iter_mut()
+                .filter(|entry| target_ids.contains(&entry.id))
+            {
                 if let Some(note) = &import_note {
                     entry.credentials.import_note = Some(note.clone());
                 }
@@ -2625,6 +2653,7 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.disabled_at = None;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
@@ -2950,6 +2979,11 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        if initial_disabled {
+            validated_cred.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+        } else {
+            validated_cred.disabled_at = None;
+        }
         validated_cred.disabled = initial_disabled;
         let import_note_for_log = validated_cred.import_note.clone().unwrap_or_default();
 
@@ -3788,9 +3822,8 @@ mod tests {
     #[tokio::test]
     async fn test_add_credential_waits_for_refresh_lock() {
         let config = Config::default();
-        let manager = std::sync::Arc::new(
-            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
-        );
+        let manager =
+            std::sync::Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
         let refresh_guard = manager.refresh_lock.lock().await;
 
         let mut credential = KiroCredentials::default();
@@ -4437,6 +4470,17 @@ mod tests {
         let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(first.disabled);
         assert_eq!(first.disabled_reason.as_deref(), Some("Manual"));
+        assert!(first.disabled_at.is_some());
+
+        manager.set_disabled(1, false).unwrap();
+        let recovered = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == 1)
+            .unwrap();
+        assert!(!recovered.disabled);
+        assert!(recovered.disabled_at.is_none());
     }
 
     #[test]
@@ -4849,10 +4893,8 @@ mod tests {
 
     #[test]
     fn test_batch_update_credentials_persists_and_is_atomic() {
-        let path = std::env::temp_dir().join(format!(
-            "kiro-batch-update-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("kiro-batch-update-{}.json", uuid::Uuid::new_v4()));
         let mut first = KiroCredentials::default();
         first.id = Some(1);
         first.import_note = Some("old-a".to_string());

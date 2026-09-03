@@ -9,19 +9,20 @@ import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 interface CredentialCompactTableProps {
   credentials: CredentialStatusItem[]
   balances: Map<number, BalanceResponse>
+  balanceErrors: Map<number, string>
   loadingBalanceIds: Set<number>
   selectedIds: Set<number>
   onToggleSelect: (id: number) => void
 }
 
-const disabledReasonLabels: Record<string, string> = {
-  QuotaExceeded: '额度用尽',
-  UpstreamSuspended: '上游封停',
-  InvalidRefreshToken: 'Token 失效',
-  TooManyFailures: '连续失败',
-  TooManyRefreshFailures: '刷新失败',
-  InvalidConfig: '配置无效',
-  Manual: '手动禁用',
+const disabledReasonMeta: Record<string, { label: string; description: string }> = {
+  QuotaExceeded: { label: '额度用尽', description: '等待上游额度恢复；不会自动恢复' },
+  UpstreamSuspended: { label: '上游封停', description: '账号已被上游封停；不会自动恢复' },
+  InvalidRefreshToken: { label: 'Token 失效', description: '需要重新导入或更换 Token' },
+  TooManyFailures: { label: '连续失败', description: '需通过代理出口与账号探测后恢复' },
+  TooManyRefreshFailures: { label: '刷新失败', description: '需 Token 刷新与账号探测通过后恢复' },
+  InvalidConfig: { label: '配置无效', description: '修正配置并通过账号探测后恢复' },
+  Manual: { label: '手动禁用', description: '仅在人工确认后恢复' },
 }
 
 function formatLastUsed(value: string | null) {
@@ -41,6 +42,7 @@ function authLabel(value: string | null) {
 export function CredentialCompactTable({
   credentials,
   balances,
+  balanceErrors,
   loadingBalanceIds,
   selectedIds,
   onToggleSelect,
@@ -77,9 +79,11 @@ export function CredentialCompactTable({
           <tbody>
             {credentials.map((credential) => {
               const balance = balances.get(credential.id)
+              const balanceError = balanceErrors.get(credential.id)
               const loadingBalance = loadingBalanceIds.has(credential.id)
               const remaining = balance ? Math.max(0, balance.remaining) : null
               const limit = balance?.usageLimit ?? null
+              const reasonMeta = disabledReasonMeta[credential.disabledReason || '']
 
               return (
                 <tr
@@ -102,7 +106,23 @@ export function CredentialCompactTable({
                     {credential.disabled ? (
                       <div className="space-y-1">
                         <Badge variant="destructive">已禁用</Badge>
-                        <div className="text-xs">{disabledReasonLabels[credential.disabledReason || ''] || credential.disabledReason || '原因未知'}</div>
+                        <div className="text-xs">{reasonMeta?.label || credential.disabledReason || '原因未知'}</div>
+                        <div className="text-[11px] leading-4 text-muted-foreground">
+                          {reasonMeta?.description || '等待人工确认恢复条件'}
+                        </div>
+                        {credential.disabledAt && (
+                          <div className="text-[11px] text-muted-foreground">
+                            起始 {formatLastUsed(credential.disabledAt)}
+                          </div>
+                        )}
+                        {credential.recoveryChecks && credential.recoveryChecks.length > 0 && (
+                          <div className="text-[11px] text-muted-foreground">
+                            检查：{credential.recoveryChecks.join('、')}
+                          </div>
+                        )}
+                        <div className="text-[11px] text-muted-foreground">
+                          恢复：{credential.recoveryClass || 'manual'}
+                        </div>
                       </div>
                     ) : (
                       <Badge variant="success">可用</Badge>
@@ -115,14 +135,21 @@ export function CredentialCompactTable({
                   </td>
                   <td className="px-3 py-3 align-top font-mono tabular-nums">
                     {loadingBalance ? (
-                      <span className="inline-flex items-center gap-1 text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" />加载中</span>
+                      <span className="inline-flex items-center gap-1 text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" />查询中</span>
                     ) : balance ? (
                       <>
                         <div className="font-semibold text-foreground">{remaining?.toFixed(0)} / {limit?.toFixed(0)}</div>
                         <div className="text-xs text-muted-foreground">已用 {balance.usagePercentage.toFixed(1)}%</div>
+                        {credential.balanceState === 'stale' && (
+                          <div className="text-[11px] text-amber-600">缓存已过期</div>
+                        )}
                       </>
+                    ) : balanceError ? (
+                      <span className="text-destructive">查询失败 · {balanceError}</span>
+                    ) : credential.balanceState === 'stale' ? (
+                      <span className="text-amber-600">缓存已过期</span>
                     ) : (
-                      <span className="text-muted-foreground">未知</span>
+                      <span className="text-muted-foreground">未查询</span>
                     )}
                   </td>
                   <td className="max-w-[260px] px-3 py-3 align-top">

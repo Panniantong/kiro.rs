@@ -68,6 +68,21 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 当前禁用生命周期开始时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+    /// 后端统一恢复判定分类：none / never / conditional / manual
+    pub recovery_class: String,
+    /// 恢复前置检查代码
+    pub recovery_checks: Vec<String>,
+    /// 当前余额探针状态
+    pub balance_state: String,
+    pub balance_checked_at: Option<String>,
+    pub balance_source: Option<String>,
+    pub balance_error_class: Option<String>,
+    pub balance_remaining: Option<f64>,
+    pub balance_usage_limit: Option<f64>,
+    pub balance_next_reset_at: Option<f64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 凭据级 RPM 配置原值（None 表示跟随全局默认）
@@ -86,6 +101,43 @@ pub struct CredentialStatusItem {
     pub throttled_1h: u32,
     /// AWS 侧超额（overage）状态（ENABLED / DISABLED；None 表示未知/未同步）
     pub overage_status: Option<String>,
+}
+
+/// 账号余额缓存/探针状态摘要。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceProbeSummary {
+    /// notChecked / fresh / stale / failed
+    pub state: String,
+    pub checked_at: Option<String>,
+    pub source: Option<String>,
+    pub error_class: Option<String>,
+}
+
+/// 批量查询账号余额。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBalanceRequest {
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub force_refresh: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceProbeResult {
+    pub credential_id: u64,
+    pub state: String,
+    pub balance: Option<BalanceResponse>,
+    pub checked_at: Option<String>,
+    pub source: Option<String>,
+    pub error_class: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBalanceResponse {
+    pub results: Vec<BalanceProbeResult>,
 }
 
 // ============ 操作请求 ============
@@ -164,6 +216,33 @@ pub struct AddProxyPoolEntriesRequest {
 /// 从自动分配代理池移除代理。
 ///
 /// 仅阻止后续自动分配，不会改变已绑定账号的出口代理。
+/// 代理出口探针的非敏感摘要。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProbeSummary {
+    /// notTested / passed / failed
+    pub state: String,
+    pub egress_ip: Option<String>,
+    pub expected_ip: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub failure_class: Option<String>,
+    pub tested_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolTestRequest {
+    pub proxy_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolTestResponse {
+    pub proxy_url: String,
+    #[serde(flatten)]
+    pub probe: ProxyProbeSummary,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoveProxyPoolEntriesRequest {
@@ -220,6 +299,7 @@ pub struct ProxyPoolEntryStatus {
     pub healthy_count: usize,
     pub abnormal_count: usize,
     pub unknown_count: usize,
+    pub last_test: Option<ProxyProbeSummary>,
 }
 
 /// 代理下绑定账号的健康摘要。
@@ -235,7 +315,9 @@ pub struct ProxyAssignedCredentialStatus {
     pub remaining: Option<f64>,
     pub usage_limit: Option<f64>,
     pub balance_cached_at: Option<f64>,
-    /// healthy / abnormal / unknown
+    pub proxy_probe_state: String,
+    pub account_probe_state: String,
+    pub recovery_state: String,
     pub health: String,
 }
 
@@ -271,7 +353,9 @@ pub struct BatchCredentialIdsRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RecoverQuotaRetiredRequest { pub ids: Vec<u64> }
+pub struct RecoverQuotaRetiredRequest {
+    pub ids: Vec<u64>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

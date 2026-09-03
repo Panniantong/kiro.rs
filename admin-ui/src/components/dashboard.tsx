@@ -34,9 +34,9 @@ import {
 } from '@/hooks/use-credentials'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, batchGetCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
@@ -47,6 +47,16 @@ type CredentialViewMode = 'cards' | 'available-compact' | 'all-compact'
 function getInitialCredentialView(): CredentialViewMode {
   const stored = storage.getCredentialView()
   return stored === 'available-compact' || stored === 'all-compact' ? stored : 'cards'
+}
+
+const AUTO_BALANCE_LOOKBACK_MS = 72 * 60 * 60 * 1000
+
+function shouldAutoQueryBalance(credential: CredentialStatusItem): boolean {
+  if (!credential.disabled) return true
+  if (credential.disabledReason === 'QuotaExceeded') return false
+  if (!credential.disabledAt) return false
+  const disabledAt = Date.parse(credential.disabledAt)
+  return Number.isFinite(disabledAt) && Date.now() - disabledAt <= AUTO_BALANCE_LOOKBACK_MS
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -62,6 +72,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
+  const [balanceErrorMap, setBalanceErrorMap] = useState<Map<number, string>>(new Map())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [queryingInfo, setQueryingInfo] = useState(false)
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
@@ -159,6 +170,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     if (!data?.credentials) {
       setBalanceMap(new Map())
+      setBalanceErrorMap(new Map())
       setLoadingBalanceIds(new Set())
       return
     }
@@ -167,6 +179,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     setBalanceMap(prev => {
       const next = new Map<number, BalanceResponse>()
+      prev.forEach((value, id) => {
+        if (validIds.has(id)) {
+          next.set(id, value)
+        }
+      })
+      return next.size === prev.size ? prev : next
+    })
+
+    setBalanceErrorMap(prev => {
+      const next = new Map<number, string>()
       prev.forEach((value, id) => {
         if (validIds.has(id)) {
           next.set(id, value)
@@ -189,14 +211,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }, [data?.credentials])
 
-  // 紧凑视图自动补齐可用凭据余额；四路并发，避免瞬间打爆上游。
+  // 紧凑视图自动补齐可用凭据余额；四路批量查询，避免瞬间打爆上游。
   useEffect(() => {
     if (viewMode === 'cards' || !data?.credentials) return
 
     const ids = currentCredentials
       .filter(credential =>
-        !credential.disabled &&
+        shouldAutoQueryBalance(credential) &&
         !balanceMap.has(credential.id) &&
+        !balanceErrorMap.has(credential.id) &&
         !loadingBalanceIds.has(credential.id)
       )
       .map(credential => credential.id)
@@ -209,25 +232,45 @@ export function Dashboard({ onLogout }: DashboardProps) {
       for (let index = 0; index < ids.length; index += 4) {
         if (cancelled) break
         const chunk = ids.slice(index, index + 4)
-
         setLoadingBalanceIds(prev => new Set([...prev, ...chunk]))
-        const results = await Promise.allSettled(chunk.map(id => getCredentialBalance(id)))
 
-        if (cancelled) break
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          results.forEach((result, resultIndex) => {
-            if (result.status === 'fulfilled') {
-              next.set(chunk[resultIndex], result.value)
-            }
+        try {
+          const response = await batchGetCredentialBalance(chunk)
+          if (cancelled) break
+
+          setBalanceMap(prev => {
+            const next = new Map(prev)
+            response.results.forEach(result => {
+              if (result.balance) {
+                next.set(result.credentialId, result.balance)
+              }
+            })
+            return next
           })
-          return next
-        })
-        setLoadingBalanceIds(prev => {
-          const next = new Set(prev)
-          chunk.forEach(id => next.delete(id))
-          return next
-        })
+          setBalanceErrorMap(prev => {
+            const next = new Map(prev)
+            response.results.forEach(result => {
+              if (result.state === 'failed') {
+                next.set(result.credentialId, result.errorClass || '查询失败')
+              } else {
+                next.delete(result.credentialId)
+              }
+            })
+            return next
+          })
+        } catch {
+          setBalanceErrorMap(prev => {
+            const next = new Map(prev)
+            chunk.forEach(id => next.set(id, '批量查询失败'))
+            return next
+          })
+        } finally {
+          setLoadingBalanceIds(prev => {
+            const next = new Set(prev)
+            chunk.forEach(id => next.delete(id))
+            return next
+          })
+        }
       }
     }
 
@@ -488,61 +531,68 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
-  // 查询当前页凭据信息（逐个查询，避免瞬时并发）
+  // 查询当前页凭据信息；包含近期禁用账号，服务端按账号隔离失败。
   const handleQueryCurrentPageInfo = async () => {
     if (currentCredentials.length === 0) {
       toast.error('当前页没有可查询的凭据')
       return
     }
 
-    const ids = currentCredentials
-      .filter(credential => !credential.disabled)
-      .map(credential => credential.id)
-
-    if (ids.length === 0) {
-      toast.error('当前页没有可查询的启用凭据')
-      return
-    }
-
+    const ids = currentCredentials.map(credential => credential.id)
     setQueryingInfo(true)
     setQueryInfoProgress({ current: 0, total: ids.length })
 
     let successCount = 0
     let failCount = 0
 
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i]
-
-      setLoadingBalanceIds(prev => {
-        const next = new Set(prev)
-        next.add(id)
-        return next
-      })
+    for (let index = 0; index < ids.length; index += 4) {
+      const chunk = ids.slice(index, index + 4)
+      setLoadingBalanceIds(prev => new Set([...prev, ...chunk]))
 
       try {
-        const balance = await getCredentialBalance(id)
-        successCount++
+        const response = await batchGetCredentialBalance(chunk, true)
+        successCount += response.results.filter(result => Boolean(result.balance)).length
+        failCount += response.results.filter(result => result.state === 'failed').length
 
         setBalanceMap(prev => {
           const next = new Map(prev)
-          next.set(id, balance)
+          response.results.forEach(result => {
+            if (result.balance) {
+              next.set(result.credentialId, result.balance)
+            }
+          })
           return next
         })
-      } catch (error) {
-        failCount++
+        setBalanceErrorMap(prev => {
+          const next = new Map(prev)
+          response.results.forEach(result => {
+            if (result.state === 'failed') {
+              next.set(result.credentialId, result.errorClass || '查询失败')
+            } else {
+              next.delete(result.credentialId)
+            }
+          })
+          return next
+        })
+      } catch {
+        failCount += chunk.length
+        setBalanceErrorMap(prev => {
+          const next = new Map(prev)
+          chunk.forEach(id => next.set(id, '批量查询失败'))
+          return next
+        })
       } finally {
         setLoadingBalanceIds(prev => {
           const next = new Set(prev)
-          next.delete(id)
+          chunk.forEach(id => next.delete(id))
           return next
         })
       }
 
-      setQueryInfoProgress({ current: i + 1, total: ids.length })
+      setQueryInfoProgress({ current: Math.min(index + chunk.length, ids.length), total: ids.length })
     }
 
     setQueryingInfo(false)
-
     if (failCount === 0) {
       toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
     } else {
@@ -1254,6 +1304,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <CredentialCompactTable
               credentials={currentCredentials}
               balances={balanceMap}
+              balanceErrors={balanceErrorMap}
               loadingBalanceIds={loadingBalanceIds}
               selectedIds={selectedIds}
               onToggleSelect={toggleSelect}
@@ -1268,7 +1319,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
       />
-
       {/* 添加凭据对话框 */}
       <AddCredentialDialog
         open={addDialogOpen}

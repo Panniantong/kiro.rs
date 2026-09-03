@@ -10,11 +10,11 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
-        BatchCredentialIdsRequest, BatchSetCredentialProxyRequest, BatchSetRpmRequest,
-        BatchUpdateCredentialsRequest, ManualProxyBindRequest, ManualProxyUnbindRequest,
-        RemoveProxyPoolEntriesRequest, RecoverQuotaRetiredRequest, SetArmorBreakingRequest,
-        SetCredentialProxyRequest, SetDefaultRpmRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetMaxRelayRequest,
+        BatchBalanceRequest, BatchCredentialIdsRequest, BatchSetCredentialProxyRequest,
+        BatchSetRpmRequest, BatchUpdateCredentialsRequest, ManualProxyBindRequest,
+        ManualProxyUnbindRequest, ProxyPoolTestRequest, RecoverQuotaRetiredRequest,
+        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
+        SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetProPlusProxyGateRequest,
         SetRpmRequest, SuccessResponse,
     },
@@ -150,7 +150,11 @@ pub async fn manual_unbind_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<ManualProxyUnbindRequest>,
 ) -> impl IntoResponse {
-    match state.service.manual_unbind_proxy(payload.credential_ids).await {
+    match state
+        .service
+        .manual_unbind_proxy(payload.credential_ids)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
@@ -188,6 +192,18 @@ pub async fn remove_proxy_pool_entries(
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/test
+/// 独立测试代理池条目，不依赖账号凭据。
+pub async fn test_proxy_pool_entry(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyPoolTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_proxy_pool_entry(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 
@@ -238,6 +254,17 @@ pub async fn reset_failure_count(
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+/// POST /api/admin/credentials/batch-balance
+/// 逐个查询凭据余额，单个失败不会阻断其他账号。
+pub async fn batch_balance(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchBalanceRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_balance(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 
@@ -357,10 +384,11 @@ pub async fn batch_update_credentials(
     State(state): State<AdminState>,
     Json(payload): Json<BatchUpdateCredentialsRequest>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .batch_update_credentials(&payload.ids, payload.import_note, payload.priority)
-    {
+    match state.service.batch_update_credentials(
+        &payload.ids,
+        payload.import_note,
+        payload.priority,
+    ) {
         Ok(count) => Json(SuccessResponse::new(format!("已更新 {} 个凭据", count))).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }

@@ -29,6 +29,16 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  disabledAt?: string | null
+  recoveryClass?: 'none' | 'never' | 'conditional' | 'manual'
+  recoveryChecks?: string[]
+  balanceState?: 'notChecked' | 'fresh' | 'stale' | 'failed'
+  balanceCheckedAt?: string | null
+  balanceSource?: 'cache' | 'upstream' | null
+  balanceErrorClass?: string | null
+  balanceRemaining?: number | null
+  balanceUsageLimit?: number | null
+  balanceNextResetAt?: number | null
   endpoint: string
   // 上游尝试 RPM 限流
   rpm: number | null
@@ -50,12 +60,31 @@ export interface BalanceResponse {
   usageLimit: number
   remaining: number
   usagePercentage: number
+
   nextResetAt: number | null
   // 超额（overage）信息（单位均为次数；overageRate 为美元/次）
   overageStatus?: string | null
   currentOverages: number
   overageCap: number
   overageRate: number
+}
+
+export interface BatchBalanceRequest {
+  ids: number[]
+  forceRefresh?: boolean
+}
+
+export interface BalanceProbeResult {
+  credentialId: number
+  state: 'notChecked' | 'fresh' | 'stale' | 'failed'
+  balance: BalanceResponse | null
+  checkedAt: string | null
+  source: 'cache' | 'upstream' | null
+  errorClass: string | null
+}
+
+export interface BatchBalanceResponse {
+  results: BalanceProbeResult[]
 }
 
 // 成功响应
@@ -73,6 +102,19 @@ export interface AdminErrorResponse {
 }
 
 // 请求类型
+
+export interface ProxyProbeSummary {
+  state: 'notTested' | 'passed' | 'failed'
+  egressIp: string | null
+  expectedIp: string | null
+  latencyMs: number | null
+  failureClass: string | null
+  testedAt: string
+}
+
+export interface ProxyPoolTestResponse extends ProxyProbeSummary {
+  proxyUrl: string
+}
 export interface SetDisabledRequest {
   disabled: boolean
 }
@@ -141,7 +183,7 @@ export interface AddCredentialResponse {
   email?: string
   assignedProxyUrl?: string
   assignedProxyFromPool: boolean
-  activationRequiresProxy: boolean
+  unknownCount: number
   proxyPoolEligibility?: ProxyPoolEligibility
 }
 
@@ -149,12 +191,12 @@ export interface ProxyAssignedCredentialStatus {
   credentialId: number
   email?: string
   subscriptionTitle?: string
-  importNote?: string
-  disabled: boolean
-  disabledReason?: string
   remaining?: number
   usageLimit?: number
   balanceCachedAt?: number
+  proxyProbeState: string
+  accountProbeState: string
+  recoveryState: string
   health: 'healthy' | 'abnormal' | 'unknown'
 }
 
@@ -167,6 +209,7 @@ export interface ProxyPoolEntryStatus {
   healthyCount: number
   abnormalCount: number
   unknownCount: number
+  lastTest?: ProxyProbeSummary | null
 }
 
 export interface ProxyPoolResponse {

@@ -3,6 +3,7 @@ import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  BatchBalanceResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -21,13 +22,13 @@ import type {
   SetProPlusProxyGateRequest,
   SetMaxRelayRequest,
   ProxyPoolResponse,
+  ProxyPoolTestResponse,
   ManualProxyBindRequest,
   ManualProxyUnbindRequest,
   ManualProxyOperationResponse,
   AddProxyPoolEntriesRequest,
   RemoveProxyPoolEntriesRequest,
 } from '@/types/api'
-
 // 创建 axios 实例
 const api = axios.create({
   baseURL: '/api/admin',
@@ -112,6 +113,12 @@ export async function getProxyPool(): Promise<ProxyPoolResponse> {
   return data
 }
 
+// 独立测试代理池条目，不依赖账号探测。
+export async function testProxyPoolEntry(proxyUrl: string): Promise<ProxyPoolTestResponse> {
+  const { data } = await api.post<ProxyPoolTestResponse>('/proxy-pool/test', { proxyUrl })
+  return data
+}
+
 export async function manualBindProxy(
   req: ManualProxyBindRequest
 ): Promise<ManualProxyOperationResponse> {
@@ -159,6 +166,18 @@ export async function forceRefreshToken(
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 批量查询凭据余额；服务端按账号隔离失败并返回状态。
+export async function batchGetCredentialBalance(
+  ids: number[],
+  forceRefresh = false
+): Promise<BatchBalanceResponse> {
+  const { data } = await api.post<BatchBalanceResponse>('/credentials/batch-balance', {
+    ids,
+    forceRefresh,
+  })
   return data
 }
 

@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use parking_lot::Mutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -16,15 +17,17 @@ use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
-    AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse, BalanceResponse,
-    BatchSetCredentialProxyRequest, CredentialProxyTestResponse, CredentialStatusItem,
-    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
+    AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse,
+    BalanceProbeResult, BalanceProbeSummary, BalanceResponse, BatchBalanceRequest,
+    BatchBalanceResponse, BatchSetCredentialProxyRequest, CredentialProxyTestResponse,
+    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
     ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
     ProPlusProxyGateResponse, ProxyAssignedCredentialStatus, ProxyPoolAssignmentSkip,
-    ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, RemoveProxyPoolEntriesRequest,
-    RecoverQuotaRetiredRequest, RecoverQuotaRetiredResponse,
-    SetArmorBreakingRequest, SetCredentialProxyRequest, SetLoadBalancingModeRequest,
-    SetMaxRelayRequest, SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
+    ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, ProxyPoolTestRequest,
+    ProxyPoolTestResponse, ProxyProbeSummary, RecoverQuotaRetiredRequest,
+    RecoverQuotaRetiredResponse, RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
+    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+    SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -43,6 +46,12 @@ struct CachedBalance {
     cached_at: f64,
     /// 缓存的余额数据
     data: BalanceResponse,
+}
+
+#[derive(Debug, Clone)]
+struct BalanceFailure {
+    checked_at: String,
+    error_class: String,
 }
 
 /// 代理池持久化格式。凭据本身继续保存最终代理绑定，避免引入运行时依赖。
@@ -65,6 +74,8 @@ struct ProxyPoolEntry {
     proxy_url: String,
     proxy_username: Option<String>,
     proxy_password: Option<String>,
+    #[serde(default)]
+    last_test: Option<ProxyProbeSummary>,
 }
 
 /// Admin 服务
@@ -73,6 +84,7 @@ struct ProxyPoolEntry {
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    balance_errors: Mutex<HashMap<u64, BalanceFailure>>,
     cache_path: Option<PathBuf>,
     proxy_pool_path: Option<PathBuf>,
     proxy_pool: Mutex<ProxyPool>,
@@ -100,6 +112,7 @@ impl AdminService {
         let service = Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
+            balance_errors: Mutex::new(HashMap::new()),
             cache_path,
             proxy_pool_path,
             proxy_pool: Mutex::new(proxy_pool),
@@ -108,6 +121,96 @@ impl AdminService {
         };
         service.disable_unbound_kiro_pro_plus();
         service
+    }
+    fn balance_probe_summary(&self, id: u64) -> BalanceProbeSummary {
+        if let Some(failure) = self.balance_errors.lock().get(&id).cloned() {
+            return BalanceProbeSummary {
+                state: "failed".to_string(),
+                checked_at: Some(failure.checked_at),
+                source: Some("upstream".to_string()),
+                error_class: Some(failure.error_class),
+            };
+        }
+
+        let Some(cached) = self.balance_cache.lock().get(&id).cloned() else {
+            return BalanceProbeSummary {
+                state: "notChecked".to_string(),
+                checked_at: None,
+                source: None,
+                error_class: None,
+            };
+        };
+        let now = Utc::now().timestamp() as f64;
+        let checked_at = Utc
+            .timestamp_opt(cached.cached_at as i64, 0)
+            .single()
+            .map(|value| value.to_rfc3339());
+        BalanceProbeSummary {
+            state: if now - cached.cached_at < BALANCE_CACHE_TTL_SECS as f64 {
+                "fresh".to_string()
+            } else {
+                "stale".to_string()
+            },
+            checked_at,
+            source: Some("cache".to_string()),
+            error_class: None,
+        }
+    }
+
+    fn cache_balance(&self, balance: &BalanceResponse) {
+        self.balance_cache.lock().insert(
+            balance.id,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64,
+                data: balance.clone(),
+            },
+        );
+        self.balance_errors.lock().remove(&balance.id);
+        self.save_balance_cache();
+    }
+    fn recovery_metadata(disabled: bool, reason: Option<&str>) -> (String, Vec<String>) {
+        if !disabled {
+            return ("none".to_string(), Vec::new());
+        }
+        match reason.unwrap_or("Manual") {
+            "QuotaExceeded" => (
+                "never".to_string(),
+                vec!["quota_reset_observed".to_string()],
+            ),
+            "UpstreamSuspended" | "InvalidRefreshToken" => ("never".to_string(), Vec::new()),
+            "TooManyRefreshFailures" => (
+                "conditional".to_string(),
+                vec![
+                    "token_refresh_passed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            "TooManyFailures" => (
+                "conditional".to_string(),
+                vec![
+                    "proxy_egress_passed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            "InvalidConfig" => (
+                "conditional".to_string(),
+                vec![
+                    "config_fixed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            "Manual" => (
+                "manual".to_string(),
+                vec![
+                    "proxy_egress_passed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            _ => (
+                "manual".to_string(),
+                vec!["account_probe_passed".to_string()],
+            ),
+        }
     }
 
     /// 获取所有凭据状态
@@ -125,40 +228,61 @@ impl AdminService {
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                import_note: entry.import_note,
-                subscription_title: entry.subscription_title,
-                success_count: entry.success_count,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url.as_deref().map(Self::redact_proxy_url),
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: if retired_quota_ids.contains(&entry.id) {
+            .map(|entry| {
+                let disabled_reason = if retired_quota_ids.contains(&entry.id) {
                     Some("QuotaExceeded".to_string())
                 } else {
                     entry.disabled_reason
-                },
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
-                rpm: entry.rpm,
-                effective_rpm: entry.effective_rpm,
-                rpm_follows_default: entry.rpm_follows_default,
-                current_rpm: entry.current_rpm,
-                in_flight_requests: entry.in_flight_requests,
-                peak_rpm_1h: entry.peak_rpm_1h,
-                throttled_1h: entry.throttled_1h,
-                overage_status: entry.overage_status,
+                };
+                let (recovery_class, recovery_checks) =
+                    Self::recovery_metadata(entry.disabled, disabled_reason.as_deref());
+                let balance_probe = self.balance_probe_summary(entry.id);
+                let cached_balance = self.balance_cache.lock().get(&entry.id).cloned();
+                CredentialStatusItem {
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    import_note: entry.import_note,
+                    subscription_title: entry.subscription_title,
+                    success_count: entry.success_count,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url.as_deref().map(Self::redact_proxy_url),
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason,
+                    disabled_at: entry.disabled_at,
+                    recovery_class,
+                    recovery_checks,
+                    balance_state: balance_probe.state,
+                    balance_checked_at: balance_probe.checked_at,
+                    balance_source: balance_probe.source,
+                    balance_remaining: cached_balance.as_ref().map(|cached| cached.data.remaining),
+                    balance_usage_limit: cached_balance
+                        .as_ref()
+                        .map(|cached| cached.data.usage_limit),
+                    balance_next_reset_at: cached_balance
+                        .as_ref()
+                        .and_then(|cached| cached.data.next_reset_at),
+                    balance_error_class: balance_probe.error_class,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    rpm: entry.rpm,
+                    effective_rpm: entry.effective_rpm,
+                    rpm_follows_default: entry.rpm_follows_default,
+                    current_rpm: entry.current_rpm,
+                    in_flight_requests: entry.in_flight_requests,
+                    peak_rpm_1h: entry.peak_rpm_1h,
+                    throttled_1h: entry.throttled_1h,
+                    overage_status: entry.overage_status,
+                }
             })
             .collect();
 
@@ -329,6 +453,47 @@ impl AdminService {
                 "至少需要一个凭据 ID".to_string(),
             ));
         }
+        if self.token_manager.get_require_pro_plus_credential_proxy() {
+            let ids = req.ids.clone();
+            for id in &ids {
+                let credentials = self
+                    .token_manager
+                    .credential_and_effective_proxy(*id)
+                    .map_err(|error| self.classify_error(error, *id))?
+                    .0;
+                if !credentials.proxy_url.is_some() {
+                    self.mark_proxy_pending(*id)?;
+                }
+            }
+            let _ = self.reconcile_pending_pro_plus().await?;
+            let snapshot = self.token_manager.snapshot();
+            let assigned_credential_ids = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    snapshot
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == *id && entry.has_proxy)
+                })
+                .collect::<Vec<_>>();
+            let assigned = assigned_credential_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let skipped = ids
+                .into_iter()
+                .filter(|id| !assigned.contains(id))
+                .map(|credential_id| ProxyPoolAssignmentSkip {
+                    credential_id,
+                    reason: "账号仍在待验证队列，未提交代理绑定".to_string(),
+                })
+                .collect();
+            return Ok(AssignCredentialProxyFromPoolResponse {
+                assigned_credential_ids,
+                skipped,
+            });
+        }
 
         let mut assigned_credential_ids = Vec::new();
         let mut skipped = Vec::new();
@@ -401,7 +566,7 @@ impl AdminService {
         })
     }
 
-    /// 为代理不足或出口验证失败的所有账号自动补绑；只有出口验证通过才启用。
+    /// 为代理不足或出口验证失败的所有账号自动补绑；只有代理与账号探针均通过才启用。
     pub async fn reconcile_pending_pro_plus(&self) -> Result<(usize, usize), AdminServiceError> {
         if !self.token_manager.get_require_pro_plus_credential_proxy() {
             return Ok((0, self.pending_proxy_ids().len()));
@@ -409,48 +574,119 @@ impl AdminService {
 
         let mut enabled_count = 0;
         for id in self.pending_proxy_ids() {
-            let credentials = match self.token_manager.credential_and_effective_proxy(id) {
-                Ok((credentials, _)) => credentials,
+            let (credentials, _) = match self.token_manager.credential_and_effective_proxy(id) {
+                Ok(value) => value,
                 Err(_) => {
                     self.clear_proxy_pending(id)?;
                     continue;
                 }
             };
 
-            if !Self::has_credential_proxy(&credentials) {
-                let _allocation_guard = self.allocation_lock.lock().await;
-                let proxy = match self.next_proxy_pool_entry() {
-                    Ok(Some(proxy)) => proxy,
-                    Ok(None) => break,
-                    Err(AdminServiceError::InvalidCredential(message))
-                        if message.starts_with("代理池已满") =>
-                    {
-                        break;
-                    }
-                    Err(error) => return Err(error),
+            let (proxy, already_bound) = if Self::has_credential_proxy(&credentials) {
+                (
+                    ProxyPoolEntry {
+                        proxy_url: credentials.proxy_url.clone().unwrap_or_default(),
+                        proxy_username: credentials.proxy_username.clone(),
+                        proxy_password: credentials.proxy_password.clone(),
+                        last_test: None,
+                    },
+                    true,
+                )
+            } else {
+                let Some(proxy) = self.next_proxy_pool_entry()? else {
+                    break;
                 };
+                (proxy, false)
+            };
+
+            let proxy_test = if already_bound {
+                match self.test_credential_proxy(id).await {
+                    Ok(result) if Self::proxy_test_matches_expected_egress(&result) => true,
+                    Ok(_) | Err(_) => false,
+                }
+            } else {
+                self.test_proxy_pool_entry(ProxyPoolTestRequest {
+                    proxy_url: proxy.proxy_url.clone(),
+                })
+                .await?
+                .probe
+                .state
+                    == "passed"
+            };
+            if !proxy_test {
                 self.token_manager
-                    .set_credential_proxy(
-                        id,
-                        Some(proxy.proxy_url),
-                        proxy.proxy_username,
-                        proxy.proxy_password,
-                    )
+                    .set_disabled_without_release_event(id, true)
                     .map_err(|error| self.classify_error(error, id))?;
+                if already_bound {
+                    let _ = self.release_disabled_credential_proxy(id, false)?;
+                }
+                continue;
             }
 
-            match self.test_credential_proxy(id).await {
-                Ok(result) if Self::proxy_test_matches_expected_egress(&result) => {
-                    self.set_disabled(id, false)?;
+            let balance = match self.probe_credential_with_proxy(id, &proxy).await {
+                Ok(balance) => balance,
+                Err(error) => {
+                    self.token_manager
+                        .set_disabled_without_release_event(id, true)
+                        .map_err(|inner| self.classify_error(inner, id))?;
+                    if already_bound {
+                        let _ = self.release_disabled_credential_proxy(id, false)?;
+                    }
+                    tracing::warn!(
+                        credential_id = id,
+                        error_class = %Self::balance_error_class(&error),
+                        "代理通过但账号探针失败，继续等待恢复"
+                    );
+                    continue;
+                }
+            };
+            if Self::is_quota_exhausted_balance(&balance)
+                || !self.can_recover_after_probe(id, &balance)?
+            {
+                continue;
+            }
+
+            let commit_result = {
+                let _allocation_guard = self.allocation_lock.lock().await;
+                let current = self
+                    .token_manager
+                    .credential_and_effective_proxy(id)
+                    .map_err(|error| self.classify_error(error, id))?
+                    .0;
+                if !already_bound && Self::has_credential_proxy(&current) {
+                    Err(AdminServiceError::InvalidCredential(
+                        "账号在验证期间已绑定其他代理".to_string(),
+                    ))
+                } else {
+                    if !already_bound {
+                        self.ensure_proxy_binding_capacity(&proxy.proxy_url, &[id])?;
+                        self.token_manager
+                            .set_credential_proxy(
+                                id,
+                                Some(proxy.proxy_url.clone()),
+                                proxy.proxy_username.clone(),
+                                proxy.proxy_password.clone(),
+                            )
+                            .map_err(|error| self.classify_error(error, id))?;
+                    }
+                    if current.disabled {
+                        self.set_disabled(id, false)?;
+                    }
+                    Ok(())
+                }
+            };
+            match commit_result {
+                Ok(()) => {
                     self.clear_proxy_pending(id)?;
                     enabled_count += 1;
                 }
-                Ok(_) | Err(_) => {
-                    // 验证失败继续等待，但释放失败绑定，避免禁用账号长期占槽；绝不回退直连。
-                    self.token_manager
-                        .set_disabled_without_release_event(id, true)
-                        .map_err(|error| self.classify_error(error, id))?;
-                    self.release_disabled_credential_proxy(id, false)?;
+                Err(error) => {
+                    if !already_bound {
+                        let _ = self
+                            .token_manager
+                            .set_credential_proxy(id, None, None, None);
+                    }
+                    tracing::warn!(credential_id = id, "代理自动补位提交失败: {}", error);
                 }
             }
         }
@@ -564,11 +800,11 @@ impl AdminService {
             }
         }
     }
-
     /// 获取代理池及当前账号占用情况。已绑定但后来从池移除的账号不计入可分配池。
     pub fn get_proxy_pool(&self) -> ProxyPoolResponse {
         let snapshot = self.token_manager.snapshot();
         let balance_cache = self.balance_cache.lock().clone();
+        let balance_errors = self.balance_errors.lock().clone();
         let max_accounts_per_proxy = self.token_manager.get_max_accounts_per_proxy();
         let pool = self.proxy_pool.lock();
         let proxies = pool
@@ -585,13 +821,29 @@ impl AdminService {
                         let balance = balance_cache.get(&credential.id);
                         let remaining = balance.map(|cached| cached.data.remaining);
                         let usage_limit = balance.map(|cached| cached.data.usage_limit);
+                        let proxy_probe_state = entry
+                            .last_test
+                            .as_ref()
+                            .map(|test| test.state.clone())
+                            .unwrap_or_else(|| "notTested".to_string());
+                        let account_probe_state = if balance_errors.contains_key(&credential.id) {
+                            "failed"
+                        } else if balance.is_some() {
+                            "passed"
+                        } else {
+                            "notTested"
+                        };
+                        let recovery_state = if credential.disabled {
+                            "blocked"
+                        } else {
+                            "passed"
+                        };
                         let health = if credential.disabled
                             || matches!(
                                 (remaining, usage_limit),
                                 (Some(value), Some(limit))
                                     if limit > 0.0 && value <= BALANCE_EXHAUSTED_EPSILON
-                            )
-                        {
+                            ) {
                             "abnormal"
                         } else if remaining.is_some() && usage_limit.is_some() {
                             "healthy"
@@ -608,6 +860,9 @@ impl AdminService {
                             remaining,
                             usage_limit,
                             balance_cached_at: balance.map(|cached| cached.cached_at),
+                            proxy_probe_state,
+                            account_probe_state: account_probe_state.to_string(),
+                            recovery_state: recovery_state.to_string(),
                             health: health.to_string(),
                         }
                     })
@@ -635,6 +890,7 @@ impl AdminService {
                     healthy_count,
                     abnormal_count,
                     unknown_count,
+                    last_test: entry.last_test.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -659,7 +915,10 @@ impl AdminService {
             .filter(|credential| !credential.disabled && !credential.has_proxy)
             .count();
         let empty_reason = if pending_credential_count > 0 && available_slots == 0 {
-            Some(format!("代理池已满，{} 个账号等待分配", pending_credential_count))
+            Some(format!(
+                "代理池已满，{} 个账号等待分配",
+                pending_credential_count
+            ))
         } else if pending_credential_count > 0 {
             Some(format!(
                 "有空位但仍有 {} 个账号等待：代理出口验证失败或账号不可用",
@@ -697,6 +956,33 @@ impl AdminService {
 
     /// 追加代理池条目。重复 URL 会更新认证信息但不会产生重复槽位。
 
+    fn can_recover_after_probe(
+        &self,
+        id: u64,
+        balance: &BalanceResponse,
+    ) -> Result<bool, AdminServiceError> {
+        let entry = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        if !entry.disabled {
+            return Ok(true);
+        }
+        match entry.disabled_reason.as_deref() {
+            Some("UpstreamSuspended") | Some("InvalidRefreshToken") => Ok(false),
+            Some("QuotaExceeded") => Ok(balance.remaining > BALANCE_EXHAUSTED_EPSILON
+                && !self
+                    .proxy_pool
+                    .lock()
+                    .retired_quota_credential_ids
+                    .contains(&id)),
+            _ => Ok(true),
+        }
+    }
+
     /// 从代理池手动绑定账号，并验证实际出口。
     pub async fn manual_bind_proxy(
         &self,
@@ -708,21 +994,42 @@ impl AdminService {
                 "至少需要一个凭据 ID".to_string(),
             ));
         }
-        let _allocation_guard = self.allocation_lock.lock().await;
         let proxy_url = proxy_url.trim_end_matches('/').to_string();
         let proxy = self
             .proxy_pool
             .lock()
             .proxies
             .iter()
-            .find(|proxy| proxy.proxy_url.trim_end_matches('/') == proxy_url)
+            .find(|entry| {
+                let actual = entry.proxy_url.trim_end_matches('/');
+                let redacted = Self::redact_proxy_url(&entry.proxy_url);
+                actual == proxy_url || redacted.trim_end_matches('/') == proxy_url
+            })
             .cloned()
             .ok_or_else(|| AdminServiceError::InvalidCredential("代理不在代理池中".to_string()))?;
-        self.ensure_proxy_binding_capacity(&proxy.proxy_url, &credential_ids)?;
+        let proxy_test = self
+            .test_proxy_pool_entry(ProxyPoolTestRequest {
+                proxy_url: proxy.proxy_url.clone(),
+            })
+            .await?;
+        let proxy_failure = proxy_test
+            .probe
+            .failure_class
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         let mut updated = Vec::new();
         let mut failed = Vec::new();
         for id in credential_ids {
+            if proxy_test.probe.state != "passed" {
+                self.mark_proxy_pending(id)?;
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: format!("代理侧验证失败：{}", proxy_failure),
+                });
+                continue;
+            }
+
             let credentials = self
                 .token_manager
                 .credential_and_effective_proxy(id)
@@ -735,28 +1042,80 @@ impl AdminService {
                 });
                 continue;
             }
-            self.token_manager
-                .set_credential_proxy(
-                    id,
-                    Some(proxy.proxy_url.clone()),
-                    proxy.proxy_username.clone(),
-                    proxy.proxy_password.clone(),
-                )
-                .map_err(|error| self.classify_error(error, id))?;
-            match self.test_credential_proxy(id).await {
-                Ok(result) if Self::proxy_test_matches_expected_egress(&result) => {
-                    self.set_disabled(id, false)?;
-                    self.clear_proxy_pending(id)?;
-                    updated.push(id);
-                }
-                Ok(_) | Err(_) => {
-                    self.token_manager
-                        .set_credential_proxy(id, None, None, None)
-                        .map_err(|error| self.classify_error(error, id))?;
+
+            let balance = match self.probe_credential_with_proxy(id, &proxy).await {
+                Ok(balance) => balance,
+                Err(error) => {
                     self.mark_proxy_pending(id)?;
                     failed.push(ProxyPoolAssignmentSkip {
                         credential_id: id,
-                        reason: "代理出口验证失败，已释放绑定并保持等待".to_string(),
+                        reason: format!(
+                            "账号侧验证失败：{} ({})",
+                            Self::balance_error_class(&error),
+                            error
+                        ),
+                    });
+                    continue;
+                }
+            };
+            if Self::is_quota_exhausted_balance(&balance) {
+                self.mark_proxy_pending(id)?;
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号侧验证通过，但额度已耗尽".to_string(),
+                });
+                continue;
+            }
+            if !self.can_recover_after_probe(id, &balance)? {
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号当前禁用原因不允许直接恢复，请重新导入或等待上游处理".to_string(),
+                });
+                continue;
+            }
+
+            let commit_result = {
+                let _allocation_guard = self.allocation_lock.lock().await;
+                self.ensure_proxy_binding_capacity(&proxy.proxy_url, &[id])
+                    .and_then(|_| {
+                        self.token_manager
+                            .set_credential_proxy(
+                                id,
+                                Some(proxy.proxy_url.clone()),
+                                proxy.proxy_username.clone(),
+                                proxy.proxy_password.clone(),
+                            )
+                            .map_err(|error| self.classify_error(error, id))
+                    })
+                    .and_then(|_| {
+                        let currently_disabled = self
+                            .token_manager
+                            .snapshot()
+                            .entries
+                            .into_iter()
+                            .find(|entry| entry.id == id)
+                            .map(|entry| entry.disabled)
+                            .unwrap_or(false);
+                        if currently_disabled {
+                            self.set_disabled(id, false)
+                        } else {
+                            Ok(())
+                        }
+                    })
+            };
+            match commit_result {
+                Ok(()) => {
+                    self.clear_proxy_pending(id)?;
+                    updated.push(id);
+                }
+                Err(error) => {
+                    let _ = self
+                        .token_manager
+                        .set_credential_proxy(id, None, None, None);
+                    self.mark_proxy_pending(id)?;
+                    failed.push(ProxyPoolAssignmentSkip {
+                        credential_id: id,
+                        reason: format!("提交绑定失败：{}", error),
                     });
                 }
             }
@@ -804,8 +1163,16 @@ impl AdminService {
             self.token_manager
                 .set_credential_proxy(id, None, None, None)
                 .map_err(|error| self.classify_error(error, id))?;
-            self.clear_proxy_pending(id)?;
+            if self.token_manager.get_require_pro_plus_credential_proxy() {
+                self.mark_proxy_pending(id)?;
+            } else {
+                self.clear_proxy_pending(id)?;
+            }
             updated.push(id);
+        }
+        drop(_allocation_guard);
+        if !updated.is_empty() {
+            let _ = self.reconcile_pending_pro_plus().await?;
         }
         Ok(ManualProxyOperationResponse {
             updated_credential_ids: updated,
@@ -842,6 +1209,7 @@ impl AdminService {
                 proxy_url,
                 proxy_username,
                 proxy_password,
+                last_test: None,
             });
         }
 
@@ -898,6 +1266,138 @@ impl AdminService {
         Ok(removed)
     }
 
+    fn expected_egress_ip(proxy_url: Option<&str>) -> Option<std::net::IpAddr> {
+        proxy_url
+            .and_then(|url| Url::parse(url).ok())
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+    }
+
+    fn classify_proxy_probe_error(message: &str) -> String {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("407") || lower.contains("proxy authentication") {
+            "auth_failed".to_string()
+        } else if lower.contains("timed out") || lower.contains("timeout") {
+            "connect_timeout".to_string()
+        } else if lower.contains("dns")
+            || lower.contains("resolve")
+            || lower.contains("name or service")
+        {
+            "connect_failed".to_string()
+        } else if lower.contains("response") || lower.contains("status") {
+            "target_unreachable".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    async fn probe_proxy(
+        &self,
+        effective_proxy: Option<&crate::http_client::ProxyConfig>,
+        expected_proxy_url: Option<&str>,
+    ) -> Result<ProxyProbeSummary, AdminServiceError> {
+        let tested_at = Utc::now().to_rfc3339();
+        let started = Instant::now();
+        let client = crate::http_client::build_client(
+            effective_proxy,
+            15,
+            self.token_manager.config().tls_backend,
+        )
+        .map_err(|error| {
+            AdminServiceError::InvalidCredential(format!("代理配置无效: {}", error))
+        })?;
+        let response = client
+            .get("https://api.ipify.org?format=json")
+            .send()
+            .await
+            .map_err(|error| {
+                AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", error))
+            })?
+            .error_for_status()
+            .map_err(|error| {
+                AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", error))
+            })?;
+        let body: serde_json::Value = response.json().await.map_err(|error| {
+            AdminServiceError::UpstreamError(format!("代理出口测试响应无效: {}", error))
+        })?;
+        let egress_ip = body
+            .get("ip")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AdminServiceError::UpstreamError("代理出口测试未返回 IP".to_string()))?
+            .to_string();
+        let expected_ip = Self::expected_egress_ip(expected_proxy_url);
+        let matches_expected = expected_ip
+            .map(|expected| egress_ip.parse::<std::net::IpAddr>().ok() == Some(expected))
+            .unwrap_or(true);
+        Ok(ProxyProbeSummary {
+            state: if matches_expected { "passed" } else { "failed" }.to_string(),
+            egress_ip: Some(egress_ip),
+            expected_ip: expected_ip.map(|value| value.to_string()),
+            latency_ms: Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            failure_class: if matches_expected {
+                None
+            } else {
+                Some("egress_mismatch".to_string())
+            },
+            tested_at,
+        })
+    }
+
+    pub async fn test_proxy_pool_entry(
+        &self,
+        req: ProxyPoolTestRequest,
+    ) -> Result<ProxyPoolTestResponse, AdminServiceError> {
+        let requested_url = req.proxy_url.trim_end_matches('/').to_string();
+        let entry = self
+            .proxy_pool
+            .lock()
+            .proxies
+            .iter()
+            .find(|entry| {
+                let actual = entry.proxy_url.trim_end_matches('/');
+                let redacted = Self::redact_proxy_url(&entry.proxy_url);
+                actual == requested_url || redacted.trim_end_matches('/') == requested_url
+            })
+            .cloned()
+            .ok_or_else(|| AdminServiceError::InvalidCredential("代理不在代理池中".to_string()))?;
+        let mut probe_credentials = KiroCredentials::default();
+        probe_credentials.proxy_url = Some(entry.proxy_url.clone());
+        probe_credentials.proxy_username = entry.proxy_username.clone();
+        probe_credentials.proxy_password = entry.proxy_password.clone();
+        let effective_proxy = probe_credentials.effective_proxy(None);
+        let summary = match self
+            .probe_proxy(effective_proxy.as_ref(), Some(&entry.proxy_url))
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => ProxyProbeSummary {
+                state: "failed".to_string(),
+                egress_ip: None,
+                expected_ip: Self::expected_egress_ip(Some(&entry.proxy_url))
+                    .map(|value| value.to_string()),
+                latency_ms: None,
+                failure_class: Some(Self::classify_proxy_probe_error(&error.to_string())),
+                tested_at: Utc::now().to_rfc3339(),
+            },
+        };
+        {
+            let mut pool = self.proxy_pool.lock();
+            if let Some(current) = pool
+                .proxies
+                .iter_mut()
+                .find(|current| current.proxy_url == entry.proxy_url)
+            {
+                current.last_test = Some(summary.clone());
+                self.persist_proxy_pool(&pool)?;
+            }
+        }
+        Ok(ProxyPoolTestResponse {
+            proxy_url: Self::redact_proxy_url(&entry.proxy_url),
+            probe: summary,
+        })
+    }
+
     /// 以指定凭据实际会使用的代理访问出口探针，不触发 Kiro Token 刷新或上游模型调用。
     pub async fn test_credential_proxy(
         &self,
@@ -907,29 +1407,13 @@ impl AdminService {
             .token_manager
             .credential_and_effective_proxy(id)
             .map_err(|e| self.classify_error(e, id))?;
-        let client = crate::http_client::build_client(
-            effective_proxy.as_ref(),
-            15,
-            self.token_manager.config().tls_backend,
-        )
-        .map_err(|e| AdminServiceError::InvalidCredential(format!("代理配置无效: {}", e)))?;
-        let response = client
-            .get("https://api.ipify.org?format=json")
-            .send()
-            .await
-            .map_err(|e| AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", e)))?;
-        let response = response
-            .error_for_status()
-            .map_err(|e| AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", e)))?;
-        let body: serde_json::Value = response.json().await.map_err(|e| {
-            AdminServiceError::UpstreamError(format!("代理出口测试响应无效: {}", e))
-        })?;
-        let egress_ip = body
-            .get("ip")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AdminServiceError::UpstreamError("代理出口测试未返回 IP".to_string()))?
-            .to_string();
+        let summary = self
+            .probe_proxy(effective_proxy.as_ref(), credentials.proxy_url.as_deref())
+            .await?;
+        let egress_ip = summary
+            .egress_ip
+            .clone()
+            .ok_or_else(|| AdminServiceError::UpstreamError("代理出口测试未返回 IP".to_string()))?;
 
         Ok(CredentialProxyTestResponse {
             credential_id: id,
@@ -937,23 +1421,18 @@ impl AdminService {
             uses_credential_proxy: credentials.proxy_url.is_some(),
             proxy_url: credentials.proxy_url.as_deref().map(Self::redact_proxy_url),
             egress_ip,
-            tested_at: Utc::now().to_rfc3339(),
+            tested_at: summary.tested_at,
         })
     }
 
-    /// PRO+ 自动启用只接受账号级代理，且出口 IP 必须与代理 URL 中的 IP 一致。
+    /// PRO+ 自动启用要求账号级代理；若代理地址不是字面 IP，则只校验出口可用性。
     fn proxy_test_matches_expected_egress(result: &CredentialProxyTestResponse) -> bool {
         if !result.uses_proxy || !result.uses_credential_proxy {
             return false;
         }
-        let expected_ip = result
-            .proxy_url
-            .as_deref()
-            .and_then(|url| Url::parse(url).ok())
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .and_then(|host| host.parse::<std::net::IpAddr>().ok());
-        let actual_ip = result.egress_ip.parse::<std::net::IpAddr>().ok();
-        expected_ip.is_some() && expected_ip == actual_ip
+        Self::expected_egress_ip(result.proxy_url.as_deref())
+            .map(|expected| result.egress_ip.parse::<std::net::IpAddr>().ok() == Some(expected))
+            .unwrap_or(true)
     }
 
     fn validate_proxy_binding(
@@ -1043,6 +1522,11 @@ impl AdminService {
                     })
                     .count()
                     < self.token_manager.get_max_accounts_per_proxy()
+                    && !entry
+                        .last_test
+                        .as_ref()
+                        .map(|test| test.state == "failed")
+                        .unwrap_or(false)
             })
             .cloned()
             .map(Some)
@@ -1069,8 +1553,7 @@ impl AdminService {
             .as_deref()
             .map(|title| format!("全账号代理门禁已开启，{title:?} 允许自动分配代理"))
             .unwrap_or_else(|| {
-                "全账号代理门禁已开启；即使未返回 subscriptionTitle 也允许分配代理"
-                    .to_string()
+                "全账号代理门禁已开启；即使未返回 subscriptionTitle 也允许分配代理".to_string()
             });
         ProxyPoolEligibility {
             eligible: true,
@@ -1489,70 +1972,150 @@ impl AdminService {
         &self,
         req: RecoverQuotaRetiredRequest,
     ) -> Result<RecoverQuotaRetiredResponse, AdminServiceError> {
-        let _ = self.assign_credentials_proxy_from_pool(AssignCredentialProxyFromPoolRequest { ids: req.ids.clone() }).await?;
+        let _ = self
+            .assign_credentials_proxy_from_pool(AssignCredentialProxyFromPoolRequest {
+                ids: req.ids.clone(),
+            })
+            .await?;
         let mut recovered = Vec::new();
         let mut skipped = Vec::new();
         for id in req.ids {
             let balance = self.get_balance(id).await?;
             if balance.remaining <= 0.0 {
-                skipped.push(ProxyPoolAssignmentSkip { credential_id: id, reason: "余额仍为 0，未恢复".to_string() });
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "余额仍为 0，未恢复".to_string(),
+                });
                 continue;
             }
             {
                 let mut pool = self.proxy_pool.lock();
-                pool.retired_quota_credential_ids.retain(|retired_id| *retired_id != id);
+                pool.retired_quota_credential_ids
+                    .retain(|retired_id| *retired_id != id);
                 self.persist_proxy_pool(&pool)?;
             }
             match self.token_manager.reset_and_enable(id) {
                 Ok(()) => recovered.push(id),
-                Err(error) => skipped.push(ProxyPoolAssignmentSkip { credential_id: id, reason: error.to_string() }),
+                Err(error) => skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: error.to_string(),
+                }),
             }
         }
-        Ok(RecoverQuotaRetiredResponse { recovered_credential_ids: recovered, skipped })
+        Ok(RecoverQuotaRetiredResponse {
+            recovered_credential_ids: recovered,
+            skipped,
+        })
     }
 
-    /// 获取凭据余额（带缓存）
+    /// 获取凭据余额（带缓存）。
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        let cached_balance = {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    Some(cached.data.clone())
+        self.get_balance_with_options(id, false).await
+    }
+
+    pub async fn get_balance_with_options(
+        &self,
+        id: u64,
+        force_refresh: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        if !force_refresh {
+            let cached_balance = {
+                let cache = self.balance_cache.lock();
+                if let Some(cached) = cache.get(&id) {
+                    let now = Utc::now().timestamp() as f64;
+                    if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                        tracing::debug!("凭据 #{} 余额命中缓存", id);
+                        Some(cached.data.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
+            };
+            if let Some(balance) = cached_balance {
+                self.balance_errors.lock().remove(&id);
+                self.disable_if_quota_exhausted_balance(&balance);
+                self.backfill_disabled_reason(id, &balance);
+                return Ok(balance);
+            }
+        }
+
+        let balance = match self.fetch_balance(id).await {
+            Ok(balance) => balance,
+            Err(error) => {
+                self.balance_errors.lock().insert(
+                    id,
+                    BalanceFailure {
+                        checked_at: Utc::now().to_rfc3339(),
+                        error_class: Self::balance_error_class(&error),
+                    },
+                );
+                return Err(error);
             }
         };
-        if let Some(balance) = cached_balance {
-            self.disable_if_quota_exhausted_balance(&balance);
-            self.backfill_disabled_reason(id, &balance);
-            return Ok(balance);
-        }
 
-        // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
-
-        // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
-        self.save_balance_cache();
+        self.cache_balance(&balance);
         self.disable_if_quota_exhausted_balance(&balance);
         self.backfill_disabled_reason(id, &balance);
-
         Ok(balance)
+    }
+
+    pub async fn batch_balance(
+        &self,
+        req: BatchBalanceRequest,
+    ) -> Result<BatchBalanceResponse, AdminServiceError> {
+        if req.ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        let mut results = Vec::new();
+        for id in req.ids.into_iter().filter(|id| seen.insert(*id)).take(100) {
+            match self.get_balance_with_options(id, req.force_refresh).await {
+                Ok(balance) => {
+                    let summary = self.balance_probe_summary(id);
+                    results.push(BalanceProbeResult {
+                        credential_id: id,
+                        state: summary.state,
+                        balance: Some(balance),
+                        checked_at: summary.checked_at,
+                        source: summary.source,
+                        error_class: None,
+                    });
+                }
+                Err(error) => {
+                    let summary = self.balance_probe_summary(id);
+                    results.push(BalanceProbeResult {
+                        credential_id: id,
+                        state: "failed".to_string(),
+                        balance: None,
+                        checked_at: summary.checked_at,
+                        source: summary.source,
+                        error_class: Some(Self::balance_error_class(&error)),
+                    });
+                }
+            }
+        }
+        Ok(BatchBalanceResponse { results })
+    }
+
+    fn balance_error_class(error: &AdminServiceError) -> String {
+        let lower = error.to_string().to_ascii_lowercase();
+        if lower.contains("invalid") || lower.contains("权限") || lower.contains("403") {
+            "token_invalid".to_string()
+        } else if lower.contains("429") {
+            "upstream_429".to_string()
+        } else if lower.contains("5") && lower.contains("上游") {
+            "upstream_5xx".to_string()
+        } else if lower.contains("响应") || lower.contains("json") {
+            "malformed_response".to_string()
+        } else if lower.contains("timeout") || lower.contains("超时") {
+            "network".to_string()
+        } else {
+            "unknown".to_string()
+        }
     }
 
     fn disable_if_quota_exhausted_balance(&self, balance: &BalanceResponse) {
@@ -1627,6 +2190,55 @@ impl AdminService {
         true
     }
 
+    fn usage_to_balance(id: u64, usage: &UsageLimitsResponse) -> BalanceResponse {
+        let current_usage = usage.current_usage();
+        let usage_limit = usage.usage_limit();
+        let remaining = (usage_limit - current_usage).max(0.0);
+        let usage_percentage = if usage_limit > 0.0 {
+            (current_usage / usage_limit * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        BalanceResponse {
+            id,
+            subscription_title: usage.subscription_title().map(|s| s.to_string()),
+            current_usage,
+            usage_limit,
+            remaining,
+            usage_percentage,
+            next_reset_at: usage.next_date_reset,
+            overage_status: usage.overage_status().map(|s| s.to_string()),
+            current_overages: usage.current_overages(),
+            overage_cap: usage.overage_cap(),
+            overage_rate: usage.overage_rate(),
+        }
+    }
+
+    /// 使用候选账号级代理验证账号，不修改最终代理绑定。
+    async fn probe_credential_with_proxy(
+        &self,
+        id: u64,
+        proxy: &ProxyPoolEntry,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        let (mut credentials, _) = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|error| self.classify_error(error, id))?;
+        credentials.proxy_url = Some(proxy.proxy_url.clone());
+        credentials.proxy_username = proxy.proxy_username.clone();
+        credentials.proxy_password = proxy.proxy_password.clone();
+        let candidate = self
+            .token_manager
+            .get_usage_limits_for_candidate(&credentials)
+            .await
+            .map_err(|error| self.classify_balance_error(error, id))?;
+        let balance = Self::usage_to_balance(id, &candidate.usage_limits);
+        self.token_manager
+            .store_usage_metadata(id, &candidate.usage_limits);
+        self.cache_balance(&balance);
+        Ok(balance)
+    }
+
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         let usage = match self.token_manager.get_usage_limits_for(id).await {
@@ -1649,28 +2261,7 @@ impl AdminService {
             }
         };
 
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-
-        let response = BalanceResponse {
-            id,
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-            current_usage,
-            usage_limit,
-            remaining,
-            usage_percentage,
-            next_reset_at: usage.next_date_reset,
-            overage_status: usage.overage_status().map(|s| s.to_string()),
-            current_overages: usage.current_overages(),
-            overage_cap: usage.overage_cap(),
-            overage_rate: usage.overage_rate(),
-        };
+        let response = Self::usage_to_balance(id, &usage);
 
         if self.token_manager.get_require_pro_plus_credential_proxy()
             && Self::is_kiro_pro_plus(response.subscription_title.as_deref())
@@ -1804,6 +2395,7 @@ impl AdminService {
             // 门禁开启时先以禁用状态入库，完成套餐识别与代理出口验证后再启用。
             disabled: gate_enabled,
             disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             rpm: None,
@@ -1830,9 +2422,7 @@ impl AdminService {
                     Some(ProxyPoolEligibility {
                         eligible: true,
                         subscription_title: None,
-                        reason: format!(
-                            "套餐识别失败，但全账号代理门禁要求仍分配代理: {error}"
-                        ),
+                        reason: format!("套餐识别失败，但全账号代理门禁要求仍分配代理: {error}"),
                     }),
                     None,
                 ),
@@ -1996,11 +2586,12 @@ impl AdminService {
             .map_err(|e| self.classify_delete_error(e, id))?;
         self.clear_proxy_tracking(id)?;
 
-        // 清理已删除凭据的余额缓存
+        // 清理已删除凭据的余额缓存与失败状态
         {
             let mut cache = self.balance_cache.lock();
             cache.remove(&id);
         }
+        self.balance_errors.lock().remove(&id);
         self.save_balance_cache();
 
         Ok(())
@@ -3031,11 +3622,23 @@ mod tests {
         service.backfill_disabled_reason(2, &balance_response(2, 10000.0, 500.0));
         let snapshot = manager.snapshot();
         assert_eq!(
-            snapshot.entries.iter().find(|e| e.id == 1).unwrap().disabled_reason.as_deref(),
+            snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
             Some("Manual")
         );
         assert_eq!(
-            snapshot.entries.iter().find(|e| e.id == 2).unwrap().disabled_reason.as_deref(),
+            snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == 2)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
             Some("Manual")
         );
 
@@ -3383,9 +3986,7 @@ mod tests {
     fn test_enabled_gate_requires_proxy_for_every_subscription_type() {
         let mut config = Config::default();
         config.require_pro_plus_credential_proxy = true;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
-        );
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
         let service = AdminService::new(manager, Vec::<String>::new());
 
         for title in ["KIRO FREE", "KIRO POWER", "KIRO PRO+", "KIRO PRO MAX"] {
@@ -3414,9 +4015,7 @@ mod tests {
     fn test_disabled_gate_allows_only_power_10k_without_proxy() {
         let mut config = Config::default();
         config.require_pro_plus_credential_proxy = false;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
-        );
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
         let service = AdminService::new(manager, Vec::<String>::new());
 
         let mut power = KiroCredentials::default();
@@ -4146,5 +4745,42 @@ mod tests {
         std::fs::remove_file(&credentials_path).unwrap();
         std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
         std::fs::remove_dir(&test_dir).unwrap();
+    }
+    #[test]
+    fn test_recovery_metadata_matches_disabled_reason() {
+        assert_eq!(
+            AdminService::recovery_metadata(true, Some("QuotaExceeded")),
+            (
+                "never".to_string(),
+                vec!["quota_reset_observed".to_string()]
+            )
+        );
+        assert_eq!(
+            AdminService::recovery_metadata(true, Some("TooManyFailures")),
+            (
+                "conditional".to_string(),
+                vec![
+                    "proxy_egress_passed".to_string(),
+                    "account_probe_passed".to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            AdminService::recovery_metadata(false, Some("Manual")),
+            ("none".to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn test_domain_proxy_accepts_any_successful_egress() {
+        let result = CredentialProxyTestResponse {
+            credential_id: 1,
+            uses_proxy: true,
+            uses_credential_proxy: true,
+            proxy_url: Some("http://proxy.example:8080".to_string()),
+            egress_ip: "203.0.113.10".to_string(),
+            tested_at: "2026-09-03T00:00:00Z".to_string(),
+        };
+        assert!(AdminService::proxy_test_matches_expected_egress(&result));
     }
 }
