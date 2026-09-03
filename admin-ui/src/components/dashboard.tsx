@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, ScrollText } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
+import { AccountLogsDialog } from '@/components/account-logs-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
@@ -39,6 +40,8 @@ interface DashboardProps {
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
+  const [logsDialogOpen, setLogsDialogOpen] = useState(false)
+  const [logsCredentialId, setLogsCredentialId] = useState<number | null>(null)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
@@ -149,6 +152,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
+  }
+
+  const handleViewLogs = (id: number | null) => {
+    setLogsCredentialId(id)
+    setLogsDialogOpen(true)
   }
 
   const handleRefresh = () => {
@@ -697,6 +705,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
             >
               {isLoadingArmor ? '加载中...' : (armorBreakingData?.enabled ? '破甲：开' : '破甲：关')}
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleViewLogs(null)}
+            >
+              <ScrollText className="h-4 w-4 mr-1" />
+              日志中心
+            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -975,6 +991,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
+                    onViewLogs={handleViewLogs}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -1017,6 +1034,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
         credentialId={selectedCredentialId}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
+      />
+
+      {/* 账号日志中心 */}
+      <AccountLogsDialog
+        open={logsDialogOpen}
+        onOpenChange={setLogsDialogOpen}
+        credentials={data?.credentials || []}
+        initialCredentialId={logsCredentialId}
       />
 
       {/* 添加凭据对话框 */}

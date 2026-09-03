@@ -14,6 +14,9 @@ import type {
   SetDefaultRpmRequest,
   MaxRelayResponse,
   SetMaxRelayRequest,
+  AccountLogAccountSearchResponse,
+  CredentialLogQuery,
+  CredentialLogsResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -165,5 +168,26 @@ export async function getMaxRelay(): Promise<MaxRelayResponse> {
 // 设置 CC Test 透传配置
 export async function setMaxRelay(req: SetMaxRelayRequest): Promise<MaxRelayResponse> {
   const { data } = await api.put<MaxRelayResponse>('/config/max-relay', req)
+  return data
+}
+
+// 搜索日志中心的账号候选
+export async function searchLogAccounts(
+  query: string
+): Promise<AccountLogAccountSearchResponse> {
+  const { data } = await api.get<AccountLogAccountSearchResponse>('/logs/accounts', {
+    params: { query, limit: 20 },
+  })
+  return data
+}
+
+// 获取单个凭据的日志
+export async function getCredentialLogs(
+  id: number,
+  params: CredentialLogQuery = {}
+): Promise<CredentialLogsResponse> {
+  const { data } = await api.get<CredentialLogsResponse>(`/credentials/${id}/logs`, {
+    params: { ...params, limit: 100 },
+  })
   return data
 }

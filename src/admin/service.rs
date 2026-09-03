@@ -4,19 +4,22 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::account_logs::{AccountLogEvent, AccountLogFilters, AccountLogStore};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, ArmorBreakingResponse, BalanceResponse,
-    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    MaxRelayResponse, OveragePassthroughResponse, SetArmorBreakingRequest,
-    SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
+    AccountLogAccount, AccountLogAccountsResponse, AccountLogSearchQuery, AddCredentialRequest,
+    AddCredentialResponse, ArmorBreakingResponse, BalanceResponse, CredentialLogQuery,
+    CredentialLogsResponse, CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse,
+    LoadBalancingModeResponse, MaxRelayResponse, OveragePassthroughResponse,
+    SetArmorBreakingRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+    SetOveragePassthroughRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -24,6 +27,34 @@ use crate::model::config::MaxRelayConfig;
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 /// 浮点余额接近 0 时视为额度耗尽
 const BALANCE_EXHAUSTED_EPSILON: f64 = 0.000001;
+
+fn validate_log_filter(
+    value: Option<&str>,
+    allowed: &[&str],
+    field: &str,
+) -> Result<(), AdminServiceError> {
+    if let Some(value) = value {
+        if !allowed.contains(&value) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "{} 参数无效",
+                field
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_log_time(value: Option<&str>, field: &str) -> Result<Option<i64>, AdminServiceError> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|date| date.timestamp_millis())
+                .map_err(|_| {
+                    AdminServiceError::InvalidCredential(format!("{} 必须是 RFC3339 时间", field))
+                })
+        })
+        .transpose()
+}
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,9 +71,12 @@ struct CachedBalance {
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 账号级结构化日志存储；未配置缓存目录时为空。
+    account_log_store: Option<Arc<AccountLogStore>>,
 }
 
 impl AdminService {
@@ -61,6 +95,29 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            account_log_store: None,
+        }
+    }
+
+    pub fn with_account_log_store(mut self, store: Option<Arc<AccountLogStore>>) -> Self {
+        self.account_log_store = store;
+        self
+    }
+    fn record_admin_log(
+        &self,
+        id: u64,
+        event_type: &str,
+        severity: &str,
+        outcome: &str,
+        message: impl Into<String>,
+    ) {
+        let Some(store) = &self.account_log_store else {
+            return;
+        };
+        if let Err(error) = store.record(AccountLogEvent::new(
+            id, event_type, severity, outcome, message,
+        )) {
+            tracing::warn!(target: "account_logs", error = %error, "账号日志入队失败");
         }
     }
 
@@ -115,6 +172,125 @@ impl AdminService {
             credentials,
         }
     }
+    /// 搜索账号日志中心的单账号候选。
+    pub fn search_log_accounts(
+        &self,
+        query: AccountLogSearchQuery,
+    ) -> Result<AccountLogAccountsResponse, AdminServiceError> {
+        let needle = query.query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请输入账号 ID、邮箱或导入备注".to_string(),
+            ));
+        }
+        let limit = query.limit.unwrap_or(20).clamp(1, 20);
+        let accounts = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.id.to_string().contains(&needle)
+                    || entry
+                        .email
+                        .as_deref()
+                        .map(|value| value.to_ascii_lowercase().contains(&needle))
+                        .unwrap_or(false)
+                    || entry
+                        .import_note
+                        .as_deref()
+                        .map(|value| value.to_ascii_lowercase().contains(&needle))
+                        .unwrap_or(false)
+            })
+            .take(limit)
+            .map(|entry| AccountLogAccount {
+                id: entry.id,
+                email: entry.email,
+                import_note: entry.import_note,
+                disabled: entry.disabled,
+                disabled_reason: entry.disabled_reason,
+            })
+            .collect();
+        Ok(AccountLogAccountsResponse { accounts })
+    }
+
+    /// 查询单个账号的结构化日志。
+    pub async fn get_credential_logs(
+        &self,
+        id: u64,
+        query: CredentialLogQuery,
+    ) -> Result<CredentialLogsResponse, AdminServiceError> {
+        if !self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.id == id)
+        {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        let store = self
+            .account_log_store
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("账号日志存储未启用".to_string()))?;
+        validate_log_filter(
+            query.severity.as_deref(),
+            &["info", "warn", "error"],
+            "severity",
+        )?;
+        validate_log_filter(
+            query.event_type.as_deref(),
+            &[
+                "request",
+                "token_refresh",
+                "balance",
+                "credential_status",
+                "proxy",
+                "recovery_probe",
+            ],
+            "eventType",
+        )?;
+        validate_log_filter(
+            query.outcome.as_deref(),
+            &["success", "failure", "retry", "pending"],
+            "outcome",
+        )?;
+        let from_ms = parse_log_time(query.from.as_deref(), "from")?;
+        let to_ms = parse_log_time(query.to.as_deref(), "to")?;
+        if from_ms.zip(to_ms).is_some_and(|(from, to)| from > to) {
+            return Err(AdminServiceError::InvalidCredential(
+                "from 不能晚于 to".to_string(),
+            ));
+        }
+        let page = store
+            .query(
+                id,
+                AccountLogFilters {
+                    severity: query.severity,
+                    event_type: query.event_type,
+                    outcome: query.outcome,
+                    from_ms,
+                    to_ms,
+                    before: query.before,
+                    limit: query.limit.unwrap_or(100).clamp(1, 100),
+                },
+            )
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("无效的日志分页游标") {
+                    AdminServiceError::InvalidCredential(message)
+                } else {
+                    AdminServiceError::InternalError(message)
+                }
+            })?;
+        Ok(CredentialLogsResponse {
+            credential_id: id,
+            items: page.items,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        })
+    }
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
@@ -130,6 +306,17 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            if disabled {
+                "管理员禁用凭据"
+            } else {
+                "管理员启用凭据"
+            },
+        );
         Ok(())
     }
 
@@ -137,14 +324,30 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            format!("管理员设置优先级为 {priority}"),
+        );
+        Ok(())
     }
 
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            "管理员重置失败计数并启用凭据",
+        );
+        Ok(())
     }
 
     /// 获取凭据余额（带缓存）
@@ -166,11 +369,18 @@ impl AdminService {
         };
         if let Some(balance) = cached_balance {
             self.disable_if_quota_exhausted_balance(&balance);
+            self.record_admin_log(id, "balance", "info", "success", "余额查询命中缓存");
             return Ok(balance);
         }
 
         // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
+        let balance = match self.fetch_balance(id).await {
+            Ok(balance) => balance,
+            Err(error) => {
+                self.record_admin_log(id, "balance", "error", "failure", "余额查询失败");
+                return Err(error);
+            }
+        };
 
         // 更新缓存
         {
@@ -186,6 +396,7 @@ impl AdminService {
         self.save_balance_cache();
         self.disable_if_quota_exhausted_balance(&balance);
 
+        self.record_admin_log(id, "balance", "info", "success", "余额查询完成");
         Ok(balance)
     }
 
@@ -197,6 +408,7 @@ impl AdminService {
         // AWS 侧 overage=ENABLED 且全局开关开启：进入超额、保持启用，不永久禁用
         if self.token_manager.is_overage_enabled(balance.id) {
             tracing::info!(
+                credential_id = balance.id,
                 "凭据 #{} 余额耗尽但 overage=ENABLED，进入超额、保持启用",
                 balance.id
             );
@@ -206,6 +418,7 @@ impl AdminService {
         let has_available = self.token_manager.report_quota_exhausted(balance.id);
         if has_available {
             tracing::warn!(
+                credential_id = balance.id,
                 "凭据 #{} 余额已耗尽（remaining={} usageLimit={}），已自动禁用",
                 balance.id,
                 balance.remaining,
@@ -213,6 +426,7 @@ impl AdminService {
             );
         } else {
             tracing::error!(
+                credential_id = balance.id,
                 "凭据 #{} 余额已耗尽（remaining={} usageLimit={}），已自动禁用；当前无可用凭据",
                 balance.id,
                 balance.remaining,
@@ -274,7 +488,7 @@ impl AdminService {
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
-        if let Some(ref name) = req.endpoint {
+        if let Some(name) = &req.endpoint {
             if !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
                     self.known_endpoints.iter().map(|s| s.as_str()).collect();
@@ -318,6 +532,7 @@ impl AdminService {
             endpoint: req.endpoint,
             rpm: None,
         };
+        let has_proxy = new_cred.proxy_url.is_some();
 
         // 调用 token_manager 添加凭据
         let credential_id = self
@@ -325,6 +540,22 @@ impl AdminService {
             .add_credential(new_cred)
             .await
             .map_err(|e| self.classify_add_error(e))?;
+        self.record_admin_log(
+            credential_id,
+            "credential_status",
+            "info",
+            "success",
+            "管理员添加凭据",
+        );
+        if has_proxy {
+            self.record_admin_log(
+                credential_id,
+                "proxy",
+                "info",
+                "success",
+                "凭据代理配置已保存",
+            );
+        }
 
         // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
         if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
@@ -351,6 +582,7 @@ impl AdminService {
             cache.remove(&id);
         }
         self.save_balance_cache();
+        self.record_admin_log(id, "credential_status", "info", "success", "管理员删除凭据");
 
         Ok(())
     }
@@ -486,10 +718,28 @@ impl AdminService {
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .force_refresh_token_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))
+        match self.token_manager.force_refresh_token_for(id).await {
+            Ok(()) => {
+                self.record_admin_log(
+                    id,
+                    "token_refresh",
+                    "info",
+                    "success",
+                    "管理员强制刷新 Token 成功",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.record_admin_log(
+                    id,
+                    "token_refresh",
+                    "error",
+                    "failure",
+                    "管理员强制刷新 Token 失败",
+                );
+                Err(self.classify_balance_error(error, id))
+            }
+        }
     }
 
     // ============ 余额缓存持久化 ============

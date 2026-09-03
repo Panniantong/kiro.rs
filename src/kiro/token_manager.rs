@@ -315,14 +315,33 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    let refresh_result = if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
+    };
+    let credential_id = credentials.id.unwrap_or_default();
+    if refresh_result.is_ok() {
+        tracing::info!(
+            event_type = "token_refresh",
+            request_outcome = "success",
+            credential_id,
+            credential_id_present = credentials.id.is_some(),
+            "Token 刷新成功"
+        );
+    } else {
+        tracing::warn!(
+            event_type = "token_refresh",
+            request_outcome = "failure",
+            credential_id,
+            credential_id_present = credentials.id.is_some(),
+            "Token 刷新失败"
+        );
     }
+    refresh_result
 }
 
 /// 刷新 Social Token
@@ -331,7 +350,12 @@ async fn refresh_social_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 Social Token...");
+    tracing::info!(
+        event_type = "token_refresh",
+        credential_id = credentials.id.unwrap_or_default(),
+        credential_id_present = credentials.id.is_some(),
+        "正在刷新 Social Token..."
+    );
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
@@ -423,7 +447,12 @@ async fn refresh_idc_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 IdC Token...");
+    tracing::info!(
+        event_type = "token_refresh",
+        credential_id = credentials.id.unwrap_or_default(),
+        credential_id_present = credentials.id.is_some(),
+        "正在刷新 IdC Token..."
+    );
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let client_id = credentials
@@ -531,7 +560,12 @@ pub(crate) async fn get_usage_limits(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
-    tracing::debug!("正在获取使用额度信息...");
+    tracing::debug!(
+        event_type = "balance",
+        credential_id = credentials.id.unwrap_or_default(),
+        credential_id_present = credentials.id.is_some(),
+        "正在获取使用额度信息..."
+    );
 
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
@@ -892,6 +926,7 @@ impl MultiTokenManager {
                     .unwrap_or(false)
             {
                 tracing::warn!(
+                    credential_id = entry.id,
                     "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
                     entry.id
                 );
@@ -1015,7 +1050,11 @@ impl MultiTokenManager {
                 entry.disabled_reason = None;
                 entry.failure_count = 0;
                 recovered += 1;
-                tracing::info!("凭据 #{} TooManyFailures 冷却结束，已自动恢复", entry.id);
+                tracing::info!(
+                    credential_id = entry.id,
+                    "凭据 #{} TooManyFailures 冷却结束，已自动恢复",
+                    entry.id
+                );
             }
         }
         recovered

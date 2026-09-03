@@ -1,3 +1,4 @@
+mod account_logs;
 mod admin;
 mod admin_ui;
 mod anthropic;
@@ -9,6 +10,9 @@ pub mod token;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use clap::Parser;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
@@ -23,12 +27,14 @@ async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // 初始化日志；账号级事件由附加 Layer 持久化到 SQLite。
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(account_logs::AccountLogLayer::default())
         .init();
 
     // 加载配置
@@ -139,6 +145,19 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    let account_log_store = match account_logs::AccountLogStore::open(token_manager.cache_dir()) {
+        Ok(store) => {
+            if let Some(store) = &store {
+                account_logs::set_global_store(store.clone());
+                tracing::info!("账号日志 SQLite 存储已启用");
+            }
+            store
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "账号日志 SQLite 存储初始化失败，将仅保留 stdout 日志");
+            None
+        }
+    };
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -176,7 +195,8 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_account_log_store(account_log_store.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -208,6 +228,8 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  GET  /api/admin/logs/accounts");
+        tracing::info!("  GET  /api/admin/credentials/:id/logs");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

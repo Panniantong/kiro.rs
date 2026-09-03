@@ -84,6 +84,54 @@ pub struct CredentialStatusItem {
     /// AWS 侧超额（overage）状态（ENABLED / DISABLED；None 表示未知/未同步）
     pub overage_status: Option<String>,
 }
+/// 账号日志搜索参数。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLogSearchQuery {
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+/// 单账号日志查询参数。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialLogQuery {
+    pub severity: Option<String>,
+    pub event_type: Option<String>,
+    pub outcome: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub limit: Option<usize>,
+    pub before: Option<String>,
+}
+
+/// 日志中心的账号搜索结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLogAccount {
+    pub id: u64,
+    pub email: Option<String>,
+    pub import_note: Option<String>,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+/// 账号搜索响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLogAccountsResponse {
+    pub accounts: Vec<AccountLogAccount>,
+}
+
+/// 单账号日志响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialLogsResponse {
+    pub credential_id: u64,
+    pub items: Vec<crate::account_logs::AccountLogItem>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
 
 // ============ 操作请求 ============
 

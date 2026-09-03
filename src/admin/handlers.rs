@@ -1,17 +1,18 @@
 //! Admin API HTTP 处理器
 
 use axum::{
-    Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
+    Json,
 };
 
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchSetRpmRequest, SetArmorBreakingRequest, SetDefaultRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
-        SetOveragePassthroughRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
+        AccountLogSearchQuery, AddCredentialRequest, BatchSetRpmRequest, CredentialLogQuery,
+        SetArmorBreakingRequest, SetDefaultRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
+        SetPriorityRequest, SetRpmRequest, SuccessResponse,
     },
 };
 
@@ -20,6 +21,31 @@ use super::{
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/logs/accounts
+/// 搜索日志中心的单账号候选。
+pub async fn search_log_accounts(
+    State(state): State<AdminState>,
+    Query(query): Query<AccountLogSearchQuery>,
+) -> impl IntoResponse {
+    match state.service.search_log_accounts(query) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/logs
+/// 查询单个凭据的结构化日志。
+pub async fn get_credential_logs(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(query): Query<CredentialLogQuery>,
+) -> impl IntoResponse {
+    match state.service.get_credential_logs(id, query).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/credentials/:id/disabled
