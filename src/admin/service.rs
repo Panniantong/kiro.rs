@@ -1811,6 +1811,7 @@ impl AdminService {
 
         let should_check_pool =
             !explicit_proxy && assign_from_pool && (gate_enabled || self.has_proxy_pool_entries());
+        let mut prevalidated_credential = None;
         let (proxy_pool_eligibility, inspected_usage) = if should_check_pool {
             match self
                 .token_manager
@@ -1818,6 +1819,7 @@ impl AdminService {
                 .await
             {
                 Ok(candidate) => {
+                    prevalidated_credential = Some(candidate.credentials.clone());
                     new_cred = candidate.credentials;
                     (
                         Some(Self::proxy_pool_eligibility(&candidate.usage_limits)),
@@ -1880,12 +1882,16 @@ impl AdminService {
             new_cred.disabled = true;
         }
 
-        // 调用 token_manager 添加凭据
-        let credential_id = self
-            .token_manager
-            .add_credential(new_cred)
-            .await
-            .map_err(|e| self.classify_add_error(e))?;
+        // 候选额度校验已经完成 Token 刷新时直接复用结果，避免同一 refreshToken
+        // 在一次导入中连续请求两次 AWS OIDC。
+        let credential_id = if let Some(validated_cred) = prevalidated_credential {
+            self.token_manager
+                .add_credential_with_validated_token(new_cred, validated_cred)
+                .await
+        } else {
+            self.token_manager.add_credential(new_cred).await
+        }
+        .map_err(|e| self.classify_add_error(e))?;
         drop(_allocation_guard);
 
         // 自动分配前已经查询过的结果直接保存，避免重复请求官方接口。

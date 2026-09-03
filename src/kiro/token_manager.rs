@@ -2729,6 +2729,7 @@ impl MultiTokenManager {
         let refreshed_credentials = if credentials.is_api_key_credential() {
             credentials.clone()
         } else {
+            let _refresh_guard = self.refresh_lock.lock().await;
             let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
             refresh_token(credentials, &self.config, effective_proxy.as_ref()).await?
         };
@@ -2830,6 +2831,24 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        self.add_credential_inner(new_cred, None).await
+    }
+
+    /// 将已完成候选额度校验的凭据直接入库，避免重复刷新同一个 IdC refreshToken。
+    pub(crate) async fn add_credential_with_validated_token(
+        &self,
+        new_cred: KiroCredentials,
+        validated_cred: KiroCredentials,
+    ) -> anyhow::Result<u64> {
+        self.add_credential_inner(new_cred, Some(validated_cred))
+            .await
+    }
+
+    async fn add_credential_inner(
+        &self,
+        new_cred: KiroCredentials,
+        prevalidated_cred: Option<KiroCredentials>,
+    ) -> anyhow::Result<u64> {
         // AdminService 会让需要完成前置校验的凭据以 disabled=true 入池。
         // Token 刷新返回的新对象不能覆盖这个调度状态，否则账号会在代理验真前短暂可用，
         // 池满时甚至会一直保持启用。
@@ -2892,11 +2911,13 @@ impl MultiTokenManager {
                 anyhow::bail!("凭据已存在（refreshToken 重复）");
             }
         }
-
         // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
+        let mut validated_cred = if let Some(prevalidated_cred) = prevalidated_cred {
+            prevalidated_cred
+        } else if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
+            let _refresh_guard = self.refresh_lock.lock().await;
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
@@ -3761,6 +3782,57 @@ mod tests {
             err_msg.contains("API Key 凭据不支持刷新"),
             "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
             err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_waits_for_refresh_lock() {
+        let config = Config::default();
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
+        );
+        let refresh_guard = manager.refresh_lock.lock().await;
+
+        let mut credential = KiroCredentials::default();
+        credential.auth_method = Some("idc".to_string());
+        credential.refresh_token = Some("r".repeat(150));
+        let task = {
+            let manager = std::sync::Arc::clone(&manager);
+            tokio::spawn(async move { manager.add_credential(credential).await })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "新增 OAuth 凭据应等待正在执行的 Token 刷新"
+        );
+
+        drop(refresh_guard);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("IdC 刷新需要 clientId"));
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_with_validated_token_skips_refresh() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.auth_method = Some("idc".to_string());
+        new_cred.refresh_token = Some("r".repeat(150));
+        let mut validated_cred = new_cred.clone();
+        validated_cred.access_token = Some("access-token-from-candidate".to_string());
+
+        let id = manager
+            .add_credential_with_validated_token(new_cred, validated_cred)
+            .await
+            .unwrap();
+
+        assert_eq!(id, 1);
+        let entries = manager.entries.lock();
+        assert_eq!(
+            entries[0].credentials.access_token.as_deref(),
+            Some("access-token-from-candidate")
         );
     }
 
