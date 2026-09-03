@@ -2455,6 +2455,24 @@ impl MultiTokenManager {
     ) -> anyhow::Result<()> {
         self.set_disabled_inner(id, disabled, false)
     }
+    /// 代理待验证过渡：新进入等待队列的启用账号按 Manual 禁用，
+    /// 已有禁用原因的账号保持原原因，避免代理故障覆盖账号故障。
+    pub(crate) fn set_disabled_for_proxy_pending(&self, id: u64) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if !entry.disabled {
+                entry.credentials.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::Manual);
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
     /// 仅更新凭据的禁用原因（不改变禁用状态），并持久化。
     /// 用于给历史禁用账号补记具体原因（额度用尽 / Token 失效 / 手动禁用）。
     pub fn set_disabled_reason(&self, id: u64, reason: DisabledReason) -> anyhow::Result<()> {
@@ -4481,6 +4499,38 @@ mod tests {
             .unwrap();
         assert!(!recovered.disabled);
         assert!(recovered.disabled_at.is_none());
+    }
+    #[test]
+    fn test_proxy_pending_preserves_existing_disabled_reason() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_disabled(1, true).unwrap();
+        manager
+            .set_disabled_reason(1, DisabledReason::QuotaExceeded)
+            .unwrap();
+        let disabled_at = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap()
+            .disabled_at;
+
+        manager.set_disabled_for_proxy_pending(1).unwrap();
+        let preserved = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap();
+        assert_eq!(preserved.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(preserved.disabled_at, disabled_at);
     }
 
     #[test]

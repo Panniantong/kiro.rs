@@ -615,7 +615,7 @@ impl AdminService {
             };
             if !proxy_test {
                 self.token_manager
-                    .set_disabled_without_release_event(id, true)
+                    .set_disabled_for_proxy_pending(id)
                     .map_err(|error| self.classify_error(error, id))?;
                 if already_bound {
                     let _ = self.release_disabled_credential_proxy(id, false)?;
@@ -627,7 +627,7 @@ impl AdminService {
                 Ok(balance) => balance,
                 Err(error) => {
                     self.token_manager
-                        .set_disabled_without_release_event(id, true)
+                        .set_disabled_for_proxy_pending(id)
                         .map_err(|inner| self.classify_error(inner, id))?;
                     if already_bound {
                         let _ = self.release_disabled_credential_proxy(id, false)?;
@@ -1022,6 +1022,9 @@ impl AdminService {
         let mut failed = Vec::new();
         for id in credential_ids {
             if proxy_test.probe.state != "passed" {
+                self.token_manager
+                    .set_disabled_for_proxy_pending(id)
+                    .map_err(|error| self.classify_error(error, id))?;
                 self.mark_proxy_pending(id)?;
                 failed.push(ProxyPoolAssignmentSkip {
                     credential_id: id,
@@ -1046,6 +1049,9 @@ impl AdminService {
             let balance = match self.probe_credential_with_proxy(id, &proxy).await {
                 Ok(balance) => balance,
                 Err(error) => {
+                    self.token_manager
+                        .set_disabled_for_proxy_pending(id)
+                        .map_err(|inner| self.classify_error(inner, id))?;
                     self.mark_proxy_pending(id)?;
                     failed.push(ProxyPoolAssignmentSkip {
                         credential_id: id,
@@ -1059,6 +1065,9 @@ impl AdminService {
                 }
             };
             if Self::is_quota_exhausted_balance(&balance) {
+                self.token_manager
+                    .set_disabled_for_proxy_pending(id)
+                    .map_err(|error| self.classify_error(error, id))?;
                 self.mark_proxy_pending(id)?;
                 failed.push(ProxyPoolAssignmentSkip {
                     credential_id: id,
@@ -2273,7 +2282,7 @@ impl AdminService {
                 .0;
             if !Self::has_credential_proxy(&credentials) {
                 self.token_manager
-                    .set_disabled_without_release_event(id, true)
+                    .set_disabled_for_proxy_pending(id)
                     .map_err(|error| self.classify_error(error, id))?;
                 self.mark_proxy_pending(id)?;
                 let _ = self.reconcile_pending_pro_plus().await?;
@@ -2502,7 +2511,7 @@ impl AdminService {
                     activation_requires_proxy = self.requires_proxy_before_enable(&credentials);
                     if activation_requires_proxy {
                         self.token_manager
-                            .set_disabled_without_release_event(credential_id, true)
+                            .set_disabled_for_proxy_pending(credential_id)
                             .map_err(|error| self.classify_error(error, credential_id))?;
                     }
                 }
@@ -2529,14 +2538,14 @@ impl AdminService {
                             self.set_disabled(credential_id, false)?;
                         } else {
                             self.token_manager
-                                .set_disabled_without_release_event(credential_id, true)
+                                .set_disabled_for_proxy_pending(credential_id)
                                 .map_err(|error| self.classify_error(error, credential_id))?;
                         }
                     }
                     Ok(_) | Err(_) => {
                         proxy_test_failed = true;
                         self.token_manager
-                            .set_disabled_without_release_event(credential_id, true)
+                            .set_disabled_for_proxy_pending(credential_id)
                             .map_err(|error| self.classify_error(error, credential_id))?;
                         self.release_disabled_credential_proxy(credential_id, false)?;
                         assigned_proxy = None;
