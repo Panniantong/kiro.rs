@@ -23,7 +23,7 @@
 </head>
 <body>
   <h1>Kiro RS 账号运营观察与代理恢复门禁</h1>
-  <p class="meta">日期：2026-09-03　状态：已实现，待隔离部署验证　基线：FluxNode fork <code>fluxnode/fix-kam-import-duplicate-refresh</code></p>
+  <p class="meta">日期：2026-09-03　状态：隔离部署验证通过；生产灰度待明确授权　基线：FluxNode fork <code>fluxnode/fix-kam-import-duplicate-refresh</code></p>
 
   <h2>1. 问题与目标</h2>
   <p>运营需要在紧凑模式观察最近被禁用、但并非额度耗尽的账号；在手动挂载代理时查看禁用账号额度；理解禁用原因与重启可能性；并能区分代理出口故障与账号本身故障。现有实现已经有余额、代理池和出口测试能力，但查询范围、状态语义、错误归因和自动补位时序不统一。</p>
