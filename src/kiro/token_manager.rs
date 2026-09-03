@@ -2410,6 +2410,9 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
+            // 新增凭据也必须复用运行时刷新锁，避免与在线请求/其它管理操作
+            // 同时向 AWS OIDC 发起刷新，触发连接级失败。
+            let _refresh_guard = self.refresh_lock.lock().await;
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
@@ -3203,6 +3206,33 @@ mod tests {
             "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
             err_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_waits_for_refresh_lock() {
+        let config = Config::default();
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
+        );
+        let refresh_guard = manager.refresh_lock.lock().await;
+
+        let mut credential = KiroCredentials::default();
+        credential.auth_method = Some("idc".to_string());
+        credential.refresh_token = Some("r".repeat(150));
+        let task = {
+            let manager = std::sync::Arc::clone(&manager);
+            tokio::spawn(async move { manager.add_credential(credential).await })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "新增 OAuth 凭据应等待正在执行的 Token 刷新"
+        );
+
+        drop(refresh_guard);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("IdC 刷新需要 clientId"));
     }
 
     #[tokio::test]
