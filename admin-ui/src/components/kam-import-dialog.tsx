@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, setCredentialRpm } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -149,6 +149,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
   const [batchNote, setBatchNote] = useState('')
+  const [batchPriority, setBatchPriority] = useState('')
+  const [batchRpm, setBatchRpm] = useState('')
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
@@ -174,11 +176,23 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setCurrentProcessing('')
     setResults([])
     setBatchNote('')
+    setBatchPriority('')
+    setBatchRpm('')
   }
 
   const handleImport = async () => {
     // 先单独解析 JSON，给出精准的错误提示
     let validAccounts: KamAccount[]
+    const sharedPriority = batchPriority.trim() === '' ? undefined : Number(batchPriority)
+    const sharedRpm = batchRpm.trim() === '' ? undefined : Number(batchRpm)
+    if (sharedPriority !== undefined && (!Number.isInteger(sharedPriority) || sharedPriority < 0)) {
+      toast.error('统一优先级必须是非负整数')
+      return
+    }
+    if (sharedRpm !== undefined && (!Number.isInteger(sharedRpm) || sharedRpm < 0)) {
+      toast.error('统一 RPM 必须是非负整数')
+      return
+    }
     try {
       const accounts = parseKamJson(jsonInput)
 
@@ -192,6 +206,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         toast.error('没有包含有效 refreshToken 的账号')
         return
       }
+
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -285,10 +300,15 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
+            priority: sharedPriority ?? 0,
             importNote: sharedImportNote || undefined,
           })
 
           addedCredId = addedCred.credentialId
+
+          if (sharedRpm !== undefined) {
+            await setCredentialRpm(addedCred.credentialId, sharedRpm)
+          }
 
           await new Promise(resolve => setTimeout(resolve, 1000))
 
@@ -440,6 +460,35 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               maxLength={200}
               className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
             />
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">统一优先级</label>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                placeholder="留空使用默认 0"
+                value={batchPriority}
+                onChange={(e) => setBatchPriority(e.target.value)}
+                disabled={importing}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">统一 RPM</label>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                placeholder="留空跟随全局默认，0 表示不限制"
+                value={batchRpm}
+                onChange={(e) => setBatchRpm(e.target.value)}
+                disabled={importing}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </div>
           </div>
 
           {/* 解析预览 */}

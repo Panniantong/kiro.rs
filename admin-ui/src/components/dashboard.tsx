@@ -25,6 +25,7 @@ import {
   useDefaultRpm,
   useSetDefaultRpm,
   useBatchSetRpm,
+  useSetPriority,
   useArmorBreaking,
   useSetArmorBreaking,
   useProPlusProxyGate,
@@ -101,6 +102,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: defaultRpmData } = useDefaultRpm()
   const { mutate: setDefaultRpm, isPending: isSettingDefaultRpm } = useSetDefaultRpm()
   const batchSetRpm = useBatchSetRpm()
+  const setPriority = useSetPriority()
   const [editingDefaultRpm, setEditingDefaultRpm] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
   const { data: armorBreakingData, isLoading: isLoadingArmor } = useArmorBreaking()
@@ -830,6 +832,31 @@ export function Dashboard({ onLogout }: DashboardProps) {
       }
     )
   }
+
+  // 批量设置优先级
+  const handleBatchSetPriority = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要设置的凭据')
+      return
+    }
+    const input = window.prompt(
+      `为选中的 ${selectedIds.size} 个凭据设置统一优先级：\n数字越小优先级越高`,
+      ''
+    )
+    if (input === null) return
+    const priority = Number(input.trim())
+    if (!Number.isInteger(priority) || priority < 0) {
+      toast.error('优先级必须是非负整数')
+      return
+    }
+    try {
+      await Promise.all(Array.from(selectedIds).map(id => setPriority.mutateAsync({ id, priority })))
+      toast.success(`已更新 ${selectedIds.size} 个凭据的优先级`)
+      deselectAll()
+    } catch (error) {
+      toast.error(`批量设置失败: ${extractErrorMessage(error)}`)
+    }
+  }
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -1205,6 +1232,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   >
                     <Gauge className="h-4 w-4 mr-2" />
                     批量设置 RPM
+                  </Button>
+                  <Button
+                    onClick={handleBatchSetPriority}
+                    size="sm"
+                    variant="outline"
+                    disabled={setPriority.isPending}
+                  >
+                    批量设置优先级
                   </Button>
                   <Button
                     onClick={handleBatchDelete}
