@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, Activity, LayoutGrid, Table2, Shuffle, PencilLine } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, Activity, LayoutGrid, Table2, Shuffle, PencilLine, ScrollText } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialCompactTable } from '@/components/credential-compact-table'
 import { BalanceDialog } from '@/components/balance-dialog'
+import { AccountLogsDialog } from '@/components/account-logs-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { BatchEditDialog } from '@/components/batch-edit-dialog'
@@ -62,6 +63,8 @@ function shouldAutoQueryBalance(credential: CredentialStatusItem): boolean {
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
+  const [logsDialogOpen, setLogsDialogOpen] = useState(false)
+  const [logsCredentialId, setLogsCredentialId] = useState<number | null>(null)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
@@ -288,6 +291,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
+  }
+
+  const handleViewLogs = (id: number | null) => {
+    setLogsCredentialId(id)
+    setLogsDialogOpen(true)
   }
 
   const handleRefresh = () => {
@@ -1240,6 +1248,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
+              <Button
+                onClick={() => handleViewLogs(null)}
+                size="sm"
+                variant="outline"
+              >
+                <ScrollText className="h-4 w-4 mr-2" />
+                日志中心
+              </Button>
               <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
                 <FileUp className="h-4 w-4 mr-2" />
                 Kiro Account Manager 导入
@@ -1268,6 +1284,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
+                    onViewLogs={handleViewLogs}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -1318,6 +1335,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
         credentialId={selectedCredentialId}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
+      />
+
+      {/* 账号日志中心 */}
+      <AccountLogsDialog
+        open={logsDialogOpen}
+        onOpenChange={setLogsDialogOpen}
+        credentials={data?.credentials || []}
+        initialCredentialId={logsCredentialId}
       />
       {/* 添加凭据对话框 */}
       <AddCredentialDialog

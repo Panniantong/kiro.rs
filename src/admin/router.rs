@@ -10,10 +10,11 @@ use super::{
         add_credential, add_proxy_pool_entries, assign_credential_proxy_from_pool, batch_balance,
         batch_set_credential_proxy, batch_set_credential_rpm, batch_test_credential_proxy,
         batch_update_credentials, delete_credential, force_refresh_token, get_all_credentials,
-        get_armor_breaking, get_credential_balance, get_default_rpm, get_load_balancing_mode,
+        get_armor_breaking, get_credential_balance, get_credential_logs, get_default_rpm,
+        get_load_balancing_mode,
         get_max_relay, get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool,
         manual_bind_proxy, manual_unbind_proxy, recover_quota_retired, remove_proxy_pool_entries,
-        reset_failure_count, set_armor_breaking, set_credential_disabled, set_credential_priority,
+        reset_failure_count, search_log_accounts, set_armor_breaking, set_credential_disabled, set_credential_priority,
         set_credential_proxy, set_credential_rpm, set_default_rpm, set_load_balancing_mode,
         set_max_relay, set_overage_passthrough, set_pro_plus_proxy_gate, test_credential_proxy,
         test_proxy_pool_entry,
@@ -38,6 +39,8 @@ use super::{
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `GET /logs/accounts` - 搜索日志账号
+/// - `GET /credentials/:id/logs` - 查询账号日志（最多 100 条/页）
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 ///
@@ -47,11 +50,13 @@ use super::{
 /// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
+        .route("/logs/accounts", get(search_log_accounts))
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/{id}", delete(delete_credential))
+        .route("/credentials/{id}/logs", get(get_credential_logs))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))

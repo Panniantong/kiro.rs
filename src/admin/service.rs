@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use parking_lot::Mutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use crate::account_logs::{AccountLogEvent, AccountLogFilters, AccountLogStore};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
@@ -16,11 +17,13 @@ use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
+    AccountLogAccount, AccountLogAccountsResponse, AccountLogSearchQuery, AddCredentialRequest,
+    AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
     AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse,
     BalanceProbeResult, BalanceProbeSummary, BalanceResponse, BatchBalanceRequest,
-    BatchBalanceResponse, BatchSetCredentialProxyRequest, CredentialProxyTestResponse,
-    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
+    BatchBalanceResponse, BatchSetCredentialProxyRequest, CredentialLogQuery,
+    CredentialLogsResponse, CredentialProxyTestResponse, CredentialStatusItem,
+    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
     ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
     ProPlusProxyGateResponse, ProxyAssignedCredentialStatus, ProxyPoolAssignmentSkip,
     ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, ProxyPoolTestRequest,
@@ -39,6 +42,34 @@ const PRO_PLUS_MIN_REMAINING: f64 = 50.0;
 const PRO_PLUS_QUOTA_GUARD_INTERVAL_SECS: u64 = 60;
 /// 浮点余额接近 0 时视为额度耗尽
 const BALANCE_EXHAUSTED_EPSILON: f64 = 0.000001;
+
+fn validate_log_filter(
+    value: Option<&str>,
+    allowed: &[&str],
+    field: &str,
+) -> Result<(), AdminServiceError> {
+    if let Some(value) = value {
+        if !allowed.contains(&value) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "{} 参数无效",
+                field
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_log_time(value: Option<&str>, field: &str) -> Result<Option<i64>, AdminServiceError> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|date| date.timestamp_millis())
+                .map_err(|_| {
+                    AdminServiceError::InvalidCredential(format!("{} 必须是 RFC3339 时间", field))
+                })
+        })
+        .transpose()
+}
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -92,6 +123,9 @@ pub struct AdminService {
     allocation_lock: tokio::sync::Mutex<()>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 账号级结构化日志存储；未配置缓存目录时为空。
+    account_log_store: Option<Arc<AccountLogStore>>,
+
 }
 
 impl AdminService {
@@ -118,9 +152,33 @@ impl AdminService {
             proxy_pool: Mutex::new(proxy_pool),
             allocation_lock: tokio::sync::Mutex::new(()),
             known_endpoints: known_endpoints.into_iter().collect(),
+            account_log_store: None,
         };
         service.disable_unbound_kiro_pro_plus();
         service
+    }
+
+    pub fn with_account_log_store(mut self, store: Option<Arc<AccountLogStore>>) -> Self {
+        self.account_log_store = store;
+        self
+    }
+
+    fn record_admin_log(
+        &self,
+        id: u64,
+        event_type: &str,
+        severity: &str,
+        outcome: &str,
+        message: impl Into<String>,
+    ) {
+        let Some(store) = &self.account_log_store else {
+            return;
+        };
+        if let Err(error) = store.record(AccountLogEvent::new(
+            id, event_type, severity, outcome, message,
+        )) {
+            tracing::warn!(target: "account_logs", error = %error, "账号日志入队失败");
+        }
     }
     fn balance_probe_summary(&self, id: u64) -> BalanceProbeSummary {
         if let Some(failure) = self.balance_errors.lock().get(&id).cloned() {
@@ -297,6 +355,125 @@ impl AdminService {
             credentials,
         }
     }
+    /// 搜索账号日志中心的单账号候选。
+    pub fn search_log_accounts(
+        &self,
+        query: AccountLogSearchQuery,
+    ) -> Result<AccountLogAccountsResponse, AdminServiceError> {
+        let needle = query.query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请输入账号 ID、邮箱或导入备注".to_string(),
+            ));
+        }
+        let limit = query.limit.unwrap_or(20).clamp(1, 20);
+        let accounts = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.id.to_string().contains(&needle)
+                    || entry
+                        .email
+                        .as_deref()
+                        .map(|value| value.to_ascii_lowercase().contains(&needle))
+                        .unwrap_or(false)
+                    || entry
+                        .import_note
+                        .as_deref()
+                        .map(|value| value.to_ascii_lowercase().contains(&needle))
+                        .unwrap_or(false)
+            })
+            .take(limit)
+            .map(|entry| AccountLogAccount {
+                id: entry.id,
+                email: entry.email,
+                import_note: entry.import_note,
+                disabled: entry.disabled,
+                disabled_reason: entry.disabled_reason,
+            })
+            .collect();
+        Ok(AccountLogAccountsResponse { accounts })
+    }
+
+    /// 查询单个账号的结构化日志。
+    pub async fn get_credential_logs(
+        &self,
+        id: u64,
+        query: CredentialLogQuery,
+    ) -> Result<CredentialLogsResponse, AdminServiceError> {
+        if !self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.id == id)
+        {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        let store = self
+            .account_log_store
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("账号日志存储未启用".to_string()))?;
+        validate_log_filter(
+            query.severity.as_deref(),
+            &["info", "warn", "error"],
+            "severity",
+        )?;
+        validate_log_filter(
+            query.event_type.as_deref(),
+            &[
+                "request",
+                "token_refresh",
+                "balance",
+                "credential_status",
+                "proxy",
+                "recovery_probe",
+            ],
+            "eventType",
+        )?;
+        validate_log_filter(
+            query.outcome.as_deref(),
+            &["success", "failure", "retry", "pending"],
+            "outcome",
+        )?;
+        let from_ms = parse_log_time(query.from.as_deref(), "from")?;
+        let to_ms = parse_log_time(query.to.as_deref(), "to")?;
+        if from_ms.zip(to_ms).is_some_and(|(from, to)| from > to) {
+            return Err(AdminServiceError::InvalidCredential(
+                "from 不能晚于 to".to_string(),
+            ));
+        }
+        let page = store
+            .query(
+                id,
+                AccountLogFilters {
+                    severity: query.severity,
+                    event_type: query.event_type,
+                    outcome: query.outcome,
+                    from_ms,
+                    to_ms,
+                    before: query.before,
+                    limit: query.limit.unwrap_or(100).clamp(1, 100),
+                },
+            )
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("无效的日志分页游标") {
+                    AdminServiceError::InvalidCredential(message)
+                } else {
+                    AdminServiceError::InternalError(message)
+                }
+            })?;
+        Ok(CredentialLogsResponse {
+            credential_id: id,
+            items: page.items,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        })
+    }
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
@@ -316,6 +493,17 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            if disabled {
+                "管理员禁用凭据"
+            } else {
+                "管理员启用凭据"
+            },
+        );
         Ok(())
     }
 
@@ -339,7 +527,15 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            format!("管理员设置优先级为 {priority}"),
+        );
+        Ok(())
     }
 
     /// 绑定、清除或显式直连单个凭据的代理。
@@ -1974,7 +2170,15 @@ impl AdminService {
         self.ensure_can_enable(id)?;
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            "管理员重置失败计数并启用凭据",
+        );
+        Ok(())
     }
 
     pub async fn recover_quota_retired(
@@ -2046,6 +2250,7 @@ impl AdminService {
                 self.balance_errors.lock().remove(&id);
                 self.disable_if_quota_exhausted_balance(&balance);
                 self.backfill_disabled_reason(id, &balance);
+                self.record_admin_log(id, "balance", "info", "success", "余额查询命中缓存");
                 return Ok(balance);
             }
         }
@@ -2060,6 +2265,7 @@ impl AdminService {
                         error_class: Self::balance_error_class(&error),
                     },
                 );
+                self.record_admin_log(id, "balance", "error", "failure", "余额查询失败");
                 return Err(error);
             }
         };
@@ -2067,6 +2273,7 @@ impl AdminService {
         self.cache_balance(&balance);
         self.disable_if_quota_exhausted_balance(&balance);
         self.backfill_disabled_reason(id, &balance);
+        self.record_admin_log(id, "balance", "info", "success", "余额查询完成");
         Ok(balance)
     }
 
@@ -2557,6 +2764,23 @@ impl AdminService {
             }
         }
 
+        self.record_admin_log(
+            credential_id,
+            "credential_status",
+            "info",
+            "success",
+            "管理员添加凭据",
+        );
+        if assigned_proxy.is_some() || explicit_proxy {
+            self.record_admin_log(
+                credential_id,
+                "proxy",
+                "info",
+                "success",
+                "凭据代理配置已保存",
+            );
+        }
+
         Ok(AddCredentialResponse {
             success: true,
             message: if proxy_test_failed {
@@ -2602,6 +2826,7 @@ impl AdminService {
         }
         self.balance_errors.lock().remove(&id);
         self.save_balance_cache();
+        self.record_admin_log(id, "credential_status", "info", "success", "管理员删除凭据");
 
         Ok(())
     }
@@ -2815,10 +3040,28 @@ impl AdminService {
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .force_refresh_token_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))
+        match self.token_manager.force_refresh_token_for(id).await {
+            Ok(()) => {
+                self.record_admin_log(
+                    id,
+                    "token_refresh",
+                    "info",
+                    "success",
+                    "管理员强制刷新 Token 成功",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.record_admin_log(
+                    id,
+                    "token_refresh",
+                    "error",
+                    "failure",
+                    "管理员强制刷新 Token 失败",
+                );
+                Err(self.classify_balance_error(error, id))
+            }
+        }
     }
 
     // ============ 余额缓存持久化 ============

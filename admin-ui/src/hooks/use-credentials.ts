@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
   setCredentialDisabled,
@@ -26,12 +26,15 @@ import {
   getProxyPool,
   testProxyPoolEntry,
   batchGetCredentialBalance,
+  searchLogAccounts,
+  getCredentialLogs,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
   SetCredentialProxyRequest,
   SetMaxRelayRequest,
   SetProPlusProxyGateRequest,
+  CredentialLogQuery,
 } from '@/types/api'
 
 // 查询凭据列表
@@ -292,5 +295,36 @@ export function useSetMaxRelay() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['maxRelay'] })
     },
+  })
+}
+
+// 搜索日志中心账号
+export function useLogAccounts(query: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ['log-accounts', query],
+    queryFn: () => searchLogAccounts(query),
+    enabled: enabled && query.trim().length > 0,
+    retry: false,
+  })
+}
+
+// 查询单个账号日志，按时间倒序分页
+export function useCredentialLogs(
+  id: number | null,
+  filters: CredentialLogQuery,
+  enabled: boolean
+) {
+  return useInfiniteQuery({
+    queryKey: ['credential-logs', id, filters],
+    queryFn: ({ pageParam }) =>
+      getCredentialLogs(id!, {
+        ...filters,
+        ...(pageParam ? { before: pageParam } : {}),
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.hasMore ? lastPage.nextCursor ?? undefined : undefined,
+    enabled: enabled && id !== null,
+    retry: false,
   })
 }

@@ -293,3 +293,58 @@ export interface SetMaxRelayRequest {
   baseUrl: string
   apiKey: string
 }
+
+export interface AccountLogAccount {
+  id: number
+  email?: string | null
+  importNote?: string | null
+  disabled: boolean
+  disabledReason?: string | null
+}
+
+export interface AccountLogAccountSearchResponse {
+  accounts: AccountLogAccount[]
+}
+
+export type AccountLogSeverity = 'info' | 'warn' | 'error'
+export type AccountLogEventType =
+  | 'request'
+  | 'token_refresh'
+  | 'balance'
+  | 'credential_status'
+  | 'proxy'
+  | 'recovery_probe'
+export type AccountLogOutcome = 'success' | 'failure' | 'retry' | 'pending'
+
+export interface AccountLogItem {
+  id: number
+  createdAt: string
+  eventType: AccountLogEventType
+  severity: AccountLogSeverity
+  outcome: AccountLogOutcome
+  model: string | null
+  apiType: string | null
+  errorClass: string | null
+  upstreamStatus: number | null
+  latencyMs: number | null
+  requestId: string | null
+  message: string
+  details: Record<string, unknown> | null
+}
+
+export interface CredentialLogsResponse {
+  credentialId: number
+  items: AccountLogItem[]
+  nextCursor: string | null
+  hasMore: boolean
+}
+
+export interface CredentialLogQuery {
+  severity?: AccountLogSeverity
+  eventType?: AccountLogEventType
+  outcome?: AccountLogOutcome
+  from?: string
+  to?: string
+  limit?: number
+  before?: string
+}

@@ -253,6 +253,13 @@ impl KiroProvider {
         if let Some(client) = cache.get(&cache_key) {
             return Ok(client.clone());
         }
+        if effective.is_some() {
+            tracing::debug!(
+                event_type = "proxy",
+                credential_id,
+                "凭据代理客户端已创建"
+            );
+        }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(cache_key, client.clone());
         Ok(client)
