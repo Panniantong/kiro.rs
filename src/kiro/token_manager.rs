@@ -2798,8 +2798,25 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = match get_usage_limits(
+            &credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await
+        {
+            Ok(usage_limits) => usage_limits,
+            Err(proxy_error) if effective_proxy.is_some() => {
+                tracing::warn!(
+                    "凭据 #{} 通过代理获取额度失败，尝试直连: {}",
+                    id,
+                    proxy_error
+                );
+                get_usage_limits(&credentials, &self.config, &token, None).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         self.store_usage_metadata(id, &usage_limits);
 
