@@ -1571,6 +1571,17 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // IdC/刷新接口的 400 通常表示共享请求链路或参数问题，
+                    // 不能把它当成账号永久失效累计，否则同一故障会批量禁用有余额账号。
+                    let error_text = e.to_string();
+                    if error_text.contains("400 Bad Request") {
+                        log_token_acquire_failure(id, &e, false);
+                        tracing::warn!(
+                            credential_id = id,
+                            "Token 刷新返回 400，保留凭据启用状态，不累计自动禁用失败计数"
+                        );
+                        return Err(e);
+                    }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         log_token_acquire_failure(id, &e, true);
