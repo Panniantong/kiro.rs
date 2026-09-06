@@ -68,13 +68,15 @@ pub fn build_client(
     }
 
     if let Some(proxy_config) = proxy {
-        let mut proxy = Proxy::all(&proxy_config.url)?;
-
-        // 设置代理认证
+        // SOCKS5 认证必须通过 URL 用户信息发送；`Proxy::basic_auth` 只对
+        // HTTP 代理生效。
+        let mut proxy_url = reqwest::Url::parse(&proxy_config.url)?;
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
-            proxy = proxy.basic_auth(username, password);
+            proxy_url.set_username(username).map_err(|_| anyhow::anyhow!("代理用户名无效"))?;
+            proxy_url.set_password(Some(password)).map_err(|_| anyhow::anyhow!("代理密码无效"))?;
         }
 
+        let proxy = Proxy::all(proxy_url)?;
         builder = builder.proxy(proxy);
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
     }
@@ -85,6 +87,7 @@ pub fn build_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, routing::any};
 
     #[test]
     fn test_proxy_config_new() {
@@ -113,5 +116,26 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_client_routes_request_through_http_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().fallback(any(|| async { r#"{"ip":"203.0.113.44"}"# }));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = ProxyConfig::new(format!("http://{}", address));
+        let client = build_client(Some(&config), 5, TlsBackend::Rustls).unwrap();
+        let response = client
+            .get("http://unresolvable.invalid/proxy-check")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), r#"{"ip":"203.0.113.44"}"#);
     }
 }

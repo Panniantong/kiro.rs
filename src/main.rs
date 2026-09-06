@@ -1,3 +1,4 @@
+mod account_logs;
 mod admin;
 mod admin_ui;
 mod anthropic;
@@ -9,6 +10,9 @@ pub mod token;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use clap::Parser;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
@@ -23,12 +27,14 @@ async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // 初始化日志；账号级事件由附加 Layer 持久化到 SQLite。
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(account_logs::AccountLogLayer::default())
         .init();
 
     // 加载配置
@@ -139,6 +145,19 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    let account_log_store = match account_logs::AccountLogStore::open(token_manager.cache_dir()) {
+        Ok(store) => {
+            if let Some(store) = &store {
+                account_logs::set_global_store(store.clone());
+                tracing::info!("账号日志 SQLite 存储已启用");
+            }
+            store
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "账号日志 SQLite 存储初始化失败，将仅保留 stdout 日志");
+            None
+        }
+    };
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -175,9 +194,48 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
+            let quota_events = token_manager.subscribe_quota_exhausted();
+            let stable_disabled_events = token_manager.subscribe_stable_disabled();
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_account_log_store(account_log_store.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let rotation_service = admin_state.service.clone();
+            tokio::spawn(rotation_service.run_quota_rotation_worker(quota_events));
+            let quota_guard_service = admin_state.service.clone();
+            tokio::spawn(quota_guard_service.run_pro_plus_quota_guard());
+            let disabled_release_service = admin_state.service.clone();
+            tokio::spawn(
+                disabled_release_service
+                    .run_stable_disabled_proxy_release_worker(stable_disabled_events),
+            );
+            let reconcile_service = admin_state.service.clone();
+            tokio::spawn(async move {
+                match reconcile_service.retire_cached_nonviable_pool_credentials() {
+                    Ok(retired) => tracing::info!(retired, "代理池历史额度失效账号启动收口完成"),
+                    Err(error) => tracing::warn!("代理池历史额度失效账号启动收口失败: {}", error),
+                }
+                match reconcile_service.release_stale_disabled_proxy_bindings() {
+                    Ok(released) => {
+                        tracing::info!(released, "历史稳定禁用账号代理启动释放完成")
+                    }
+                    Err(error) => {
+                        tracing::warn!("历史稳定禁用账号代理启动释放失败: {}", error)
+                    }
+                }
+                match reconcile_service.reconcile_pending_pro_plus().await {
+                    Ok((enabled, pending)) => tracing::info!(
+                        "PRO+ 代理等待队列启动收口完成: enabled={} pending={}",
+                        enabled,
+                        pending
+                    ),
+                    Err(error) => tracing::warn!("PRO+ 代理等待队列启动收口失败: {}", error),
+                }
+                match reconcile_service.backfill_disabled_reasons().await {
+                    Ok(backfilled) => tracing::info!(backfilled, "历史禁用账号原因回填完成"),
+                    Err(error) => tracing::warn!("历史禁用账号原因回填失败: {}", error),
+                }
+            });
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -208,6 +266,8 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  GET  /api/admin/logs/accounts");
+        tracing::info!("  GET  /api/admin/credentials/:id/logs");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

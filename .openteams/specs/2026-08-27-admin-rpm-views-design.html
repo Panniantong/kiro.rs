@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Kiro Admin 全局 RPM 与高密度凭据视图</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:980px;margin:40px auto;padding:0 24px;color:#18212f;line-height:1.65}h1{font-size:30px}h2{margin-top:32px;border-bottom:1px solid #dfe5ec;padding-bottom:8px}code{background:#f2f5f8;padding:2px 6px;border-radius:4px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #dfe5ec;padding:9px;text-align:left}th{background:#f7f9fb}.decision{border-left:4px solid #16a34a;background:#f0fdf4;padding:14px 18px}.risk{border-left:4px solid #f59e0b;background:#fffbeb;padding:14px 18px}.muted{color:#64748b}</style></head><body>
+<h1>Kiro Admin：全局 RPM 与高密度凭据视图</h1>
+<p class="muted">设计日期：2026-08-27；基线：生产 commit 7ee72de；目标端口：8992 / 8993。</p>
+<div class="decision"><strong>采用方案：</strong>保留现有卡片操作视图，同时新增“可用紧凑”和“全部紧凑”两种高密度表格视图；全部使用现有 Admin API 字段，不新增后端数据模型。</div>
+<h2>1. 顶部全局 RPM</h2>
+<p>统计区从 3 张卡扩为 4 张：凭据总数、可用凭据、全局 RPM、当前活跃。</p>
+<ul><li>主数字：所有启用凭据 <code>currentRpm</code> 之和，表示最近 60 秒上游尝试总数。</li><li>副文案：所有启用凭据 <code>peakRpm1h</code> 之和，并显示近 1h 本地 throttled 总数。</li><li>不把配置值 <code>defaultRpm=99999</code> 当作实际 RPM。</li></ul>
+<h2>2. 默认排序</h2>
+<ol><li>启用凭据优先。</li><li>当前活跃凭据优先。</li><li>priority 数字升序。</li><li>id 升序，保证稳定。</li></ol>
+<p>排序只影响展示，不改变路由和凭据优先级。</p>
+<h2>3. 三档视图</h2>
+<table><tr><th>模式</th><th>数据</th><th>布局</th><th>分页</th></tr>
+<tr><td>卡片</td><td>全部凭据</td><td>现有 3 列卡片，保留全部操作</td><td>12 条/页</td></tr>
+<tr><td>可用紧凑</td><td>仅启用凭据</td><td>高密度表格</td><td>单页展示全部可用凭据</td></tr>
+<tr><td>全部紧凑</td><td>全部凭据</td><td>高密度表格</td><td>单页展示全部凭据</td></tr></table>
+<p>视图选择保存在 localStorage，刷新后保留。切换视图重置选择与页码。</p>
+<h2>4. 紧凑表格字段</h2>
+<p>每行显示：选择框、ID/邮箱、启用/禁用及原因、认证方式、订阅等级、实时 RPM/有效上限/近1h峰值、剩余额度/总额、分组/备注（importNote）、优先级、最后调用、启用开关。</p>
+<p>余额来自现有 <code>GET /credentials/{id}/balance</code>。进入紧凑视图后按可见凭据自动补齐 balanceMap；有缓存直接显示，加载中显示占位，不阻塞列表。</p>
+<h2>5. 分支管理</h2>
+<ul><li>从当前生产 HEAD 7ee72de 创建 <code>fluxnode/admin-rpm-views-20260827</code>。</li><li>仅包含本次 UI 功能；不混入 upstream sync、运行时配置和生产部署。</li><li>提交拆分：视图/排序功能一个 commit；必要的测试修复一个 commit。</li><li>构建镜像必须来自 commit；8992 验证后再部署 8993；保留旧容器回滚。</li></ul>
+<h2>6. 验证</h2>
+<ul><li><code>npm run build</code> / TypeScript build 通过。</li><li>浏览器验证 4 张统计卡、默认启用优先、三档切换、53+ 可用凭据单页展示。</li><li>确认 RPM 合计等于启用凭据 currentRpm 之和。</li><li>确认禁用卡片仍可操作，卡片分页保持 12/页。</li><li>部署后 /v1/models health=200，旧容器保留。</li></ul>
+<div class="risk"><strong>风险控制：</strong>紧凑视图一次展示大量账号，但余额查询使用既有 5 分钟服务端缓存；前端限制并发，避免切换视图时瞬时打爆上游。</div>
+</body></html>

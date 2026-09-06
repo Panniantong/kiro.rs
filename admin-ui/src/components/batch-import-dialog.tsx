@@ -11,7 +11,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, setCredentialRpm } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface BatchImportDialogProps {
@@ -51,6 +51,8 @@ interface VerificationResult {
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [batchNote, setBatchNote] = useState('')
+  const [batchPriority, setBatchPriority] = useState('')
+  const [batchRpm, setBatchRpm] = useState('')
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
@@ -84,6 +86,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const resetForm = () => {
     setJsonInput('')
     setBatchNote('')
+    setBatchPriority('')
+    setBatchRpm('')
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
@@ -102,6 +106,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
     if (credentials.length === 0) {
       toast.error('没有可导入的凭据')
+      return
+    }
+
+    const sharedPriority = batchPriority.trim() === '' ? undefined : Number(batchPriority)
+    if (sharedPriority !== undefined && (!Number.isInteger(sharedPriority) || sharedPriority < 0)) {
+      toast.error('统一优先级必须是非负整数')
+      return
+    }
+    const sharedRpm = batchRpm.trim() === '' ? undefined : Number(batchRpm)
+    if (sharedRpm !== undefined && (!Number.isInteger(sharedRpm) || sharedRpm < 0)) {
+      toast.error('统一 RPM 必须是非负整数')
       return
     }
 
@@ -236,7 +251,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             const addedCred = await addCredential({
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
-              priority: cred.priority || 0,
+              priority: sharedPriority ?? cred.priority ?? 0,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
@@ -246,6 +261,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             })
 
             addedCredId = addedCred.credentialId
+
+            if (sharedRpm !== undefined) {
+              await setCredentialRpm(addedCred.credentialId, sharedRpm)
+            }
 
             // 延迟 1 秒
             await new Promise(resolve => setTimeout(resolve, 1000))
@@ -289,7 +308,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,
-            priority: cred.priority || 0,
+            priority: sharedPriority ?? cred.priority ?? 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
             email: cred.email?.trim() || undefined,
@@ -297,6 +316,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           })
 
           addedCredId = addedCred.credentialId
+
+          if (sharedRpm !== undefined) {
+            await setCredentialRpm(addedCred.credentialId, sharedRpm)
+          }
 
           // 延迟 1 秒
           await new Promise(resolve => setTimeout(resolve, 1000))
@@ -442,6 +465,33 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <p className="text-xs text-muted-foreground">
               💡 导入时自动验活，失败的凭据会被排除
             </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">统一优先级</label>
+              <Input
+                type="number"
+                min="0"
+                step="1"
+                placeholder="留空按 JSON 中的值"
+                value={batchPriority}
+                onChange={(e) => setBatchPriority(e.target.value)}
+                disabled={importing}
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">统一 RPM</label>
+              <Input
+                type="number"
+                min="0"
+                step="1"
+                placeholder="留空跟随全局默认，0 表示不限制"
+                value={batchRpm}
+                onChange={(e) => setBatchRpm(e.target.value)}
+                disabled={importing}
+              />
+            </div>
           </div>
 
           <div className="space-y-2">

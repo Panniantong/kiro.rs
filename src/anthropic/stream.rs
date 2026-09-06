@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -546,18 +546,11 @@ pub enum SignatureMode {
     Disabled,
     /// 透传路径：只透传上游真实 signature，不改写、不兜底生成。
     Passthrough,
-    /// HVOY / API-CHECK 兼容路径：允许把上游 Kiro 内部模型签名规范化为公开模型名；
-    /// 上游没有 signature 时为受支持的检测模型补一个兼容 signature_delta。
-    HvoyApiCheck,
 }
 
 impl SignatureMode {
     fn enabled(self) -> bool {
         !matches!(self, SignatureMode::Disabled)
-    }
-
-    fn hvoy_api_check(self) -> bool {
-        matches!(self, SignatureMode::HvoyApiCheck)
     }
 }
 
@@ -838,6 +831,13 @@ impl StreamContext {
         )
     }
 
+    fn prepare_next_reasoning_block(&mut self) {
+        self.thinking_block_index = None;
+        self.signature_delta_emitted = false;
+        self.thinking_delta_emitted = false;
+        self.in_thinking_block = false;
+    }
+
     fn process_reasoning_content(
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
@@ -848,23 +848,30 @@ impl StreamContext {
 
         let mut events = Vec::new();
 
-        if self.emit_thinking_text && !reasoning.text.is_empty() {
-            events.extend(self.ensure_thinking_block_started());
-            if let Some(thinking_index) = self.thinking_block_index {
-                self.output_tokens += estimate_tokens(&reasoning.text);
-                events.push(self.create_thinking_delta_event(thinking_index, &reasoning.text));
+        if !reasoning.text.is_empty() {
+            // A signature terminates its thinking block. Later reasoning text
+            // must open a fresh block, never reuse the already closed index.
+            if self.signature_delta_emitted {
+                self.prepare_next_reasoning_block();
+            }
+            if self.emit_thinking_text {
+                events.extend(self.ensure_thinking_block_started());
+                if let Some(thinking_index) = self.thinking_block_index {
+                    self.output_tokens += estimate_tokens(&reasoning.text);
+                    events.push(self.create_thinking_delta_event(thinking_index, &reasoning.text));
+                }
             }
         }
 
-        if !reasoning.signature.is_empty() && !self.signature_delta_emitted {
+        if !reasoning.signature.is_empty() {
+            if self.signature_delta_emitted {
+                // Without a text/tool boundary, the upstream event model gives
+                // us no new-block identity. Treat every additional signature as
+                // a duplicate of the current block rather than guessing.
+                return events;
+            }
             events.extend(self.ensure_thinking_block_started());
             if let Some(thinking_index) = self.thinking_block_index {
-                if self.emit_thinking_text && !self.thinking_delta_emitted {
-                    events.push(self.create_thinking_delta_event(
-                        thinking_index,
-                        "I reviewed the request and prepared a concise response.",
-                    ));
-                }
                 events.push(self.emit_signature_delta_event(thinking_index, &reasoning.signature));
                 if let Some(stop_event) =
                     self.state_manager.handle_content_block_stop(thinking_index)
@@ -1156,13 +1163,6 @@ impl StreamContext {
     }
 
     fn create_upstream_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
-        let signature = if self.signature_mode.hvoy_api_check() {
-            normalize_hvoy_signature_model(signature, &self.model)
-                .unwrap_or_else(|| signature.to_string())
-        } else {
-            signature.to_string()
-        };
-
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1181,54 +1181,8 @@ impl StreamContext {
         self.create_upstream_signature_delta_event(index, signature)
     }
 
-    fn create_fallback_hvoy_signature(&self) -> Option<String> {
-        let public_model = hvoy_signature_public_model_name(&self.model)?;
-        let mut proof_bytes = Vec::with_capacity(256);
-        for counter in 0..8u8 {
-            let mut hasher = Sha256::new();
-            hasher.update(self.message_id.as_bytes());
-            hasher.update(public_model.as_bytes());
-            hasher.update([counter]);
-            proof_bytes.extend_from_slice(&hasher.finalize());
-        }
-
-        let mut inner = Vec::new();
-        write_varint(1 << 3, &mut inner);
-        write_varint(12, &mut inner);
-        write_varint(3 << 3, &mut inner);
-        write_varint(2, &mut inner);
-        write_varint((5 << 3) | 2, &mut inner);
-        write_varint(proof_bytes.len() as u64, &mut inner);
-        inner.extend_from_slice(&proof_bytes);
-        write_varint((6 << 3) | 2, &mut inner);
-        write_varint(public_model.len() as u64, &mut inner);
-        inner.extend_from_slice(public_model.as_bytes());
-        write_varint(7 << 3, &mut inner);
-        write_varint(0, &mut inner);
-
-        let mut outer = Vec::new();
-        write_varint((1 << 3) | 2, &mut outer);
-        write_varint(inner.len() as u64, &mut outer);
-        outer.extend_from_slice(&inner);
-
-        let mut top = Vec::new();
-        write_varint((2 << 3) | 2, &mut top);
-        write_varint(outer.len() as u64, &mut top);
-        top.extend_from_slice(&outer);
-        write_varint(3 << 3, &mut top);
-        write_varint(1, &mut top);
-
-        Some(general_purpose::STANDARD.encode(top))
-    }
-
     fn close_thinking_block_events(&mut self, index: i32) -> Vec<SseEvent> {
         let mut events = Vec::new();
-
-        if self.signature_mode.hvoy_api_check() && !self.signature_delta_emitted {
-            if let Some(signature) = self.create_fallback_hvoy_signature() {
-                events.push(self.emit_signature_delta_event(index, &signature));
-            }
-        }
 
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
             events.push(stop_event);
@@ -1244,6 +1198,12 @@ impl StreamContext {
         let mut events = Vec::new();
 
         self.state_manager.set_has_tool_use(true);
+
+        // A completed signed reasoning block must not remain current across
+        // an interleaved tool boundary.
+        if self.signature_delta_emitted {
+            self.prepare_next_reasoning_block();
+        }
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -1562,6 +1522,29 @@ impl BufferedStreamContext {
         self.inner.has_deliverable_output()
     }
 
+    /// 取走当前已转换的事件，但不结束流。
+    ///
+    /// 用于语义前缀门：确认已经存在可交付内容后，立即冲刷前缀；后续事件可以继续
+    /// 逐批取走。若前缀中尚有 message_start，则用当前已观测到的 context usage
+    /// 修正其 input_tokens；开门后协议不允许再回写已经发出的 message_start。
+    pub fn take_buffered_events(&mut self) -> Vec<SseEvent> {
+        self.correct_message_start_input_tokens();
+        std::mem::take(&mut self.event_buffer)
+    }
+
+    fn correct_message_start_input_tokens(&mut self) {
+        let final_input_tokens = self.inner.final_input_tokens();
+        for event in &mut self.event_buffer {
+            if event.event == "message_start" {
+                if let Some(message) = event.data.get_mut("message") {
+                    if let Some(usage) = message.get_mut("usage") {
+                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                    }
+                }
+            }
+        }
+    }
+
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
@@ -1580,21 +1563,7 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // /cc/v1 使用 contextUsageEvent 修正 input_tokens；普通 /v1 不走此缓冲路径。
-        let final_input_tokens = self.inner.final_input_tokens();
-
-        // 更正 message_start 事件中的 input_tokens
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
+        self.take_buffered_events()
     }
 }
 
@@ -1619,234 +1588,13 @@ fn estimate_tokens(text: &str) -> i32 {
     (chinese_tokens + other_tokens).max(1)
 }
 
-fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    while *pos < bytes.len() && shift <= 63 {
-        let byte = bytes[*pos];
-        *pos += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift += 7;
-    }
-    None
-}
-
+#[cfg(test)]
 fn write_varint(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push((value as u8 & 0x7f) | 0x80);
         value >>= 7;
     }
     out.push(value as u8);
-}
-
-fn rewrite_hvoy_inner_signature_model(inner: &[u8], model: &str) -> Option<Vec<u8>> {
-    let mut pos = 0usize;
-    let mut out = Vec::with_capacity(inner.len() + model.len());
-    let mut saw_rewritable_model = false;
-    let mut saw_field7 = false;
-
-    while pos < inner.len() {
-        let key_start = pos;
-        let key = read_varint(inner, &mut pos)?;
-        let field = key >> 3;
-        let wire_type = key & 0x07;
-
-        match (field, wire_type) {
-            (1, 0) => {
-                let _ = read_varint(inner, &mut pos)?;
-                write_varint(key, &mut out);
-                write_varint(12, &mut out);
-            }
-            (2, 0) | (8, 2) => {
-                if wire_type == 0 {
-                    let _ = read_varint(inner, &mut pos)?;
-                } else {
-                    let len = read_varint(inner, &mut pos)? as usize;
-                    pos = pos.checked_add(len)?;
-                    if pos > inner.len() {
-                        return None;
-                    }
-                }
-            }
-            (6, 2) => {
-                let len = read_varint(inner, &mut pos)? as usize;
-                let end = pos.checked_add(len)?;
-                if end > inner.len() {
-                    return None;
-                }
-                let value = &inner[pos..end];
-                pos = end;
-                if value != b"claude-quince" && value != model.as_bytes() {
-                    return None;
-                }
-                saw_rewritable_model = true;
-                write_varint(key, &mut out);
-                write_varint(model.len() as u64, &mut out);
-                out.extend_from_slice(model.as_bytes());
-            }
-            (7, 0) => {
-                let value = read_varint(inner, &mut pos)?;
-                saw_field7 = true;
-                write_varint(key, &mut out);
-                write_varint(value, &mut out);
-            }
-            (_, 0) => {
-                let _ = read_varint(inner, &mut pos)?;
-                out.extend_from_slice(&inner[key_start..pos]);
-            }
-            (_, 1) => {
-                let end = pos.checked_add(8)?;
-                if end > inner.len() {
-                    return None;
-                }
-                out.extend_from_slice(&inner[key_start..end]);
-                pos = end;
-            }
-            (_, 2) => {
-                let len = read_varint(inner, &mut pos)? as usize;
-                let end = pos.checked_add(len)?;
-                if end > inner.len() {
-                    return None;
-                }
-                out.extend_from_slice(&inner[key_start..end]);
-                pos = end;
-            }
-            (_, 5) => {
-                let end = pos.checked_add(4)?;
-                if end > inner.len() {
-                    return None;
-                }
-                out.extend_from_slice(&inner[key_start..end]);
-                pos = end;
-            }
-            _ => return None,
-        }
-    }
-
-    if saw_rewritable_model && saw_field7 {
-        Some(out)
-    } else {
-        None
-    }
-}
-
-fn rewrite_first_length_delimited_field(
-    message: &[u8],
-    target_field: u64,
-    rewrite: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
-    let mut pos = 0usize;
-    let mut out = Vec::with_capacity(message.len());
-    let mut rewrite = Some(rewrite);
-
-    while pos < message.len() {
-        let key_start = pos;
-        let key = read_varint(message, &mut pos)?;
-        let field = key >> 3;
-        let wire_type = key & 0x07;
-
-        match wire_type {
-            0 => {
-                let _ = read_varint(message, &mut pos)?;
-                out.extend_from_slice(&message[key_start..pos]);
-            }
-            1 => {
-                let end = pos.checked_add(8)?;
-                if end > message.len() {
-                    return None;
-                }
-                out.extend_from_slice(&message[key_start..end]);
-                pos = end;
-            }
-            2 => {
-                let len = read_varint(message, &mut pos)? as usize;
-                let value_start = pos;
-                let value_end = pos.checked_add(len)?;
-                if value_end > message.len() {
-                    return None;
-                }
-                let value = &message[value_start..value_end];
-                pos = value_end;
-
-                if field == target_field {
-                    let rewrite_fn = rewrite.take()?;
-                    let rewritten = rewrite_fn(value)?;
-                    write_varint(key, &mut out);
-                    write_varint(rewritten.len() as u64, &mut out);
-                    out.extend_from_slice(&rewritten);
-                } else {
-                    out.extend_from_slice(&message[key_start..value_end]);
-                }
-            }
-            5 => {
-                let end = pos.checked_add(4)?;
-                if end > message.len() {
-                    return None;
-                }
-                out.extend_from_slice(&message[key_start..end]);
-                pos = end;
-            }
-            _ => return None,
-        }
-    }
-
-    if rewrite.is_none() { Some(out) } else { None }
-}
-
-fn hvoy_signature_public_model_name(model: &str) -> Option<&'static str> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("5-sonnet")
-        {
-            return Some("claude-sonnet-5");
-        }
-
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            return Some("claude-sonnet-4-6");
-        }
-    }
-
-    if !model_lower.contains("opus") {
-        return None;
-    }
-
-    if model_lower.contains("opus-5")
-        || model_lower.contains("opus5")
-        || model_lower.contains("5-opus")
-    {
-        Some("claude-opus-5")
-    } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-        Some("claude-opus-4-8")
-    } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-        Some("claude-opus-4-7")
-    } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-        Some("claude-opus-4-6")
-    } else {
-        None
-    }
-}
-
-fn normalize_hvoy_signature_model(signature: &str, model: &str) -> Option<String> {
-    let public_model = hvoy_signature_public_model_name(model)?;
-
-    let decoded = general_purpose::STANDARD
-        .decode(signature)
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(signature))
-        .ok()?;
-
-    let rewritten = rewrite_first_length_delimited_field(&decoded, 2, |outer| {
-        rewrite_first_length_delimited_field(outer, 1, |inner| {
-            rewrite_hvoy_inner_signature_model(inner, public_model)
-        })
-    })?;
-
-    Some(general_purpose::STANDARD.encode(rewritten))
 }
 
 #[cfg(test)]
@@ -1956,6 +1704,40 @@ mod tests {
             BufferedStreamContext::new("claude-opus-5", 12, true, false, false, HashMap::new());
         text_ctx.process_and_buffer(&Event::AssistantResponse(text));
         assert!(text_ctx.has_deliverable_output());
+    }
+
+    #[test]
+    fn buffered_context_flushes_semantic_prefix_before_stream_finish() {
+        use crate::kiro::model::events::AssistantResponseEvent;
+
+        let mut ctx =
+            BufferedStreamContext::new("claude-opus-5", 12, false, false, false, HashMap::new());
+        let mut first = AssistantResponseEvent::default();
+        first.content = "first".to_string();
+        ctx.process_and_buffer(&Event::AssistantResponse(first));
+
+        assert!(ctx.has_deliverable_output());
+        let prefix = ctx.take_buffered_events();
+        assert!(prefix.iter().any(|event| event.event == "message_start"));
+        assert!(prefix.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["text"].as_str() == Some("first")
+        }));
+        assert!(!prefix.iter().any(|event| event.event == "message_stop"));
+
+        let mut second = AssistantResponseEvent::default();
+        second.content = " second".to_string();
+        ctx.process_and_buffer(&Event::AssistantResponse(second));
+        let live = ctx.take_buffered_events();
+        assert!(live.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["text"].as_str() == Some(" second")
+        }));
+        assert!(!live.iter().any(|event| event.event == "message_start"));
+
+        let tail = ctx.finish_and_get_all_events();
+        assert!(tail.iter().any(|event| event.event == "message_stop"));
+        assert!(!tail.iter().any(|event| event.event == "message_start"));
     }
 
     #[test]
@@ -2765,7 +2547,7 @@ mod tests {
         out.extend_from_slice(value);
     }
 
-    fn synthetic_hvoy_signature_with_model(model: &str) -> String {
+    fn opaque_test_signature_with_model(model: &str) -> String {
         let mut inner = Vec::new();
         put_varint_field(1, 14, &mut inner);
         put_varint_field(2, 1, &mut inner);
@@ -2785,20 +2567,7 @@ mod tests {
     }
 
     fn synthetic_kiro_quince_signature() -> String {
-        synthetic_hvoy_signature_with_model("claude-quince")
-    }
-
-    fn assert_signature_contains_public_model(signature: &str, public_model: &str) {
-        let decoded = general_purpose::STANDARD.decode(signature).unwrap();
-        let decoded_text = String::from_utf8_lossy(&decoded);
-        assert!(
-            decoded_text.contains(public_model),
-            "normalized signature must expose expected public model {public_model}"
-        );
-        assert!(
-            !decoded_text.contains("claude-quince"),
-            "normalized signature must not expose Kiro internal model"
-        );
+        opaque_test_signature_with_model("claude-quince")
     }
 
     fn message_start_input_tokens(events: &[SseEvent]) -> Option<i64> {
@@ -3052,7 +2821,7 @@ mod tests {
             "claude-opus-4-8",
             1,
             true,
-            SignatureMode::HvoyApiCheck,
+            SignatureMode::Passthrough,
             true,
             HashMap::new(),
         );
@@ -3083,7 +2852,170 @@ mod tests {
         assert_eq!(
             collect_signatures(&all_events),
             vec!["first-upstream-signature".to_string()],
-            "HVOY/API-CHECK compatibility must expose exactly one signature_delta per thinking block"
+            "passthrough must expose exactly the first upstream signature per thinking block"
+        );
+    }
+
+    #[test]
+    fn test_interleaved_reasoning_blocks_preserve_each_upstream_signature() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-5",
+            1,
+            true,
+            SignatureMode::Passthrough,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        for event in [
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: "thinking-a".to_string(),
+                signature: String::new(),
+            }),
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: "signature-a".to_string(),
+            }),
+            Event::ToolUse(crate::kiro::model::events::ToolUseEvent {
+                name: "read".to_string(),
+                tool_use_id: "tool-a".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: "thinking-b".to_string(),
+                signature: String::new(),
+            }),
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                signature: "signature-b".to_string(),
+            }),
+        ] {
+            events.extend(ctx.process_kiro_event(&event));
+        }
+
+        let thinking_starts = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let signature_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(thinking_starts.len(), 2);
+        assert_ne!(thinking_starts[0], thinking_starts[1]);
+        assert_eq!(signature_indices, thinking_starts);
+        assert_eq!(
+            collect_signatures(&events),
+            vec!["signature-a", "signature-b"]
+        );
+    }
+
+    #[test]
+    fn test_reasoning_text_after_signature_opens_a_new_thinking_block() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-5",
+            1,
+            true,
+            SignatureMode::Passthrough,
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        for (text, signature) in [
+            ("thinking-a", ""),
+            ("", "signature-a"),
+            ("thinking-b", ""),
+            ("", "signature-b"),
+        ] {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: text.to_string(),
+                    signature: signature.to_string(),
+                },
+            )));
+        }
+
+        let thinking_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "thinking_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let signature_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(thinking_indices.len(), 2);
+        assert_ne!(thinking_indices[0], thinking_indices[1]);
+        assert_eq!(signature_indices, thinking_indices);
+        assert_eq!(
+            collect_signatures(&events),
+            vec!["signature-a", "signature-b"]
+        );
+    }
+
+    #[test]
+    fn test_hidden_reasoning_text_still_separates_upstream_signatures() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-5",
+            1,
+            true,
+            SignatureMode::Passthrough,
+            false,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        for (text, signature) in [
+            ("hidden-a", ""),
+            ("", "signature-a"),
+            ("hidden-b", ""),
+            ("", "signature-b"),
+        ] {
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: text.to_string(),
+                    signature: signature.to_string(),
+                },
+            )));
+        }
+
+        let signature_indices = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|event| event.data["index"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(signature_indices.len(), 2);
+        assert_ne!(signature_indices[0], signature_indices[1]);
+        assert_eq!(
+            collect_signatures(&events),
+            vec!["signature-a", "signature-b"]
         );
     }
 
@@ -3113,89 +3045,30 @@ mod tests {
     }
 
     #[test]
-    fn test_hvoy_api_check_mode_emits_fallback_for_supported_model_without_upstream_signature() {
+    fn test_upstream_signature_without_text_does_not_fabricate_thinking() {
         let mut ctx = StreamContext::new_with_signature_mode(
-            "claude-sonnet-4-6",
+            "claude-opus-5",
             1,
             true,
-            SignatureMode::HvoyApiCheck,
+            SignatureMode::Passthrough,
             true,
             HashMap::new(),
         );
         let _initial_events = ctx.generate_initial_events();
 
-        let mut all_events = Vec::new();
-        all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nanswer"));
-        all_events.extend(ctx.generate_final_events());
-
-        let signatures = collect_signatures(&all_events);
-        assert_eq!(
-            signatures.len(),
-            1,
-            "supported HVOY/API-CHECK models should get one fallback signature_delta"
-        );
-        assert_signature_contains_public_model(&signatures[0], "claude-sonnet-4-6");
-        assert_eq!(collect_thinking_content(&all_events), "abc");
-        assert_eq!(collect_text_content(&all_events), "answer");
-    }
-
-    #[test]
-    fn test_hvoy_signature_public_model_name_keeps_sonnet5_native() {
-        assert_eq!(
-            hvoy_signature_public_model_name("claude-sonnet-5"),
-            Some("claude-sonnet-5")
-        );
-        assert_eq!(
-            hvoy_signature_public_model_name("claude-sonnet-5-thinking"),
-            Some("claude-sonnet-5")
-        );
-        assert_eq!(
-            hvoy_signature_public_model_name("sonnet5"),
-            Some("claude-sonnet-5")
-        );
-    }
-
-    #[test]
-    fn test_hvoy_signature_public_model_name_keeps_opus5_native() {
-        assert_eq!(
-            hvoy_signature_public_model_name("claude-opus-5"),
-            Some("claude-opus-5")
-        );
-        assert_eq!(
-            hvoy_signature_public_model_name("claude-opus-5-thinking"),
-            Some("claude-opus-5")
-        );
-        assert_eq!(
-            hvoy_signature_public_model_name("opus5"),
-            Some("claude-opus-5")
-        );
-    }
-
-    #[test]
-    fn test_hvoy_api_check_mode_normalizes_upstream_signature_model_name() {
-        let upstream_signature = synthetic_kiro_quince_signature();
-        let mut ctx = StreamContext::new_with_signature_mode(
-            "claude-opus-4-8",
-            1,
-            true,
-            SignatureMode::HvoyApiCheck,
-            true,
-            HashMap::new(),
-        );
-        let _initial_events = ctx.generate_initial_events();
-
-        let mut all_events = Vec::new();
-        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(
             crate::kiro::model::events::ReasoningContentEvent {
                 text: String::new(),
-                signature: upstream_signature.clone(),
+                signature: "upstream-real-signature".to_string(),
             },
-        )));
+        ));
 
-        let signatures = collect_signatures(&all_events);
-        assert_eq!(signatures.len(), 1);
-        assert_ne!(signatures[0], upstream_signature);
-        assert_signature_contains_public_model(&signatures[0], "claude-opus-4-8");
+        assert_eq!(collect_signatures(&events), vec!["upstream-real-signature"]);
+        assert_eq!(
+            collect_thinking_content(&events),
+            "",
+            "missing upstream thinking text must stay visibly missing"
+        );
     }
 
     #[test]
@@ -3223,7 +3096,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visible_thinking_signature_gets_summary_when_upstream_text_is_empty() {
+    fn test_visible_thinking_signature_keeps_upstream_text_missing() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, true, true, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
@@ -3239,20 +3112,15 @@ mod tests {
         all_events.extend(ctx.generate_final_events());
 
         assert_eq!(collect_signatures(&all_events), vec!["upstream-signature"]);
-        assert!(
-            !collect_thinking_content(&all_events).is_empty(),
-            "visible-thinking requests should expose a non-empty thinking_delta before signature"
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "",
+            "missing upstream thinking text must not be replaced with a local summary"
         );
 
         let thinking_index = ctx
             .thinking_block_index
             .expect("thinking block index should exist");
-        let thinking_delta_pos = all_events
-            .iter()
-            .position(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
-            })
-            .expect("thinking delta should exist");
         let signature_pos = all_events
             .iter()
             .position(|e| {
@@ -3273,7 +3141,6 @@ mod tests {
             })
             .expect("text block should exist");
 
-        assert!(thinking_delta_pos < signature_pos);
         assert!(signature_pos < thinking_stop_pos);
         assert!(thinking_stop_pos < text_start_pos);
         assert_eq!(collect_text_content(&all_events), "answer");

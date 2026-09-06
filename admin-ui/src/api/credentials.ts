@@ -3,9 +3,14 @@ import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  BatchBalanceResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetCredentialProxyRequest,
+  BatchSetCredentialProxyRequest,
+  BatchUpdateCredentialsRequest,
+  CredentialProxyTestResponse,
   AddCredentialRequest,
   AddCredentialResponse,
   SetRpmRequest,
@@ -13,9 +18,20 @@ import type {
   DefaultRpmResponse,
   SetDefaultRpmRequest,
   MaxRelayResponse,
+  ProPlusProxyGateResponse,
+  SetProPlusProxyGateRequest,
   SetMaxRelayRequest,
+  ProxyPoolResponse,
+  ProxyPoolTestResponse,
+  ManualProxyBindRequest,
+  ManualProxyUnbindRequest,
+  ManualProxyOperationResponse,
+  AddProxyPoolEntriesRequest,
+  RemoveProxyPoolEntriesRequest,
+  AccountLogAccountSearchResponse,
+  CredentialLogQuery,
+  CredentialLogsResponse,
 } from '@/types/api'
-
 // 创建 axios 实例
 const api = axios.create({
   baseURL: '/api/admin',
@@ -63,6 +79,77 @@ export async function setCredentialPriority(
   return data
 }
 
+// 绑定、清除或设置单个账号的代理。相同代理可绑定多个账号。
+export async function setCredentialProxy(
+  id: number,
+  req: SetCredentialProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/proxy`, req)
+  return data
+}
+
+// 将同一代理批量绑定给多个账号。
+export async function batchSetCredentialProxy(
+  req: BatchSetCredentialProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/batch-proxy', req)
+  return data
+}
+
+// 批量更新凭据备注和/或优先级。
+export async function batchUpdateCredentials(
+  req: BatchUpdateCredentialsRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/batch-update', req)
+  return data
+}
+
+// 测试账号实际会使用的代理出口 IP。
+export async function testCredentialProxy(id: number): Promise<CredentialProxyTestResponse> {
+  const { data } = await api.post<CredentialProxyTestResponse>(`/credentials/${id}/proxy/test`)
+  return data
+}
+
+// 获取代理池容量与占用健康状态。
+export async function getProxyPool(): Promise<ProxyPoolResponse> {
+  const { data } = await api.get<ProxyPoolResponse>('/proxy-pool')
+  return data
+}
+
+// 独立测试代理池条目，不依赖账号探测。
+export async function testProxyPoolEntry(proxyUrl: string): Promise<ProxyPoolTestResponse> {
+  const { data } = await api.post<ProxyPoolTestResponse>('/proxy-pool/test', { proxyUrl })
+  return data
+}
+
+export async function manualBindProxy(
+  req: ManualProxyBindRequest
+): Promise<ManualProxyOperationResponse> {
+  const { data } = await api.post<ManualProxyOperationResponse>('/proxy-pool/bind', req)
+  return data
+}
+
+export async function manualUnbindProxy(
+  req: ManualProxyUnbindRequest
+): Promise<ManualProxyOperationResponse> {
+  const { data } = await api.post<ManualProxyOperationResponse>('/proxy-pool/unbind', req)
+  return data
+}
+
+export async function addProxyPoolEntries(
+  req: AddProxyPoolEntriesRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/proxy-pool', req)
+  return data
+}
+
+export async function removeProxyPoolEntries(
+  req: RemoveProxyPoolEntriesRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>('/proxy-pool', { data: req })
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
@@ -82,6 +169,18 @@ export async function forceRefreshToken(
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 批量查询凭据余额；服务端按账号隔离失败并返回状态。
+export async function batchGetCredentialBalance(
+  ids: number[],
+  forceRefresh = false
+): Promise<BatchBalanceResponse> {
+  const { data } = await api.post<BatchBalanceResponse>('/credentials/batch-balance', {
+    ids,
+    forceRefresh,
+  })
   return data
 }
 
@@ -156,6 +255,18 @@ export async function setArmorBreaking(enabled: boolean): Promise<{ enabled: boo
   return data
 }
 
+export async function getProPlusProxyGate(): Promise<ProPlusProxyGateResponse> {
+  const { data } = await api.get<ProPlusProxyGateResponse>('/config/pro-plus-proxy-gate')
+  return data
+}
+
+export async function setProPlusProxyGate(
+  req: SetProPlusProxyGateRequest
+): Promise<ProPlusProxyGateResponse> {
+  const { data } = await api.put<ProPlusProxyGateResponse>('/config/pro-plus-proxy-gate', req)
+  return data
+}
+
 // 获取 CC Test 透传配置
 export async function getMaxRelay(): Promise<MaxRelayResponse> {
   const { data } = await api.get<MaxRelayResponse>('/config/max-relay')
@@ -165,5 +276,26 @@ export async function getMaxRelay(): Promise<MaxRelayResponse> {
 // 设置 CC Test 透传配置
 export async function setMaxRelay(req: SetMaxRelayRequest): Promise<MaxRelayResponse> {
   const { data } = await api.put<MaxRelayResponse>('/config/max-relay', req)
+  return data
+}
+
+// 搜索日志中心的账号候选
+export async function searchLogAccounts(
+  query: string
+): Promise<AccountLogAccountSearchResponse> {
+  const { data } = await api.get<AccountLogAccountSearchResponse>('/logs/accounts', {
+    params: { query, limit: 20 },
+  })
+  return data
+}
+
+// 获取单个凭据的日志
+export async function getCredentialLogs(
+  id: number,
+  params: CredentialLogQuery = {}
+): Promise<CredentialLogsResponse> {
+  const { data } = await api.get<CredentialLogsResponse>(`/credentials/${id}/logs`, {
+    params: { ...params, limit: 100 },
+  })
   return data
 }

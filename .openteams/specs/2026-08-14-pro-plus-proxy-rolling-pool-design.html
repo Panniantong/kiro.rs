@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kiro PRO+ 代理滚动池设计</title>
+  <style>
+    :root { color-scheme: light; --ink:#172033; --muted:#667085; --line:#dfe5ee; --blue:#2457d6; --green:#087a55; --red:#b42318; --bg:#f5f7fb; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(980px,calc(100% - 32px)); margin:32px auto 64px; }
+    header, section { background:#fff; border:1px solid var(--line); border-radius:16px; padding:24px 28px; margin:16px 0; box-shadow:0 8px 24px rgba(23,32,51,.05); }
+    h1 { margin:0 0 8px; font-size:30px; letter-spacing:-.02em; }
+    h2 { margin:0 0 12px; font-size:20px; }
+    p { margin:8px 0; }
+    ul,ol { margin:8px 0; padding-left:22px; }
+    .meta { color:var(--muted); }
+    .rule { display:grid; grid-template-columns:160px 1fr; gap:10px 18px; padding:10px 0; border-bottom:1px solid var(--line); }
+    .rule:last-child { border-bottom:0; }
+    .label { font-weight:700; }
+    .good { color:var(--green); font-weight:700; }
+    .danger { color:var(--red); font-weight:700; }
+    code { background:#eef2f8; padding:2px 6px; border-radius:6px; }
+    .flow { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:16px 0; }
+    .node { padding:10px 13px; border-radius:10px; background:#eef3ff; border:1px solid #cdd9ff; font-weight:650; }
+    .arrow { color:var(--blue); font-weight:800; }
+    table { width:100%; border-collapse:collapse; }
+    th,td { text-align:left; vertical-align:top; padding:10px 12px; border-bottom:1px solid var(--line); }
+    th { background:#f8fafc; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Kiro PRO+ 代理滚动池</h1>
+    <p class="meta">设计日期：2026-08-14 · 目标实例：主站 Kiro RS 8992</p>
+    <p>让代理池容量成为 PRO+ 可启用账号的硬上限，并在账号额度耗尽时永久退役旧号、自动补入有额度的新号。</p>
+  </header>
+
+  <section>
+    <h2>一、业务规则</h2>
+    <div class="rule"><div class="label">容量上限</div><div><code>代理数 × 每代理账号数</code>。当前为 10 × 2 = 20。</div></div>
+    <div class="rule"><div class="label">账号多于容量</div><div>只启用容量范围内、已绑定代理且出口验真的 PRO+；其余账号禁用并进入等待队列。</div></div>
+    <div class="rule"><div class="label">账号少于容量</div><div>所有符合条件且有额度的 PRO+ 全部启用，未使用槽位保持空闲。</div></div>
+    <div class="rule"><div class="label">额度耗尽</div><div><span class="danger">永久退役</span>：禁用、清除账号代理、移出等待队列，不因额度重置重新启用。</div></div>
+    <div class="rule"><div class="label">人工禁用</div><div>保持现有语义：不自动释放代理、不自动重新启用，避免覆盖人工判断。</div></div>
+    <div class="rule"><div class="label">启用前置条件</div><div>必须同时满足：KIRO PRO+、有账号级代理、<code>usesCredentialProxy=true</code>、出口 IP 与绑定 IP 一致。</div></div>
+  </section>
+
+  <section>
+    <h2>二、滚动流程</h2>
+    <div class="flow">
+      <span class="node">请求或余额检查发现耗尽</span><span class="arrow">→</span>
+      <span class="node">永久禁用旧号</span><span class="arrow">→</span>
+      <span class="node">清除账号代理</span><span class="arrow">→</span>
+      <span class="node">触发补位</span><span class="arrow">→</span>
+      <span class="node">新号绑代理并验出口</span><span class="arrow">→</span>
+      <span class="node">验证成功后启用</span>
+    </div>
+    <p>额度耗尽事件来自两条真实路径：上游请求返回额度耗尽，以及管理端余额查询确认 <code>remaining=0</code>。两条路径进入同一个退役与补位流程，避免行为不一致。</p>
+  </section>
+
+  <section>
+    <h2>三、状态与触发</h2>
+    <table>
+      <thead><tr><th>状态</th><th>代理</th><th>是否可调度</th><th>后续行为</th></tr></thead>
+      <tbody>
+        <tr><td>Active</td><td>已绑定且验真</td><td class="good">是</td><td>正常消耗额度</td></tr>
+        <tr><td>PendingProxy</td><td>无</td><td>否</td><td>有空槽时自动补位</td></tr>
+        <tr><td>QuotaExceeded</td><td>无</td><td>否</td><td>永久退役，不重新排队</td></tr>
+        <tr><td>ManualDisabled</td><td>保持原状</td><td>否</td><td>只接受人工处理</td></tr>
+      </tbody>
+    </table>
+    <p>补位触发点：额度耗尽事件、增加代理池、服务启动。补位过程必须串行化，防止并发抢占最后一个槽位。</p>
+  </section>
+
+  <section>
+    <h2>四、失败处理</h2>
+    <ul>
+      <li>清代理或持久化失败：旧号继续保持禁用，不开始补位，并记录明确错误。</li>
+      <li>新号代理验证失败：新号保持禁用，绝不回退直连；代理绑定保留用于排查。</li>
+      <li>没有等待账号：槽位空置，不启用耗尽号凑数。</li>
+      <li>没有空槽：等待账号继续排队，不突破每 IP 上限。</li>
+      <li>进程重启：启动收口会回收历史 <code>QuotaExceeded</code> 账号的代理，再执行一次补位。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>五、验收标准</h2>
+    <ol>
+      <li>任一 PRO+ 耗尽后，旧号为禁用、无代理、且不在等待队列。</li>
+      <li>存在等待账号时，同一个代理槽位自动转给下一账号；出口验证成功后才启用。</li>
+      <li>任意时刻每个代理的绑定账号数不超过配置上限。</li>
+      <li>人工禁用账号不会被自动释放或启用。</li>
+      <li>当前生产历史收口后：9 个耗尽旧号释放代理，7 个等待新号完成补位，剩余 2 个空槽。</li>
+      <li>全量 Rust 测试、8995 真实轮换测试、8992 模型与管理接口、真实生成请求全部通过。</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>六、明确不做</h2>
+    <ul>
+      <li>不让耗尽账号在下个额度周期自动复活。</li>
+      <li>不改变 KIRO POWER 或非 PRO+ 账号的代理逻辑。</li>
+      <li>不自动处理人工禁用账号。</li>
+      <li>不新增复杂代理健康评分、优先级或定时全量扫号系统。</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

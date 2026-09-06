@@ -1,8 +1,10 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialProxy,
+  testCredentialProxy,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -12,14 +14,28 @@ import {
   setLoadBalancingMode,
   setCredentialRpm,
   batchSetCredentialRpm,
+  batchUpdateCredentials,
   getDefaultRpm,
   setDefaultRpm,
   getArmorBreaking,
   setArmorBreaking,
+  getProPlusProxyGate,
+  setProPlusProxyGate,
   getMaxRelay,
   setMaxRelay,
+  getProxyPool,
+  testProxyPoolEntry,
+  batchGetCredentialBalance,
+  searchLogAccounts,
+  getCredentialLogs,
 } from '@/api/credentials'
-import type { AddCredentialRequest, SetMaxRelayRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  SetCredentialProxyRequest,
+  SetMaxRelayRequest,
+  SetProPlusProxyGateRequest,
+  CredentialLogQuery,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -27,6 +43,31 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+export function useProxyPool() {
+  return useQuery({
+    queryKey: ['proxyPool'],
+    queryFn: getProxyPool,
+    refetchInterval: 30000,
+  })
+}
+
+export function useTestProxyPoolEntry() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (proxyUrl: string) => testProxyPoolEntry(proxyUrl),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxyPool'] })
+    },
+  })
+}
+
+export function useBatchCredentialBalance() {
+  return useMutation({
+    mutationFn: ({ ids, forceRefresh = false }: { ids: number[]; forceRefresh?: boolean }) =>
+      batchGetCredentialBalance(ids, forceRefresh),
   })
 }
 
@@ -61,6 +102,25 @@ export function useSetPriority() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
+  })
+}
+
+// 设置账号代理绑定
+export function useSetCredentialProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, req }: { id: number; req: SetCredentialProxyRequest }) =>
+      setCredentialProxy(id, req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 测试账号代理出口
+export function useTestCredentialProxy() {
+  return useMutation({
+    mutationFn: (id: number) => testCredentialProxy(id),
   })
 }
 
@@ -151,6 +211,17 @@ export function useBatchSetRpm() {
   })
 }
 
+// 批量更新凭据备注和/或优先级。
+export function useBatchUpdateCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: batchUpdateCredentials,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 // 查询全局默认 RPM
 export function useDefaultRpm() {
   return useQuery({
@@ -190,6 +261,24 @@ export function useSetArmorBreaking() {
   })
 }
 
+export function useProPlusProxyGate() {
+  return useQuery({
+    queryKey: ['proPlusProxyGate'],
+    queryFn: getProPlusProxyGate,
+  })
+}
+
+export function useSetProPlusProxyGate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetProPlusProxyGateRequest) => setProPlusProxyGate(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proPlusProxyGate'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 // 获取 CC Test 透传配置
 export function useMaxRelay() {
   return useQuery({
@@ -206,5 +295,36 @@ export function useSetMaxRelay() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['maxRelay'] })
     },
+  })
+}
+
+// 搜索日志中心账号
+export function useLogAccounts(query: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ['log-accounts', query],
+    queryFn: () => searchLogAccounts(query),
+    enabled: enabled && query.trim().length > 0,
+    retry: false,
+  })
+}
+
+// 查询单个账号日志，按时间倒序分页
+export function useCredentialLogs(
+  id: number | null,
+  filters: CredentialLogQuery,
+  enabled: boolean
+) {
+  return useInfiniteQuery({
+    queryKey: ['credential-logs', id, filters],
+    queryFn: ({ pageParam }) =>
+      getCredentialLogs(id!, {
+        ...filters,
+        ...(pageParam ? { before: pageParam } : {}),
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.hasMore ? lastPage.nextCursor ?? undefined : undefined,
+    enabled: enabled && id !== null,
+    retry: false,
   })
 }

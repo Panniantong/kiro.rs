@@ -8,9 +8,9 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, broadcast};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -315,14 +315,34 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    let refresh_result = if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
+    };
+    let credential_id = credentials.id.unwrap_or_default();
+    if refresh_result.is_ok() {
+        tracing::info!(
+            event_type = "token_refresh",
+            request_outcome = "success",
+            credential_id,
+            credential_id_present = credentials.id.is_some(),
+            "Token 刷新成功"
+        );
+    } else {
+        tracing::warn!(
+            event_type = "token_refresh",
+            request_outcome = "failure",
+            credential_id,
+            credential_id_present = credentials.id.is_some(),
+            "Token 刷新失败"
+        );
     }
+    refresh_result
+
 }
 
 /// 刷新 Social Token
@@ -331,7 +351,12 @@ async fn refresh_social_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 Social Token...");
+    tracing::info!(
+        event_type = "token_refresh",
+        credential_id = credentials.id.unwrap_or_default(),
+        credential_id_present = credentials.id.is_some(),
+        "正在刷新 Social Token..."
+    );
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
@@ -423,7 +448,12 @@ async fn refresh_idc_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 IdC Token...");
+    tracing::info!(
+        event_type = "token_refresh",
+        credential_id = credentials.id.unwrap_or_default(),
+        credential_id_present = credentials.id.is_some(),
+        "正在刷新 IdC Token..."
+    );
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let client_id = credentials
@@ -447,7 +477,6 @@ async fn refresh_idc_token(
         os_name, node_version
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -455,24 +484,41 @@ async fn refresh_idc_token(
         grant_type: "refresh_token".to_string(),
     };
 
-    let response = match client
-        .post(&refresh_url)
-        .header("content-type", "application/json")
-        .header("x-amz-user-agent", x_amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=4")
-        .header("Connection", "close")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            let error_message = err.to_string();
-            log_token_refresh_failure(credentials, "idc", None, &error_message, true);
-            return Err(err.into());
+    // OIDC 偶发 stale connection / DNS 状态会让 reqwest 在 send 阶段失败。
+    // 仅网络错误重试一次，并重建 Client；HTTP 4xx/5xx 不在这里重试。
+    let response = {
+        let mut attempt = 1;
+        loop {
+            let client = build_client(proxy, 60, config.tls_backend)?;
+            match client
+                .post(&refresh_url)
+                .header("content-type", "application/json")
+                .header("x-amz-user-agent", x_amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", format!("oidc.{}.amazonaws.com", region))
+                .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+                .header("amz-sdk-request", format!("attempt={}; max=2", attempt))
+                .header("Connection", "close")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(response) => break response,
+                Err(err) if attempt < 2 => {
+                    tracing::warn!(
+                        attempt,
+                        error = %err,
+                        "IdC Token 刷新网络错误，重建 Client 后重试"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                Err(err) => {
+                    let error_message = err.to_string();
+                    log_token_refresh_failure(credentials, "idc", None, &error_message, true);
+                    return Err(err.into());
+                }
+            }
         }
     };
 
@@ -505,7 +551,7 @@ async fn refresh_idc_token(
     let data: IdcRefreshResponse = response.json().await?;
 
     let mut new_credentials = credentials.clone();
-    new_credentials.access_token = Some(data.access_token);
+    new_credentials.access_token = Some(data.access_token.clone());
 
     if let Some(new_refresh_token) = data.refresh_token {
         new_credentials.refresh_token = Some(new_refresh_token);
@@ -521,7 +567,56 @@ async fn refresh_idc_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
+    // 上游已把 profileArn 改成必填；IdC 账号缺 profileArn 时用占位符会被拒 403。
+    // refresh 后若仍无 profileArn，探测真实 profile 并存下。探测失败不阻塞刷新。
+    if new_credentials.profile_arn.is_none() {
+        if let Some(arn) =
+            list_available_profiles(&new_credentials, config, &data.access_token, proxy).await
+        {
+            new_credentials.profile_arn = Some(arn);
+        }
+    }
+
     Ok(new_credentials)
+}
+
+/// 列出 IdC 账号可用的 profile（上游把 profileArn 当必填后，IdC 必须用真实 profile，
+/// 不能用 Builder ID 占位符）。仅 IdC/Enterprise 有意义；Builder ID / 社交返回 None。
+async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> Option<String> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = format!("https://{}/ListAvailableProfiles", host);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let ua = format!(
+        "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+        config.kiro_version, machine_id
+    );
+    let client = build_client(proxy, 60, config.tls_backend).ok()?;
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", &ua)
+        .header("x-amz-user-agent", &ua)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .body("{}")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = response.json().await.ok()?;
+    data.get("profiles")?
+        .as_array()?
+        .iter()
+        .find_map(|p| p.get("arn").and_then(|a| a.as_str()).map(String::from))
 }
 
 /// 获取使用额度信息
@@ -531,7 +626,12 @@ pub(crate) async fn get_usage_limits(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
-    tracing::debug!("正在获取使用额度信息...");
+    tracing::debug!(
+        event_type = "balance",
+        credential_id = credentials.id.unwrap_or_default(),
+        credential_id_present = credentials.id.is_some(),
+        "正在获取使用额度信息..."
+    );
 
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
@@ -547,17 +647,23 @@ pub(crate) async fn get_usage_limits(
         host
     );
 
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    // profileArn 必填：上游已把它当准入条件，不带会 403。
+    // 账号没存就按登录方式补占位符；API Key 账号不注入（上游口径不同）。
+    if let Some(effective_arn) = crate::kiro::model::credentials::effective_profile_arn(credentials)
+    {
+        url.push_str(&format!(
+            "&profileArn={}",
+            urlencoding::encode(&effective_arn)
+        ));
     }
 
     // 构建 User-Agent headers
+    // 上游对客户端版本号设了准入门槛：aws-sdk-js 必须 ≥ 1.0.34，KiroIDE ≥ 0.12.155。
     let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.34 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
     );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -594,6 +700,14 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// 对尚未导入的凭据完成官方额度查询后的结果。
+///
+/// OAuth 刷新可能轮换 refreshToken；把刷新后的凭据一并返回，调用方必须用它继续导入。
+pub(crate) struct CandidateUsageLimits {
+    pub credentials: KiroCredentials,
+    pub usage_limits: UsageLimitsResponse,
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -614,6 +728,10 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// 临时冷却截止时间。429 只设置冷却不禁用；TooManyFailures 到期后自动恢复。
     cooldown_until: Option<DateTime<Utc>>,
+    /// 连续 429 计数（自适应冷却阶梯用；API 成功或长时间无 429 后复位）
+    rate_limit_strikes: u32,
+    /// 最近一次 429 时间（用于陈旧复位与阶梯定位）
+    last_rate_limit_at: Option<DateTime<Utc>>,
     /// API 调用成功次数
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -651,11 +769,13 @@ enum SelectOutcome {
 
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
+pub enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
     /// 连续失败达到阈值后自动禁用
     TooManyFailures,
+    /// 上游明确返回账号安全封停，禁止自动恢复
+    UpstreamSuspended,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -664,6 +784,32 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+}
+impl DisabledReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "Manual",
+            DisabledReason::TooManyFailures => "TooManyFailures",
+            DisabledReason::UpstreamSuspended => "UpstreamSuspended",
+            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+            DisabledReason::QuotaExceeded => "QuotaExceeded",
+            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+            DisabledReason::InvalidConfig => "InvalidConfig",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<DisabledReason> {
+        match value {
+            "Manual" => Some(DisabledReason::Manual),
+            "TooManyFailures" => Some(DisabledReason::TooManyFailures),
+            "UpstreamSuspended" => Some(DisabledReason::UpstreamSuspended),
+            "TooManyRefreshFailures" => Some(DisabledReason::TooManyRefreshFailures),
+            "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
+            "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
+            "InvalidConfig" => Some(DisabledReason::InvalidConfig),
+            _ => None,
+        }
+    }
 }
 
 /// 统计数据持久化条目
@@ -706,6 +852,9 @@ pub struct CredentialEntrySnapshot {
     /// 导入备注（用于前端显示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_note: Option<String>,
+    /// 已同步的官方订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -720,6 +869,9 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 当前禁用生命周期的开始时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -731,6 +883,8 @@ pub struct CredentialEntrySnapshot {
     pub rpm_follows_default: bool,
     /// 当前滑动窗口上游尝试数（瞬时上游尝试 RPM）
     pub current_rpm: u32,
+    /// 当前尚未完成的上游请求数
+    pub in_flight_requests: u32,
     /// 近 1h 峰值上游尝试 RPM
     pub peak_rpm_1h: u32,
     /// 近 1h 因 RPM 受限被跳过次数
@@ -781,6 +935,15 @@ pub struct MultiTokenManager {
     armor_breaking: Mutex<bool>,
     /// 超额放行全局开关（运行时可修改，默认 true = 开启）
     overage_passthrough: Mutex<bool>,
+    /// PRO+ 账号级代理门禁（运行时可修改，默认开启）
+    require_pro_plus_credential_proxy: Mutex<bool>,
+    /// 自动代理池中单个代理允许绑定的最大账号数（运行时可修改，默认 2）
+    max_accounts_per_proxy: Mutex<usize>,
+    /// 额度耗尽事件。AdminService 订阅后负责释放 PRO+ 代理并触发等待账号补位。
+    quota_exhausted_tx: broadcast::Sender<u64>,
+    /// 稳定禁用事件。手动禁用、刷新连续失败、refreshToken 永久失效等终态
+    /// 由 AdminService 释放 PRO+ 代理；五分钟自动恢复的 TooManyFailures 不发送。
+    stable_disabled_tx: broadcast::Sender<u64>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -793,10 +956,13 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// TooManyFailures 自动恢复冷却时间。
 const TOO_MANY_FAILURES_COOLDOWN: StdDuration = StdDuration::from_secs(300);
-/// 429 默认冷却时间。上游 Retry-After 会覆盖该默认值。
-const RATE_LIMIT_DEFAULT_COOLDOWN: StdDuration = StdDuration::from_secs(30);
+/// 429 自适应冷却阶梯默认值：首次不冷却（多数 429 是秒级窗口，重试一下就好），
+/// 连续 429 逐级升冷却。可被 config.rate_limit_cooldown_secs 覆盖。
+const DEFAULT_RATE_LIMIT_LADDER: [u64; 4] = [0, 5, 10, 30];
 /// 429 冷却上限，避免异常 Retry-After 把凭据挂起过久。
 const RATE_LIMIT_MAX_COOLDOWN: StdDuration = StdDuration::from_secs(600);
+/// 距上次 429 超过该时长后，连续计数复位（陈旧不累计）。
+const RATE_LIMIT_STRIKE_RESET: StdDuration = StdDuration::from_secs(120);
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// RPM 滑动窗口长度（60 秒）
@@ -863,12 +1029,20 @@ impl MultiTokenManager {
                     failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
+                    // 优先使用文件里持久化的禁用原因；缺失时才派生为 Manual
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        Some(
+                            cred.disabled_reason
+                                .as_deref()
+                                .and_then(DisabledReason::from_str)
+                                .unwrap_or(DisabledReason::Manual),
+                        )
                     } else {
                         None
                     },
                     cooldown_until: None,
+                    rate_limit_strikes: 0,
+                    last_rate_limit_at: None,
                     success_count: 0,
                     last_used_at: None,
                     success_window: VecDeque::new(),
@@ -890,9 +1064,13 @@ impl MultiTokenManager {
                     .unwrap_or(false)
             {
                 tracing::warn!(
+                    credential_id = entry.id,
                     "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
                     entry.id
                 );
+                if !entry.disabled {
+                    entry.credentials.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+                }
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::InvalidConfig);
             }
@@ -922,7 +1100,11 @@ impl MultiTokenManager {
         let default_rpm_init = config.default_rpm;
         let armor_breaking = config.armor_breaking;
         let overage_passthrough = config.overage_passthrough;
+        let require_pro_plus_credential_proxy = config.require_pro_plus_credential_proxy;
+        let max_accounts_per_proxy = config.max_accounts_per_proxy;
         let max_relay = config.max_relay.clone();
+        let (quota_exhausted_tx, _) = broadcast::channel(256);
+        let (stable_disabled_tx, _) = broadcast::channel(256);
         let manager = Self {
             config,
             proxy,
@@ -935,6 +1117,10 @@ impl MultiTokenManager {
             default_rpm: Mutex::new(default_rpm_init),
             armor_breaking: Mutex::new(armor_breaking),
             overage_passthrough: Mutex::new(overage_passthrough),
+            require_pro_plus_credential_proxy: Mutex::new(require_pro_plus_credential_proxy),
+            max_accounts_per_proxy: Mutex::new(max_accounts_per_proxy),
+            quota_exhausted_tx,
+            stable_disabled_tx,
             max_relay: Mutex::new(max_relay),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -963,6 +1149,16 @@ impl MultiTokenManager {
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()
+    }
+
+    /// 订阅额度耗尽事件。接收方只负责代理滚动，不参与凭据禁用判定。
+    pub fn subscribe_quota_exhausted(&self) -> broadcast::Receiver<u64> {
+        self.quota_exhausted_tx.subscribe()
+    }
+
+    /// 订阅稳定禁用事件。接收方只处理代理释放与补位，不改变禁用原因。
+    pub fn subscribe_stable_disabled(&self) -> broadcast::Receiver<u64> {
+        self.stable_disabled_tx.subscribe()
     }
 
     /// 获取可用凭据数量
@@ -1009,11 +1205,16 @@ impl MultiTokenManager {
 
             entry.cooldown_until = None;
             if entry.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                entry.credentials.disabled_at = None;
                 entry.disabled = false;
                 entry.disabled_reason = None;
                 entry.failure_count = 0;
                 recovered += 1;
-                tracing::info!("凭据 #{} TooManyFailures 冷却结束，已自动恢复", entry.id);
+                tracing::info!(
+                    credential_id = entry.id,
+                    "凭据 #{} TooManyFailures 冷却结束，已自动恢复",
+                    entry.id
+                );
             }
         }
         recovered
@@ -1221,11 +1422,17 @@ impl MultiTokenManager {
         let mode = self.load_balancing_mode.lock().clone();
         let chosen = match mode.as_str() {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据，平局按优先级
-                eligible
-                    .iter()
-                    .copied()
-                    .min_by_key(|&i| (entries[i].success_count, entries[i].credentials.priority))
+                // 实时负载优先：先摊开尚未完成的请求，再平衡当前 RPM 和长期成功数。
+                // credential id 作为最终稳定排序键，避免完全相同状态下的非确定选择。
+                eligible.iter().copied().min_by_key(|&i| {
+                    (
+                        entries[i].in_flight_requests,
+                        entries[i].success_window.len(),
+                        entries[i].success_count,
+                        entries[i].credentials.priority,
+                        entries[i].id,
+                    )
+                })
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
@@ -1320,6 +1527,7 @@ impl MultiTokenManager {
                             );
                             for e in entries.iter_mut() {
                                 if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                    e.credentials.disabled_at = None;
                                     e.disabled = false;
                                     e.disabled_reason = None;
                                     e.failure_count = 0;
@@ -1363,6 +1571,17 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // IdC/刷新接口的 400 通常表示共享请求链路或参数问题，
+                    // 不能把它当成账号永久失效累计，否则同一故障会批量禁用有余额账号。
+                    let error_text = e.to_string();
+                    if error_text.contains("400 Bad Request") {
+                        log_token_acquire_failure(id, &e, false);
+                        tracing::warn!(
+                            credential_id = id,
+                            "Token 刷新返回 400，保留凭据启用状态，不累计自动禁用失败计数"
+                        );
+                        return Err(e);
+                    }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         log_token_acquire_failure(id, &e, true);
@@ -1530,8 +1749,9 @@ impl MultiTokenManager {
                 .map(|e| {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
+                    // 同步 disabled 状态与禁用原因到凭据对象（重启后原因不丢失）
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_str().to_string());
                     cred
                 })
                 .collect()
@@ -1663,6 +1883,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.cooldown_until = None;
+                entry.rate_limit_strikes = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(now.to_rfc3339());
                 Self::record_success_slot(entry, now);
@@ -1762,6 +1983,9 @@ impl MultiTokenManager {
             );
 
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                if !entry.disabled {
+                    entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
+                }
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 let cooldown_until = Utc::now() + Self::chrono_duration(TOO_MANY_FAILURES_COOLDOWN);
@@ -1798,16 +2022,145 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告上游明确的账号安全封停。
+    ///
+    /// 这是确定性终态，不进入 TooManyFailures 的五分钟自动恢复；同时发送稳定禁用
+    /// 事件，让 AdminService 释放账号占用的自动代理池资源并触发补位。
+    pub fn report_upstream_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => return entries.iter().any(|entry| !entry.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+
+            Self::release_in_flight_slot(entry);
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::UpstreamSuspended);
+            entry.cooldown_until = None;
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            let import_note = entry.credentials.import_note.clone().unwrap_or_default();
+
+            tracing::error!(
+                credential_id = id,
+                import_note = %import_note,
+                "凭据 #{} 已被 Kiro 上游安全封停，已永久禁用",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .min_by_key(|entry| entry.credentials.priority)
+            {
+                *current_id = next.id;
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("安全封停禁用凭据后持久化失败（不影响本次切换）: {}", error);
+        }
+        let _ = self.stable_disabled_tx.send(id);
+        result
+    }
+
     /// 报告指定凭据触发上游 429 限流。
     ///
-    /// 429 是瞬态容量信号，不应永久禁用凭据；仅设置运行时冷却并让调度器
-    /// 优先选择其他凭据。冷却到期后凭据自动回到可选池。
-    pub fn report_rate_limited(&self, id: u64, cooldown: Option<StdDuration>) -> bool {
-        self.report_transient_cooldown(
-            id,
-            cooldown.unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN),
-            "上游 429",
-        )
+    /// 429 是瞬态容量信号，不应永久禁用凭据。采用自适应冷却阶梯：
+    /// 首次 429 只计数不冷却（多数 429 是秒级窗口，重试一下就好）；
+    /// 连续 429 逐级升冷却（默认 0/5/10/30s，可用 config.rate_limit_cooldown_secs 覆盖），
+    /// 避免风暴期反复撞墙。成功一次或 120s 无 429 后连续计数复位。
+    /// 上游显式 Retry-After 始终优先于阶梯。
+    pub fn report_rate_limited(&self, id: u64, retry_after: Option<StdDuration>) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let now = Utc::now();
+            Self::recover_due_cooldowns(&mut entries, now);
+
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                Self::release_in_flight_slot(entry);
+                if !entry.disabled {
+                    // 陈旧复位：距上次 429 超过阈值，连续计数重新从第一级开始
+                    let stale = entry
+                        .last_rate_limit_at
+                        .map(|t| now - t > Self::chrono_duration(RATE_LIMIT_STRIKE_RESET))
+                        .unwrap_or(true);
+                    if stale {
+                        entry.rate_limit_strikes = 0;
+                    }
+                    entry.rate_limit_strikes += 1;
+                    entry.last_rate_limit_at = Some(now);
+                    entry.last_used_at = Some(now.to_rfc3339());
+
+                    // 上游显式 Retry-After 优先；否则按连续次数走自适应阶梯
+                    let ladder_secs: &[u64] = self
+                        .config
+                        .rate_limit_cooldown_secs
+                        .as_deref()
+                        .unwrap_or(&DEFAULT_RATE_LIMIT_LADDER);
+                    let cooldown = match retry_after {
+                        Some(d) => d.min(RATE_LIMIT_MAX_COOLDOWN),
+                        None => {
+                            let idx = (entry.rate_limit_strikes as usize)
+                                .saturating_sub(1)
+                                .min(ladder_secs.len().saturating_sub(1));
+                            ladder_secs
+                                .get(idx)
+                                .copied()
+                                .map(StdDuration::from_secs)
+                                .unwrap_or(StdDuration::from_secs(30))
+                        }
+                    };
+
+                    let import_note = entry.credentials.import_note.clone().unwrap_or_default();
+                    if cooldown.is_zero() {
+                        tracing::warn!(
+                            credential_id = id,
+                            import_note = %import_note,
+                            rate_limit_strikes = entry.rate_limit_strikes,
+                            "凭据 #{} 触发上游 429（连续第 {} 次），不冷却直接重选",
+                            id,
+                            entry.rate_limit_strikes
+                        );
+                    } else {
+                        let cooldown_until = now + Self::chrono_duration(cooldown);
+                        entry.cooldown_until = Some(match entry.cooldown_until {
+                            Some(existing) if existing > cooldown_until => existing,
+                            _ => cooldown_until,
+                        });
+                        tracing::warn!(
+                            credential_id = id,
+                            import_note = %import_note,
+                            rate_limit_strikes = entry.rate_limit_strikes,
+                            cooldown_secs = cooldown.as_secs(),
+                            "凭据 #{} 触发上游 429（连续第 {} 次），冷却 {}s 至 {}",
+                            id,
+                            entry.rate_limit_strikes,
+                            cooldown.as_secs(),
+                            entry.cooldown_until.unwrap().to_rfc3339()
+                        );
+                    }
+                }
+            }
+
+            entries
+                .iter()
+                .any(|e| !e.disabled && !Self::is_cooling_down(e, now))
+        };
+        self.save_stats_debounced();
+        result
     }
 
     /// 报告指定凭据额度已用尽
@@ -1831,6 +2184,7 @@ impl MultiTokenManager {
             }
 
             Self::release_in_flight_slot(entry);
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.cooldown_until = None;
@@ -1869,6 +2223,7 @@ impl MultiTokenManager {
         if let Err(e) = self.persist_credentials() {
             tracing::warn!("额度用尽禁用凭据后持久化失败（不影响本次切换）: {}", e);
         }
+        let _ = self.quota_exhausted_tx.send(id);
         result
     }
 
@@ -1909,6 +2264,7 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
             entry.cooldown_until = None;
@@ -1939,6 +2295,13 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        if self.entries.lock().iter().any(|entry| {
+            entry.id == id
+                && entry.disabled
+                && entry.disabled_reason == Some(DisabledReason::TooManyRefreshFailures)
+        }) {
+            let _ = self.stable_disabled_tx.send(id);
+        }
         result
     }
 
@@ -1961,6 +2324,7 @@ impl MultiTokenManager {
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.credentials.disabled_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
             entry.cooldown_until = None;
@@ -1991,6 +2355,13 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        if self.entries.lock().iter().any(|entry| {
+            entry.id == id
+                && entry.disabled
+                && entry.disabled_reason == Some(DisabledReason::InvalidRefreshToken)
+        }) {
+            let _ = self.stable_disabled_tx.send(id);
+        }
         result
     }
 
@@ -2081,6 +2452,7 @@ impl MultiTokenManager {
                     },
                     email: e.credentials.email.clone(),
                     import_note: e.credentials.import_note.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -2090,6 +2462,7 @@ impl MultiTokenManager {
                         match r {
                             DisabledReason::Manual => "Manual",
                             DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::UpstreamSuspended => "UpstreamSuspended",
                             DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
@@ -2097,11 +2470,13 @@ impl MultiTokenManager {
                         }
                         .to_string()
                     }),
+                    disabled_at: e.credentials.disabled_at.clone(),
                     endpoint: e.credentials.endpoint.clone(),
                     rpm: e.credentials.rpm,
                     effective_rpm,
                     rpm_follows_default,
                     current_rpm,
+                    in_flight_requests: e.in_flight_requests,
                     peak_rpm_1h,
                     throttled_1h,
                     overage_status: e.credentials.overage_status.clone(),
@@ -2120,12 +2495,67 @@ impl MultiTokenManager {
 
     /// 设置凭据禁用状态（Admin API）
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
+        self.set_disabled_inner(id, disabled, true)
+    }
+
+    /// AdminService 内部用于“禁用后继续等待代理”的过渡状态，不发送稳定禁用事件。
+    pub(crate) fn set_disabled_without_release_event(
+        &self,
+        id: u64,
+        disabled: bool,
+    ) -> anyhow::Result<()> {
+        self.set_disabled_inner(id, disabled, false)
+    }
+    /// 代理待验证过渡：新进入等待队列的启用账号按 Manual 禁用，
+    /// 已有禁用原因的账号保持原原因，避免代理故障覆盖账号故障。
+    pub(crate) fn set_disabled_for_proxy_pending(&self, id: u64) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if !entry.disabled {
+                entry.credentials.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::Manual);
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+    /// 仅更新凭据的禁用原因（不改变禁用状态），并持久化。
+    /// 用于给历史禁用账号补记具体原因（额度用尽 / Token 失效 / 手动禁用）。
+    pub fn set_disabled_reason(&self, id: u64, reason: DisabledReason) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.disabled_reason = Some(reason);
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    fn set_disabled_inner(
+        &self,
+        id: u64,
+        disabled: bool,
+        notify_stable_disabled: bool,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if disabled && !entry.disabled {
+                entry.credentials.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+            } else if !disabled {
+                entry.credentials.disabled_at = None;
+            }
             entry.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
@@ -2138,6 +2568,9 @@ impl MultiTokenManager {
         }
         // 持久化更改
         self.persist_credentials()?;
+        if disabled && notify_stable_disabled {
+            let _ = self.stable_disabled_tx.send(id);
+        }
         Ok(())
     }
 
@@ -2161,6 +2594,126 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量更新凭据备注和/或优先级；先校验全部 ID，再一次性持久化。
+    pub fn batch_update_credentials(
+        &self,
+        ids: &[u64],
+        import_note: Option<String>,
+        priority: Option<u32>,
+    ) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            bail!("至少需要一个凭据 ID");
+        }
+        if import_note.is_none() && priority.is_none() {
+            bail!("备注和优先级至少需要提供一项");
+        }
+
+        let target_ids: HashSet<u64> = ids.iter().copied().collect();
+        {
+            let mut entries = self.entries.lock();
+            let existing_ids: HashSet<u64> = entries
+                .iter()
+                .filter(|entry| target_ids.contains(&entry.id))
+                .map(|entry| entry.id)
+                .collect();
+            if existing_ids.len() != target_ids.len() {
+                let mut missing: Vec<u64> = target_ids.difference(&existing_ids).copied().collect();
+                missing.sort_unstable();
+                bail!("凭据不存在: {:?}", missing);
+            }
+
+            for entry in entries
+                .iter_mut()
+                .filter(|entry| target_ids.contains(&entry.id))
+            {
+                if let Some(note) = &import_note {
+                    entry.credentials.import_note = Some(note.clone());
+                }
+                if let Some(value) = priority {
+                    entry.credentials.priority = value;
+                }
+            }
+        }
+
+        if priority.is_some() {
+            self.select_highest_priority();
+        }
+        self.persist_credentials()?;
+        Ok(target_ids.len())
+    }
+
+    /// 设置凭据级代理绑定（Admin API）。
+    ///
+    /// 同一代理可以绑定给多个凭据；这用于一个住宅 IP 挂多个账号、额度耗尽后继续
+    /// 使用相同出口 IP 的场景。`None` 表示清除凭据级绑定并回退到全局代理。
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_url = proxy_url;
+            entry.credentials.proxy_username = proxy_username;
+            entry.credentials.proxy_password = proxy_password;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 批量设置凭据级代理绑定（Admin API）。
+    ///
+    /// 所有目标凭据必须存在，避免只成功绑定一部分账号。
+    pub fn set_credentials_proxy_batch(
+        &self,
+        ids: &[u64],
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            anyhow::bail!("至少需要一个凭据 ID");
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            for &id in ids {
+                if !entries.iter().any(|entry| entry.id == id) {
+                    anyhow::bail!("凭据不存在: {}", id);
+                }
+            }
+            for entry in entries.iter_mut().filter(|entry| ids.contains(&entry.id)) {
+                entry.credentials.proxy_url = proxy_url.clone();
+                entry.credentials.proxy_username = proxy_username.clone();
+                entry.credentials.proxy_password = proxy_password.clone();
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 返回指定凭据与其有效代理配置，供管理端测试出口连通性。
+    pub fn credential_and_effective_proxy(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(KiroCredentials, Option<ProxyConfig>)> {
+        let credentials = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.credentials.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        Ok((credentials, effective_proxy))
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -2169,6 +2722,7 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.disabled_at = None;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
@@ -2255,9 +2809,74 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = match get_usage_limits(
+            &credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await
+        {
+            Ok(usage_limits) => usage_limits,
+            Err(proxy_error) if effective_proxy.is_some() => {
+                tracing::warn!(
+                    "凭据 #{} 通过代理获取额度失败，尝试直连: {}",
+                    id,
+                    proxy_error
+                );
+                get_usage_limits(&credentials, &self.config, &token, None).await?
+            }
+            Err(error) => return Err(error),
+        };
 
+        self.store_usage_metadata(id, &usage_limits);
+
+        Ok(usage_limits)
+    }
+
+    /// 使用尚未导入的凭据查询官方使用额度。
+    ///
+    /// 自动代理池在把代理写入凭据前调用此方法，避免不符合订阅条件的账号占用住宅 IP。
+    pub(crate) async fn get_usage_limits_for_candidate(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<CandidateUsageLimits> {
+        let refreshed_credentials = if credentials.is_api_key_credential() {
+            credentials.clone()
+        } else {
+            let _refresh_guard = self.refresh_lock.lock().await;
+            let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+            refresh_token(credentials, &self.config, effective_proxy.as_ref()).await?
+        };
+        let token = if refreshed_credentials.is_api_key_credential() {
+            refreshed_credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else {
+            refreshed_credentials
+                .access_token
+                .as_deref()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+        };
+
+        let effective_proxy = refreshed_credentials.effective_proxy(self.proxy.as_ref());
+        let usage_limits = get_usage_limits(
+            &refreshed_credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await?;
+        Ok(CandidateUsageLimits {
+            credentials: refreshed_credentials,
+            usage_limits,
+        })
+    }
+
+    /// 将已经拿到的官方额度查询结果持久化到凭据元数据。
+    pub fn store_usage_metadata(&self, id: u64, usage_limits: &UsageLimitsResponse) {
         // 更新订阅等级 / 超额状态到凭据（仅在发生变化时持久化）
         {
             let new_title = usage_limits.subscription_title();
@@ -2311,8 +2930,6 @@ impl MultiTokenManager {
                 }
             }
         }
-
-        Ok(usage_limits)
     }
 
     /// 添加新凭据（Admin API）
@@ -2329,6 +2946,29 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        self.add_credential_inner(new_cred, None).await
+    }
+
+    /// 将已完成候选额度校验的凭据直接入库，避免重复刷新同一个 IdC refreshToken。
+    pub(crate) async fn add_credential_with_validated_token(
+        &self,
+        new_cred: KiroCredentials,
+        validated_cred: KiroCredentials,
+    ) -> anyhow::Result<u64> {
+        self.add_credential_inner(new_cred, Some(validated_cred))
+            .await
+    }
+
+    async fn add_credential_inner(
+        &self,
+        new_cred: KiroCredentials,
+        prevalidated_cred: Option<KiroCredentials>,
+    ) -> anyhow::Result<u64> {
+        // AdminService 会让需要完成前置校验的凭据以 disabled=true 入池。
+        // Token 刷新返回的新对象不能覆盖这个调度状态，否则账号会在代理验真前短暂可用，
+        // 池满时甚至会一直保持启用。
+        let initial_disabled = new_cred.disabled;
+
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -2386,11 +3026,13 @@ impl MultiTokenManager {
                 anyhow::bail!("凭据已存在（refreshToken 重复）");
             }
         }
-
         // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
+        let mut validated_cred = if let Some(prevalidated_cred) = prevalidated_cred {
+            prevalidated_cred
+        } else if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
+            let _refresh_guard = self.refresh_lock.lock().await;
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
@@ -2423,6 +3065,12 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        if initial_disabled {
+            validated_cred.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+        } else {
+            validated_cred.disabled_at = None;
+        }
+        validated_cred.disabled = initial_disabled;
         let import_note_for_log = validated_cred.import_note.clone().unwrap_or_default();
 
         {
@@ -2432,9 +3080,11 @@ impl MultiTokenManager {
                 credentials: validated_cred,
                 failure_count: 0,
                 refresh_failure_count: 0,
-                disabled: false,
+                disabled: initial_disabled,
                 disabled_reason: None,
                 cooldown_until: None,
+                rate_limit_strikes: 0,
+                last_rate_limit_at: None,
                 success_count: 0,
                 last_used_at: None,
                 success_window: VecDeque::new(),
@@ -2775,6 +3425,73 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 获取 PRO+ 账号级代理门禁开关。
+    pub fn get_require_pro_plus_credential_proxy(&self) -> bool {
+        *self.require_pro_plus_credential_proxy.lock()
+    }
+
+    /// 获取单个代理允许绑定的最大账号数。
+    pub fn get_max_accounts_per_proxy(&self) -> usize {
+        *self.max_accounts_per_proxy.lock()
+    }
+
+    fn persist_pro_plus_proxy_gate(
+        &self,
+        enabled: bool,
+        max_accounts_per_proxy: usize,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，PRO+ 代理门禁仅在当前进程生效: enabled={} max_accounts_per_proxy={}",
+                    enabled,
+                    max_accounts_per_proxy
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.require_pro_plus_credential_proxy = enabled;
+        config.max_accounts_per_proxy = max_accounts_per_proxy;
+        config
+            .save()
+            .with_context(|| format!("持久化 PRO+ 代理门禁失败: {}", config_path.display()))
+    }
+
+    /// 热更新并持久化 PRO+ 代理门禁配置，持久化失败时回滚运行态。
+    pub fn set_pro_plus_proxy_gate(
+        &self,
+        enabled: bool,
+        max_accounts_per_proxy: usize,
+    ) -> anyhow::Result<()> {
+        if max_accounts_per_proxy == 0 {
+            anyhow::bail!("每个代理账号数必须大于 0");
+        }
+
+        let previous_enabled = self.get_require_pro_plus_credential_proxy();
+        let previous_max = self.get_max_accounts_per_proxy();
+        *self.require_pro_plus_credential_proxy.lock() = enabled;
+        *self.max_accounts_per_proxy.lock() = max_accounts_per_proxy;
+
+        if let Err(error) = self.persist_pro_plus_proxy_gate(enabled, max_accounts_per_proxy) {
+            *self.require_pro_plus_credential_proxy.lock() = previous_enabled;
+            *self.max_accounts_per_proxy.lock() = previous_max;
+            return Err(error);
+        }
+
+        tracing::info!(
+            "PRO+ 代理门禁已更新: enabled={} max_accounts_per_proxy={}",
+            enabled,
+            max_accounts_per_proxy
+        );
+        Ok(())
+    }
+
     /// 判断指定凭据当前是否应启用「超额放行」行为
     ///
     /// 仅当全局开关开启、且该凭据 AWS 侧 `overage_status == "ENABLED"`（忽略大小写）
@@ -2864,6 +3581,8 @@ mod tests {
             disabled: false,
             disabled_reason: None,
             cooldown_until: None,
+            rate_limit_strikes: 0,
+            last_rate_limit_at: None,
             success_count: 0,
             last_used_at: None,
             success_window: VecDeque::new(),
@@ -3187,6 +3906,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_credential_waits_for_refresh_lock() {
+        let config = Config::default();
+        let manager =
+            std::sync::Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+        let refresh_guard = manager.refresh_lock.lock().await;
+
+        let mut credential = KiroCredentials::default();
+        credential.auth_method = Some("idc".to_string());
+        credential.refresh_token = Some("r".repeat(150));
+        let task = {
+            let manager = std::sync::Arc::clone(&manager);
+            tokio::spawn(async move { manager.add_credential(credential).await })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "新增 OAuth 凭据应等待正在执行的 Token 刷新"
+        );
+
+        drop(refresh_guard);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("IdC 刷新需要 clientId"));
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_with_validated_token_skips_refresh() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.auth_method = Some("idc".to_string());
+        new_cred.refresh_token = Some("r".repeat(150));
+        let mut validated_cred = new_cred.clone();
+        validated_cred.access_token = Some("access-token-from-candidate".to_string());
+
+        let id = manager
+            .add_credential_with_validated_token(new_cred, validated_cred)
+            .await
+            .unwrap();
+
+        assert_eq!(id, 1);
+        let entries = manager.entries.lock();
+        assert_eq!(
+            entries[0].credentials.access_token.as_deref(),
+            Some("access-token-from-candidate")
+        );
+    }
+
+    #[tokio::test]
     async fn test_add_credential_reject_duplicate_refresh_token() {
         let config = Config::default();
 
@@ -3224,6 +3993,23 @@ mod tests {
             snapshot.entries[0].import_note.as_deref(),
             Some("Batch 001 - test 1P")
         );
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_preserves_initial_disabled_state() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut credential = KiroCredentials::default();
+        credential.kiro_api_key = Some("ksk_test_disabled_import".to_string());
+        credential.auth_method = Some("api_key".to_string());
+        credential.disabled = true;
+
+        manager.add_credential(credential).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(manager.available_count(), 0);
     }
 
     #[tokio::test]
@@ -3414,6 +4200,28 @@ mod tests {
     }
 
     #[test]
+    fn test_upstream_security_suspension_is_stable_disabled_event() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut events = manager.subscribe_stable_disabled();
+
+        assert!(manager.report_upstream_suspended(1));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.disabled_reason.as_deref(), Some("UpstreamSuspended"));
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(events.try_recv().unwrap(), 1);
+    }
+
+    #[test]
     fn test_multi_token_manager_report_success() {
         let config = Config::default();
         let cred = KiroCredentials::default();
@@ -3474,6 +4282,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_balanced_acquire_spreads_concurrent_requests_across_idle_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = ["t1", "t2", "t3"]
+            .into_iter()
+            .map(|token| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(token.to_string());
+                credential.expires_at = Some(expires_at.clone());
+                credential
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None).await.unwrap();
+        let third = manager.acquire_context(None).await.unwrap();
+
+        let mut selected = vec![first.id, second.id, third.id];
+        selected.sort_unstable();
+        assert_eq!(selected, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_acquire_keeps_large_concurrent_batch_evenly_distributed() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = (1..=10)
+            .map(|id| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(format!("t{id}"));
+                credential.expires_at = Some(expires_at.clone());
+                credential
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        let mut selected_counts = [0_u32; 10];
+
+        for _ in 0..100 {
+            let context = manager.acquire_context(None).await.unwrap();
+            selected_counts[(context.id - 1) as usize] += 1;
+        }
+
+        assert_eq!(selected_counts.iter().min(), Some(&10));
+        assert_eq!(selected_counts.iter().max(), Some(&10));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_exposes_in_flight_requests_until_attempt_finishes() {
+        let mut credential = KiroCredentials::default();
+        credential.access_token = Some("token".to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        let context = manager.acquire_context(None).await.unwrap();
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 1);
+
+        manager.report_success(context.id);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+    }
+
+    #[tokio::test]
     async fn test_multi_token_manager_rate_limited_credential_is_temporarily_skipped() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
@@ -3504,6 +4382,159 @@ mod tests {
         assert_eq!(manager.available_count(), 2);
     }
 
+    fn two_credential_manager(config: Config) -> MultiTokenManager {
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let credentials = ["t1", "t2"]
+            .into_iter()
+            .map(|token| {
+                let mut credential = KiroCredentials::default();
+                credential.access_token = Some(token.to_string());
+                credential.expires_at = Some(expires_at.clone());
+                credential
+            })
+            .collect();
+        MultiTokenManager::new(config, credentials, None, None, false).unwrap()
+    }
+
+    /// 阶梯第一级：首次 429 只记 strike、不冷却（多数 429 是秒级窗口，重试一下就好）
+    #[tokio::test]
+    async fn test_rate_limit_first_429_only_counts_strike_without_cooldown() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        assert!(manager.report_rate_limited(1, None));
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 1);
+            assert!(entry.cooldown_until.is_none());
+        }
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    /// 连续 429 逐级升冷却：5s → 10s → 30s 封顶
+    #[tokio::test]
+    async fn test_rate_limit_ladder_escalates_on_consecutive_429() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None); // strike 1 → 0s
+        manager.report_rate_limited(1, None); // strike 2 → 5s
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 2);
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(4) && remain <= Duration::seconds(5));
+        }
+        assert_eq!(manager.available_count(), 1);
+        manager.report_rate_limited(1, None); // strike 3 → 10s
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(9) && remain <= Duration::seconds(10));
+        }
+        manager.report_rate_limited(1, None); // strike 4 → 30s
+        manager.report_rate_limited(1, None); // strike 5 → 仍 30s 封顶
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 5);
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(29) && remain <= Duration::seconds(30));
+        }
+    }
+
+    /// 成功后连续计数复位，下次 429 回到第一级
+    #[tokio::test]
+    async fn test_rate_limit_strikes_reset_on_success() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None);
+        manager.report_rate_limited(1, None); // strike 2 → 5s 冷却
+        manager.report_success(1);
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.rate_limit_strikes, 0);
+            assert!(entry.cooldown_until.is_none());
+        }
+
+        manager.report_rate_limited(1, None);
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.rate_limit_strikes, 1);
+        assert!(entry.cooldown_until.is_none());
+    }
+
+    /// 距上次 429 超过 120s 视为陈旧，连续计数重新从第一级开始
+    #[tokio::test]
+    async fn test_rate_limit_stale_strikes_reset_after_quiet_period() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None);
+        manager.report_rate_limited(1, None); // strike 2
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.last_rate_limit_at = Some(Utc::now() - Duration::seconds(200));
+            entry.cooldown_until = Some(Utc::now() - Duration::seconds(1)); // 冷却已过期
+        }
+
+        manager.report_rate_limited(1, None);
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.rate_limit_strikes, 1);
+        assert!(entry.cooldown_until.is_none());
+    }
+
+    /// 上游显式 Retry-After 优先于阶梯，首次 429 也直接冷却
+    #[tokio::test]
+    async fn test_rate_limit_retry_after_header_overrides_ladder() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, Some(StdDuration::from_secs(45)));
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(entry.rate_limit_strikes, 1);
+        let remain = entry.cooldown_until.unwrap() - Utc::now();
+        assert!(remain > Duration::seconds(44) && remain <= Duration::seconds(45));
+    }
+
+    /// config.rate_limit_cooldown_secs 可覆盖默认阶梯，末级封顶
+    #[tokio::test]
+    async fn test_rate_limit_custom_ladder_from_config() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.rate_limit_cooldown_secs = Some(vec![1, 2]);
+        let manager = two_credential_manager(config);
+
+        manager.report_rate_limited(1, None); // strike 1 → 1s
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::milliseconds(500) && remain <= Duration::seconds(1));
+        }
+        manager.report_rate_limited(1, None); // strike 2 → 2s
+        manager.report_rate_limited(1, None); // strike 3 → 仍 2s（末级封顶）
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            let remain = entry.cooldown_until.unwrap() - Utc::now();
+            assert!(remain > Duration::seconds(1) && remain <= Duration::seconds(2));
+        }
+    }
+
     #[test]
     fn test_multi_token_manager_manual_disabled_is_not_recovered_by_cooldown() {
         let config = Config::default();
@@ -3525,6 +4556,49 @@ mod tests {
         let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(first.disabled);
         assert_eq!(first.disabled_reason.as_deref(), Some("Manual"));
+        assert!(first.disabled_at.is_some());
+
+        manager.set_disabled(1, false).unwrap();
+        let recovered = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == 1)
+            .unwrap();
+        assert!(!recovered.disabled);
+        assert!(recovered.disabled_at.is_none());
+    }
+    #[test]
+    fn test_proxy_pending_preserves_existing_disabled_reason() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_disabled(1, true).unwrap();
+        manager
+            .set_disabled_reason(1, DisabledReason::QuotaExceeded)
+            .unwrap();
+        let disabled_at = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap()
+            .disabled_at;
+
+        manager.set_disabled_for_proxy_pending(1).unwrap();
+        let preserved = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap();
+        assert_eq!(preserved.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(preserved.disabled_at, disabled_at);
     }
 
     #[test]
@@ -3692,6 +4766,20 @@ mod tests {
     }
 
     #[test]
+    fn test_report_quota_exhausted_emits_rotation_event() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let mut events = manager.subscribe_quota_exhausted();
+
+        manager.report_quota_exhausted(1);
+
+        assert_eq!(events.try_recv().unwrap(), 1);
+    }
+
+    #[test]
     fn test_multi_token_manager_report_quota_exhausted_persists_disabled_state() {
         let credentials_path =
             std::env::temp_dir().join(format!("kiro-quota-persist-{}.json", uuid::Uuid::new_v4()));
@@ -3724,6 +4812,85 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
         assert!(persisted.iter().find(|c| c.id == Some(1)).unwrap().disabled);
         assert!(!persisted.iter().find(|c| c.id == Some(2)).unwrap().disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_shared_proxy_pair_fails_over_to_the_second_credential() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-shared-proxy-pair-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let proxy_url = "http://residential.example:8080".to_string();
+
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.priority = 0;
+        first.machine_id = Some("machine-1".to_string());
+        first.proxy_url = Some(proxy_url.clone());
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.priority = 1;
+        second.machine_id = Some("machine-2".to_string());
+        second.proxy_url = Some(proxy_url.clone());
+
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![first.clone(), second.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.report_quota_exhausted(1));
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.current_id, 2);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .disabled
+        );
+        assert!(
+            !snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == 2)
+                .unwrap()
+                .disabled
+        );
+
+        let (_, effective_proxy) = manager.credential_and_effective_proxy(2).unwrap();
+        assert_eq!(effective_proxy, Some(ProxyConfig::new(proxy_url)));
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert!(
+            persisted
+                .iter()
+                .find(|credential| credential.id == Some(1))
+                .unwrap()
+                .disabled
+        );
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|credential| credential.id == Some(2))
+                .unwrap()
+                .proxy_url
+                .as_deref(),
+            Some("http://residential.example:8080")
+        );
 
         std::fs::remove_file(&credentials_path).unwrap();
     }
@@ -3841,6 +5008,72 @@ mod tests {
     }
 
     // ============ 凭据级 Region 优先级测试 ============
+
+    #[test]
+    fn test_batch_update_credentials_persists_and_is_atomic() {
+        let path =
+            std::env::temp_dir().join(format!("kiro-batch-update-{}.json", uuid::Uuid::new_v4()));
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.import_note = Some("old-a".to_string());
+        first.priority = 9;
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.import_note = Some("old-b".to_string());
+        second.priority = 8;
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&vec![first.clone(), second.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![first, second],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .batch_update_credentials(&[1, 2], Some("same-group".to_string()), Some(3))
+                .unwrap(),
+            2
+        );
+        let snapshot = manager.snapshot();
+        for entry in &snapshot.entries {
+            assert_eq!(entry.import_note.as_deref(), Some("same-group"));
+            assert_eq!(entry.priority, 3);
+        }
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.iter().all(|credential| {
+            credential.import_note.as_deref() == Some("same-group") && credential.priority == 3
+        }));
+
+        // 任一 ID 不存在时整批失败，已有账号不应被部分更新。
+        assert!(
+            manager
+                .batch_update_credentials(&[1, 999], Some("must-not-apply".to_string()), None)
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .import_note
+                .as_deref(),
+            Some("same-group")
+        );
+        assert!(manager.batch_update_credentials(&[1], None, None).is_err());
+
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn test_credential_region_priority_uses_credential_auth_region() {

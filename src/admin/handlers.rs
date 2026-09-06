@@ -2,16 +2,21 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchSetRpmRequest, SetArmorBreakingRequest, SetDefaultRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
-        SetOveragePassthroughRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
+        AccountLogSearchQuery, AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
+        BatchBalanceRequest, BatchCredentialIdsRequest, BatchSetCredentialProxyRequest,
+        BatchSetRpmRequest, BatchUpdateCredentialsRequest, CredentialLogQuery, ManualProxyBindRequest,
+        ManualProxyUnbindRequest, ProxyPoolTestRequest, RecoverQuotaRetiredRequest,
+        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
+        SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+        SetOveragePassthroughRequest, SetPriorityRequest, SetProPlusProxyGateRequest,
+        SetRpmRequest, SuccessResponse,
     },
 };
 
@@ -22,6 +27,31 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/logs/accounts
+/// 搜索日志中心的单账号候选。
+pub async fn search_log_accounts(
+    State(state): State<AdminState>,
+    Query(query): Query<AccountLogSearchQuery>,
+) -> impl IntoResponse {
+    match state.service.search_log_accounts(query) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/logs
+/// 查询单个凭据的结构化日志。
+pub async fn get_credential_logs(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(query): Query<CredentialLogQuery>,
+) -> impl IntoResponse {
+    match state.service.get_credential_logs(id, query).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/disabled
 /// 设置凭据禁用状态
 pub async fn set_credential_disabled(
@@ -29,7 +59,16 @@ pub async fn set_credential_disabled(
     Path(id): Path<u64>,
     Json(payload): Json<SetDisabledRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_disabled(id, payload.disabled) {
+    if !payload.disabled {
+        if let Err(error) = state.service.ensure_proxy_verified_before_enable(id).await {
+            return (error.status_code(), Json(error.into_response())).into_response();
+        }
+    }
+    match state
+        .service
+        .set_disabled_and_reconcile(id, payload.disabled)
+        .await
+    {
         Ok(_) => {
             let action = if payload.disabled { "禁用" } else { "启用" };
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()
@@ -55,18 +94,211 @@ pub async fn set_credential_priority(
     }
 }
 
+/// POST /api/admin/credentials/:id/proxy
+/// 绑定、清除或显式直连单个账号的代理。
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_credential_proxy_guarded(id, payload)
+        .await
+    {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理绑定已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-proxy
+/// 将同一代理批量绑定给多个账号（允许同一住宅 IP 挂多个账号）。
+pub async fn batch_set_credential_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_credentials_proxy_batch_guarded(payload)
+        .await
+    {
+        Ok(count) => Json(SuccessResponse::new(format!(
+            "已更新 {} 个凭据的代理绑定",
+            count
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/assign-proxy-from-pool
+/// 为现有未绑定账号按订阅资格与动态单 IP 容量领取代理池出口。
+pub async fn assign_credential_proxy_from_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<AssignCredentialProxyFromPoolRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .assign_credentials_proxy_from_pool(payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxy-pool
+/// 返回自动分配代理池及每个代理的动态容量占用；不回显代理认证信息。
+pub async fn get_proxy_pool(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_pool())
+}
+
+/// POST /api/admin/proxy-pool/bind
+/// 从指定代理池条目手动绑定账号，并验证出口。
+pub async fn manual_bind_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<ManualProxyBindRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .manual_bind_proxy(payload.proxy_url, payload.credential_ids)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/unbind
+/// 手动解除账号的代理池占用。
+pub async fn manual_unbind_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<ManualProxyUnbindRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .manual_unbind_proxy(payload.credential_ids)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool
+/// 追加住宅代理到自动分配池。后续新账号未显式传 proxyUrl 时会自动领取。
+pub async fn add_proxy_pool_entries(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddProxyPoolEntriesRequest>,
+) -> impl IntoResponse {
+    match state.service.add_proxy_pool_entries(payload) {
+        Ok(total) => match state.service.reconcile_pending_pro_plus().await {
+            Ok((enabled, pending)) => Json(SuccessResponse::new(format!(
+                "代理池已保存，共 {} 个代理；自动启用 {} 个待代理 PRO+，仍等待 {} 个",
+                total, enabled, pending
+            )))
+            .into_response(),
+            Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+        },
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxy-pool
+/// 从自动分配池移除代理；不影响已绑定账号。
+pub async fn remove_proxy_pool_entries(
+    State(state): State<AdminState>,
+    Json(payload): Json<RemoveProxyPoolEntriesRequest>,
+) -> impl IntoResponse {
+    match state.service.remove_proxy_pool_entries(payload) {
+        Ok(removed) => Json(SuccessResponse::new(format!(
+            "已从代理池移除 {} 个代理，现有账号绑定未修改",
+            removed
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/test
+/// 独立测试代理池条目，不依赖账号凭据。
+pub async fn test_proxy_pool_entry(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyPoolTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_proxy_pool_entry(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/proxy/test
+/// 测试账号实际使用的代理出口 IP，不会刷新 Token 或调用 Kiro 上游。
+pub async fn test_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.test_credential_proxy(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-proxy/test
+/// 逐个测试多个账号的有效代理出口。单个失败不会阻断其他账号的测试。
+pub async fn batch_test_credential_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchCredentialIdsRequest>,
+) -> impl IntoResponse {
+    let mut results = Vec::with_capacity(payload.ids.len());
+    for id in payload.ids {
+        match state.service.test_credential_proxy(id).await {
+            Ok(response) => results
+                .push(serde_json::json!({ "credentialId": id, "ok": true, "result": response })),
+            Err(error) => results.push(
+                serde_json::json!({ "credentialId": id, "ok": false, "error": error.to_string() }),
+            ),
+        }
+    }
+    Json(serde_json::json!({ "results": results })).into_response()
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
+    if let Err(error) = state.service.ensure_proxy_verified_before_enable(id).await {
+        return (error.status_code(), Json(error.into_response())).into_response();
+    }
     match state.service.reset_and_enable(id) {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 失败计数已重置并重新启用",
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+/// POST /api/admin/credentials/batch-balance
+/// 逐个查询凭据余额，单个失败不会阻断其他账号。
+pub async fn batch_balance(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchBalanceRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_balance(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn recover_quota_retired(
+    State(state): State<AdminState>,
+    Json(payload): Json<RecoverQuotaRetiredRequest>,
+) -> impl IntoResponse {
+    match state.service.recover_quota_retired(payload).await {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -171,6 +403,22 @@ pub async fn batch_set_credential_rpm(
     }
 }
 
+/// POST /api/admin/credentials/batch-update
+/// 批量更新凭据备注和/或优先级。
+pub async fn batch_update_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchUpdateCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_update_credentials(
+        &payload.ids,
+        payload.import_note,
+        payload.priority,
+    ) {
+        Ok(count) => Json(SuccessResponse::new(format!("已更新 {} 个凭据", count))).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/default-rpm
 /// 获取全局默认 RPM
 pub async fn get_default_rpm(State(state): State<AdminState>) -> impl IntoResponse {
@@ -224,6 +472,31 @@ pub async fn set_overage_passthrough(
     match state.service.set_overage_passthrough(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/pro-plus-proxy-gate
+/// 获取 PRO+ 账号级代理门禁配置。
+pub async fn get_pro_plus_proxy_gate(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_pro_plus_proxy_gate())
+}
+
+/// PUT /api/admin/config/pro-plus-proxy-gate
+/// 更新 PRO+ 账号级代理门禁与单代理账号数。
+pub async fn set_pro_plus_proxy_gate(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetProPlusProxyGateRequest>,
+) -> impl IntoResponse {
+    match state.service.set_pro_plus_proxy_gate(payload) {
+        Ok(response) => {
+            if response.enabled {
+                if let Err(error) = state.service.reconcile_pending_pro_plus().await {
+                    return (error.status_code(), Json(error.into_response())).into_response();
+                }
+            }
+            Json(response).into_response()
+        }
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

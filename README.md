@@ -459,11 +459,100 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
+  - `POST /api/admin/credentials/:id/proxy` - 绑定、清除或显式直连账号代理
+  - `POST /api/admin/credentials/batch-proxy` - 将同一代理批量绑定给多个账号（允许一 IP 两号）
+  - `GET|POST|DELETE /api/admin/proxy-pool` - 维护两号一 IP 的自动分配代理池
+  - `POST /api/admin/credentials/:id/proxy/test` - 测试该账号实际出口 IP
+  - `POST /api/admin/credentials/batch-proxy/test` - 批量测试账号出口 IP
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+
+### 账号组共用住宅 IP API
+
+一个住宅 IP 可按同一 `proxyUrl` 绑定给两个账号。账号 A 收到额度耗尽后会被持久化禁用，调度会选择账号 B；B 仍读取同一 `proxyUrl`，因此继续从相同 IP 出站。
+
+所有接口均需现有的 `x-api-key: <adminApiKey>`。密码只在绑定请求中接收，不会在状态或测试响应中回显。
+
+```bash
+# 将同一住宅 IP 绑定到两个账号。完全成功才会写入，任一账号 ID 不存在则全部失败。
+curl -X POST http://HOST:8996/api/admin/credentials/batch-proxy \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{
+    "ids": [281, 282],
+    "proxyUrl": "http://residential.example:8080",
+    "proxyUsername": "buyer-user",
+    "proxyPassword": "buyer-password"
+  }'
+
+# 逐个验证这两个账号的实际出口 IP（不刷新 Token、不调用 Kiro）。
+curl -X POST http://HOST:8996/api/admin/credentials/batch-proxy/test \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"ids": [281, 282]}'
+
+# 更换 IP 时对同一组账号重发 batch-proxy；解绑时不带代理字段。
+curl -X POST http://HOST:8996/api/admin/credentials/batch-proxy \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"ids": [281, 282]}'
+
+# 单号强制直连（即使全局配置有代理）。
+curl -X POST http://HOST:8996/api/admin/credentials/281/proxy \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"proxyUrl":"direct"}'
+
+### 代理池自动分配
+
+将购买到的代理加入池后，后续 `POST /api/admin/credentials` 导入账号只要不传
+`proxyUrl`，服务会先用该账号向 Kiro 官方 `getUsageLimits` 查询
+`subscriptionInfo.subscriptionTitle`。只有标题精确为 `KIRO POWER`（忽略大小写和首尾空格）
+的账号才会按入池顺序给每个 IP 连续分配两个账号，然后才轮到下一个 IP；不使用邮箱、
+总额度、试用额度或 bonus 作为判定条件。其他账号照常导入，但不占代理槽位。
+代理池保存为与 `credentials.json` 同目录的 `kiro_proxy_pool.json`，重启后保持有效。
+禁用账号也占用已分配槽位，避免重新启用时单个 IP 意外超过两个账号。符合 `KIRO POWER`
+但池满时导入会失败，不会创建未绑定代理的新账号；不符合资格或查询失败的账号不会自动绑定。
+显式传入 `proxyUrl` 或 `assignProxyFromPool: false` 可覆盖自动分配。
+
+```bash
+# 追加代理池。GET 接口只返回脱敏 URL 和账号占用，不返回认证信息。
+curl -X POST http://HOST:8996/api/admin/proxy-pool \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"proxies":[
+    {"proxyUrl":"http://residential-one.example:443","proxyUsername":"buyer","proxyPassword":"password"},
+    {"proxyUrl":"http://residential-two.example:443","proxyUsername":"buyer","proxyPassword":"password"}
+  ]}'
+
+# 查看总槽位、每个代理已分配的账号 ID 和剩余槽位。
+curl http://HOST:8996/api/admin/proxy-pool -H 'x-api-key: ADMIN_API_KEY'
+
+# 新号会先按官方 subscriptionTitle 判定；KIRO POWER 才领取池中第一个未满两号的代理。
+# 响应会返回 proxyPoolEligibility 和脱敏 assignedProxyUrl。
+curl -X POST http://HOST:8996/api/admin/credentials \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"authMethod":"api_key","kiroApiKey":"ksk_xxx","email":"new-account@example.com"}'
+
+# 从后续自动分配中移除代理，不改变已绑定账号。
+curl -X DELETE http://HOST:8996/api/admin/proxy-pool \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"proxyUrls":["http://residential-one.example:443"]}'
+```
+
+# 如果要在基础额度耗尽时立刻禁用账号 A、切换到账号 B，关闭已有的 overage 放行。
+# 否则 overageStatus=ENABLED 的账号会继续使用超额额度，不会立即让出给下一账号。
+curl -X PUT http://HOST:8996/api/admin/config/overage-passthrough \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"enabled":false}'
+
+# 按顺序接管而不是两号并发分摊时，使用 priority 调度，并让 A 的优先级小于 B。
+curl -X PUT http://HOST:8996/api/admin/config/load-balancing \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' \
+  -d '{"mode":"priority"}'
+curl -X POST http://HOST:8996/api/admin/credentials/281/priority \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' -d '{"priority":0}'
+curl -X POST http://HOST:8996/api/admin/credentials/282/priority \
+  -H 'x-api-key: ADMIN_API_KEY' -H 'content-type: application/json' -d '{"priority":1}'
+```
 
 ## 注意事项
 

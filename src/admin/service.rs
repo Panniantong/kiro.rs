@@ -3,28 +3,73 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use parking_lot::Mutex;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use crate::account_logs::{AccountLogEvent, AccountLogFilters, AccountLogStore};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, ArmorBreakingResponse, BalanceResponse,
-    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    MaxRelayResponse, OveragePassthroughResponse, SetArmorBreakingRequest,
-    SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
+    AccountLogAccount, AccountLogAccountsResponse, AccountLogSearchQuery, AddCredentialRequest,
+    AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
+    AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse,
+    BalanceProbeResult, BalanceProbeSummary, BalanceResponse, BatchBalanceRequest,
+    BatchBalanceResponse, BatchSetCredentialProxyRequest, CredentialLogQuery,
+    CredentialLogsResponse, CredentialProxyTestResponse, CredentialStatusItem,
+    CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
+    ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
+    ProPlusProxyGateResponse, ProxyAssignedCredentialStatus, ProxyPoolAssignmentSkip,
+    ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, ProxyPoolTestRequest,
+    ProxyPoolTestResponse, ProxyProbeSummary, RecoverQuotaRetiredRequest,
+    RecoverQuotaRetiredResponse, RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
+    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
+    SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+/// PRO+ / PRO MAX 账号剩余额度低于 50 时退出代理池。
+const PRO_PLUS_MIN_REMAINING: f64 = 50.0;
+/// 每分钟检查一次；余额缓存确保同一账号最多每 5 分钟访问一次上游额度接口。
+const PRO_PLUS_QUOTA_GUARD_INTERVAL_SECS: u64 = 60;
 /// 浮点余额接近 0 时视为额度耗尽
 const BALANCE_EXHAUSTED_EPSILON: f64 = 0.000001;
 
+fn validate_log_filter(
+    value: Option<&str>,
+    allowed: &[&str],
+    field: &str,
+) -> Result<(), AdminServiceError> {
+    if let Some(value) = value {
+        if !allowed.contains(&value) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "{} 参数无效",
+                field
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_log_time(value: Option<&str>, field: &str) -> Result<Option<i64>, AdminServiceError> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|date| date.timestamp_millis())
+                .map_err(|_| {
+                    AdminServiceError::InvalidCredential(format!("{} 必须是 RFC3339 时间", field))
+                })
+        })
+        .transpose()
+}
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -34,15 +79,53 @@ struct CachedBalance {
     data: BalanceResponse,
 }
 
+#[derive(Debug, Clone)]
+struct BalanceFailure {
+    checked_at: String,
+    error_class: String,
+}
+
+/// 代理池持久化格式。凭据本身继续保存最终代理绑定，避免引入运行时依赖。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ProxyPool {
+    #[serde(default)]
+    proxies: Vec<ProxyPoolEntry>,
+    /// 因代理容量或出口验证未通过而等待补绑的 PRO+ 凭据。
+    #[serde(default)]
+    pending_credential_ids: Vec<u64>,
+    /// 额度耗尽后永久退役的 PRO+。它们不再参与代理补位或额度重置复活。
+    #[serde(default)]
+    retired_quota_credential_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyPoolEntry {
+    proxy_url: String,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
+    #[serde(default)]
+    last_test: Option<ProxyProbeSummary>,
+}
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    balance_errors: Mutex<HashMap<u64, BalanceFailure>>,
     cache_path: Option<PathBuf>,
+    proxy_pool_path: Option<PathBuf>,
+    proxy_pool: Mutex<ProxyPool>,
+    /// 自动分配与写入凭据必须串行，防止并发导入突破单 IP 动态上限。
+    allocation_lock: tokio::sync::Mutex<()>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 账号级结构化日志存储；未配置缓存目录时为空。
+    account_log_store: Option<Arc<AccountLogStore>>,
+
 }
 
 impl AdminService {
@@ -53,14 +136,138 @@ impl AdminService {
         let cache_path = token_manager
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
+        let proxy_pool_path = token_manager
+            .cache_dir()
+            .map(|d| d.join("kiro_proxy_pool.json"));
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let proxy_pool = Self::load_proxy_pool_from(&proxy_pool_path);
 
-        Self {
+        let service = Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
+            balance_errors: Mutex::new(HashMap::new()),
             cache_path,
+            proxy_pool_path,
+            proxy_pool: Mutex::new(proxy_pool),
+            allocation_lock: tokio::sync::Mutex::new(()),
             known_endpoints: known_endpoints.into_iter().collect(),
+            account_log_store: None,
+        };
+        service.disable_unbound_kiro_pro_plus();
+        service
+    }
+
+    pub fn with_account_log_store(mut self, store: Option<Arc<AccountLogStore>>) -> Self {
+        self.account_log_store = store;
+        self
+    }
+
+    fn record_admin_log(
+        &self,
+        id: u64,
+        event_type: &str,
+        severity: &str,
+        outcome: &str,
+        message: impl Into<String>,
+    ) {
+        let Some(store) = &self.account_log_store else {
+            return;
+        };
+        if let Err(error) = store.record(AccountLogEvent::new(
+            id, event_type, severity, outcome, message,
+        )) {
+            tracing::warn!(target: "account_logs", error = %error, "账号日志入队失败");
+        }
+    }
+    fn balance_probe_summary(&self, id: u64) -> BalanceProbeSummary {
+        if let Some(failure) = self.balance_errors.lock().get(&id).cloned() {
+            return BalanceProbeSummary {
+                state: "failed".to_string(),
+                checked_at: Some(failure.checked_at),
+                source: Some("upstream".to_string()),
+                error_class: Some(failure.error_class),
+            };
+        }
+
+        let Some(cached) = self.balance_cache.lock().get(&id).cloned() else {
+            return BalanceProbeSummary {
+                state: "notChecked".to_string(),
+                checked_at: None,
+                source: None,
+                error_class: None,
+            };
+        };
+        let now = Utc::now().timestamp() as f64;
+        let checked_at = Utc
+            .timestamp_opt(cached.cached_at as i64, 0)
+            .single()
+            .map(|value| value.to_rfc3339());
+        BalanceProbeSummary {
+            state: if now - cached.cached_at < BALANCE_CACHE_TTL_SECS as f64 {
+                "fresh".to_string()
+            } else {
+                "stale".to_string()
+            },
+            checked_at,
+            source: Some("cache".to_string()),
+            error_class: None,
+        }
+    }
+
+    fn cache_balance(&self, balance: &BalanceResponse) {
+        self.balance_cache.lock().insert(
+            balance.id,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64,
+                data: balance.clone(),
+            },
+        );
+        self.balance_errors.lock().remove(&balance.id);
+        self.save_balance_cache();
+    }
+    fn recovery_metadata(disabled: bool, reason: Option<&str>) -> (String, Vec<String>) {
+        if !disabled {
+            return ("none".to_string(), Vec::new());
+        }
+        match reason.unwrap_or("Manual") {
+            "QuotaExceeded" => (
+                "never".to_string(),
+                vec!["quota_reset_observed".to_string()],
+            ),
+            "UpstreamSuspended" | "InvalidRefreshToken" => ("never".to_string(), Vec::new()),
+            "TooManyRefreshFailures" => (
+                "conditional".to_string(),
+                vec![
+                    "token_refresh_passed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            "TooManyFailures" => (
+                "conditional".to_string(),
+                vec![
+                    "proxy_egress_passed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            "InvalidConfig" => (
+                "conditional".to_string(),
+                vec![
+                    "config_fixed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            "Manual" => (
+                "manual".to_string(),
+                vec![
+                    "proxy_egress_passed".to_string(),
+                    "account_probe_passed".to_string(),
+                ],
+            ),
+            _ => (
+                "manual".to_string(),
+                vec!["account_probe_passed".to_string()],
+            ),
         }
     }
 
@@ -68,38 +275,72 @@ impl AdminService {
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let retired_quota_ids: HashSet<u64> = self
+            .proxy_pool
+            .lock()
+            .retired_quota_credential_ids
+            .iter()
+            .copied()
+            .collect();
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                import_note: entry.import_note,
-                success_count: entry.success_count,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
-                rpm: entry.rpm,
-                effective_rpm: entry.effective_rpm,
-                rpm_follows_default: entry.rpm_follows_default,
-                current_rpm: entry.current_rpm,
-                peak_rpm_1h: entry.peak_rpm_1h,
-                throttled_1h: entry.throttled_1h,
-                overage_status: entry.overage_status,
+            .map(|entry| {
+                let disabled_reason = if retired_quota_ids.contains(&entry.id) {
+                    Some("QuotaExceeded".to_string())
+                } else {
+                    entry.disabled_reason
+                };
+                let (recovery_class, recovery_checks) =
+                    Self::recovery_metadata(entry.disabled, disabled_reason.as_deref());
+                let balance_probe = self.balance_probe_summary(entry.id);
+                let cached_balance = self.balance_cache.lock().get(&entry.id).cloned();
+                CredentialStatusItem {
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    import_note: entry.import_note,
+                    subscription_title: entry.subscription_title,
+                    success_count: entry.success_count,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url.as_deref().map(Self::redact_proxy_url),
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason,
+                    disabled_at: entry.disabled_at,
+                    recovery_class,
+                    recovery_checks,
+                    balance_state: balance_probe.state,
+                    balance_checked_at: balance_probe.checked_at,
+                    balance_source: balance_probe.source,
+                    balance_remaining: cached_balance.as_ref().map(|cached| cached.data.remaining),
+                    balance_usage_limit: cached_balance
+                        .as_ref()
+                        .map(|cached| cached.data.usage_limit),
+                    balance_next_reset_at: cached_balance
+                        .as_ref()
+                        .and_then(|cached| cached.data.next_reset_at),
+                    balance_error_class: balance_probe.error_class,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    rpm: entry.rpm,
+                    effective_rpm: entry.effective_rpm,
+                    rpm_follows_default: entry.rpm_follows_default,
+                    current_rpm: entry.current_rpm,
+                    in_flight_requests: entry.in_flight_requests,
+                    peak_rpm_1h: entry.peak_rpm_1h,
+                    throttled_1h: entry.throttled_1h,
+                    overage_status: entry.overage_status,
+                }
             })
             .collect();
 
@@ -114,9 +355,132 @@ impl AdminService {
             credentials,
         }
     }
+    /// 搜索账号日志中心的单账号候选。
+    pub fn search_log_accounts(
+        &self,
+        query: AccountLogSearchQuery,
+    ) -> Result<AccountLogAccountsResponse, AdminServiceError> {
+        let needle = query.query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请输入账号 ID、邮箱或导入备注".to_string(),
+            ));
+        }
+        let limit = query.limit.unwrap_or(20).clamp(1, 20);
+        let accounts = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.id.to_string().contains(&needle)
+                    || entry
+                        .email
+                        .as_deref()
+                        .map(|value| value.to_ascii_lowercase().contains(&needle))
+                        .unwrap_or(false)
+                    || entry
+                        .import_note
+                        .as_deref()
+                        .map(|value| value.to_ascii_lowercase().contains(&needle))
+                        .unwrap_or(false)
+            })
+            .take(limit)
+            .map(|entry| AccountLogAccount {
+                id: entry.id,
+                email: entry.email,
+                import_note: entry.import_note,
+                disabled: entry.disabled,
+                disabled_reason: entry.disabled_reason,
+            })
+            .collect();
+        Ok(AccountLogAccountsResponse { accounts })
+    }
+
+    /// 查询单个账号的结构化日志。
+    pub async fn get_credential_logs(
+        &self,
+        id: u64,
+        query: CredentialLogQuery,
+    ) -> Result<CredentialLogsResponse, AdminServiceError> {
+        if !self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.id == id)
+        {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        let store = self
+            .account_log_store
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("账号日志存储未启用".to_string()))?;
+        validate_log_filter(
+            query.severity.as_deref(),
+            &["info", "warn", "error"],
+            "severity",
+        )?;
+        validate_log_filter(
+            query.event_type.as_deref(),
+            &[
+                "request",
+                "token_refresh",
+                "balance",
+                "credential_status",
+                "proxy",
+                "recovery_probe",
+            ],
+            "eventType",
+        )?;
+        validate_log_filter(
+            query.outcome.as_deref(),
+            &["success", "failure", "retry", "pending"],
+            "outcome",
+        )?;
+        let from_ms = parse_log_time(query.from.as_deref(), "from")?;
+        let to_ms = parse_log_time(query.to.as_deref(), "to")?;
+        if from_ms.zip(to_ms).is_some_and(|(from, to)| from > to) {
+            return Err(AdminServiceError::InvalidCredential(
+                "from 不能晚于 to".to_string(),
+            ));
+        }
+        let page = store
+            .query(
+                id,
+                AccountLogFilters {
+                    severity: query.severity,
+                    event_type: query.event_type,
+                    outcome: query.outcome,
+                    from_ms,
+                    to_ms,
+                    before: query.before,
+                    limit: query.limit.unwrap_or(100).clamp(1, 100),
+                },
+            )
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("无效的日志分页游标") {
+                    AdminServiceError::InvalidCredential(message)
+                } else {
+                    AdminServiceError::InternalError(message)
+                }
+            })?;
+        Ok(CredentialLogsResponse {
+            credential_id: id,
+            items: page.items,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        })
+    }
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
+        if !disabled {
+            self.ensure_can_enable(id)?;
+        }
+
         // 先获取当前凭据 ID，用于判断是否需要切换
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
@@ -129,6 +493,33 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            if disabled {
+                "管理员禁用凭据"
+            } else {
+                "管理员启用凭据"
+            },
+        );
+        Ok(())
+    }
+
+    /// 设置凭据禁用状态，并在 PRO+ 进入稳定禁用状态后释放代理、触发等待队列补位。
+    ///
+    /// 手动禁用是终态：账号不会重新进入等待队列。以后若要恢复，必须重新分配
+    /// 账号级代理并完成出口验证后再启用。
+    pub async fn set_disabled_and_reconcile(
+        &self,
+        id: u64,
+        disabled: bool,
+    ) -> Result<(), AdminServiceError> {
+        self.set_disabled(id, disabled)?;
+        if disabled && self.release_disabled_credential_proxy(id, true)? {
+            self.reconcile_pending_pro_plus().await?;
+        }
         Ok(())
     }
 
@@ -136,65 +527,1821 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            format!("管理员设置优先级为 {priority}"),
+        );
+        Ok(())
+    }
+
+    /// 绑定、清除或显式直连单个凭据的代理。
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        req: SetCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let (proxy_url, proxy_username, proxy_password) =
+            Self::validate_proxy_binding(req.proxy_url, req.proxy_username, req.proxy_password)?;
+        if let Some(url) = proxy_url.as_deref() {
+            self.ensure_proxy_binding_capacity(url, &[id])?;
+        }
+        self.token_manager
+            .set_credential_proxy(id, proxy_url, proxy_username, proxy_password)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// Admin HTTP 单绑入口：与自动分配共用同一把锁，防止并发突破容量。
+    pub async fn set_credential_proxy_guarded(
+        &self,
+        id: u64,
+        req: SetCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let _guard = self.allocation_lock.lock().await;
+        self.set_credential_proxy(id, req)
+    }
+
+    /// 把相同代理批量绑定给多个凭据。
+    ///
+    /// ponytail: 不引入代理池表。住宅 IP 直接保存在需要共用它的账号上；换 IP
+    /// 时调用同一个接口即可批量覆盖。若未来需要跨大量账号复用、过期和库存管理，再升级为独立代理资源。
+    pub fn set_credentials_proxy_batch(
+        &self,
+        req: BatchSetCredentialProxyRequest,
+    ) -> Result<usize, AdminServiceError> {
+        let (proxy_url, proxy_username, proxy_password) =
+            Self::validate_proxy_binding(req.proxy_url, req.proxy_username, req.proxy_password)?;
+        let ids = req.ids;
+        if let Some(url) = proxy_url.as_deref() {
+            self.ensure_proxy_binding_capacity(url, &ids)?;
+        }
+        self.token_manager
+            .set_credentials_proxy_batch(&ids, proxy_url, proxy_username, proxy_password)
+            .map(|_| ids.len())
+            .map_err(|e| {
+                let message = e.to_string();
+                match message
+                    .strip_prefix("凭据不存在: ")
+                    .and_then(|id| id.parse::<u64>().ok())
+                {
+                    Some(id) => AdminServiceError::NotFound { id },
+                    None => AdminServiceError::InvalidCredential(message),
+                }
+            })
+    }
+
+    /// Admin HTTP 批量绑定入口：与自动分配共用同一把锁，防止并发突破容量。
+    pub async fn set_credentials_proxy_batch_guarded(
+        &self,
+        req: BatchSetCredentialProxyRequest,
+    ) -> Result<usize, AdminServiceError> {
+        let _guard = self.allocation_lock.lock().await;
+        self.set_credentials_proxy_batch(req)
+    }
+
+    fn ensure_proxy_binding_capacity(
+        &self,
+        proxy_url: &str,
+        target_ids: &[u64],
+    ) -> Result<(), AdminServiceError> {
+        if !self.token_manager.get_require_pro_plus_credential_proxy()
+            || proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT)
+        {
+            return Ok(());
+        }
+
+        let snapshot = self.token_manager.snapshot();
+        let already_assigned: HashSet<u64> = snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.proxy_url.as_deref() == Some(proxy_url))
+            .map(|entry| entry.id)
+            .collect();
+        let new_ids: HashSet<u64> = target_ids
+            .iter()
+            .copied()
+            .filter(|id| !already_assigned.contains(id))
+            .collect();
+        let prospective = already_assigned.len() + new_ids.len();
+        let limit = self.token_manager.get_max_accounts_per_proxy();
+        if prospective > limit {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "该代理最多允许绑定 {} 个账号，绑定后将达到 {} 个",
+                limit, prospective
+            )));
+        }
+        Ok(())
+    }
+
+    /// 为已导入且未显式绑定代理的凭据补领自动代理池出口。
+    ///
+    /// ponytail: 沿用导入时的 subscriptionTitle 与单 IP 动态容量规则，认证信息只从服务端池文件
+    /// 读取，接口不接收、不返回代理密码。当前绑定的凭据一律跳过，避免覆盖人工配置。
+    pub async fn assign_credentials_proxy_from_pool(
+        &self,
+        req: AssignCredentialProxyFromPoolRequest,
+    ) -> Result<AssignCredentialProxyFromPoolResponse, AdminServiceError> {
+        if req.ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        if self.token_manager.get_require_pro_plus_credential_proxy() {
+            let ids = req.ids.clone();
+            for id in &ids {
+                let credentials = self
+                    .token_manager
+                    .credential_and_effective_proxy(*id)
+                    .map_err(|error| self.classify_error(error, *id))?
+                    .0;
+                if !credentials.proxy_url.is_some() {
+                    self.mark_proxy_pending(*id)?;
+                }
+            }
+            let _ = self.reconcile_pending_pro_plus().await?;
+            let snapshot = self.token_manager.snapshot();
+            let assigned_credential_ids = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    snapshot
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == *id && entry.has_proxy)
+                })
+                .collect::<Vec<_>>();
+            let assigned = assigned_credential_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let skipped = ids
+                .into_iter()
+                .filter(|id| !assigned.contains(id))
+                .map(|credential_id| ProxyPoolAssignmentSkip {
+                    credential_id,
+                    reason: "账号仍在待验证队列，未提交代理绑定".to_string(),
+                })
+                .collect();
+            return Ok(AssignCredentialProxyFromPoolResponse {
+                assigned_credential_ids,
+                skipped,
+            });
+        }
+
+        let mut assigned_credential_ids = Vec::new();
+        let mut skipped = Vec::new();
+        for id in req.ids {
+            let credentials = self
+                .token_manager
+                .credential_and_effective_proxy(id)
+                .map_err(|error| self.classify_error(error, id))?
+                .0;
+
+            if credentials.proxy_url.is_some() {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "凭据已有显式代理，未覆盖".to_string(),
+                });
+                continue;
+            }
+
+            let usage = self
+                .token_manager
+                .get_usage_limits_for(id)
+                .await
+                .map_err(|error| self.classify_balance_error(error, id))?;
+            let eligibility = Self::proxy_pool_eligibility(&usage);
+            if !eligibility.eligible {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: eligibility.reason,
+                });
+                continue;
+            }
+
+            // 分配与写入需要在同一临界区内，避免并发补绑突破单 IP 动态上限。
+            let _allocation_guard = self.allocation_lock.lock().await;
+            let still_unbound = self
+                .token_manager
+                .credential_and_effective_proxy(id)
+                .map_err(|error| self.classify_error(error, id))?
+                .0
+                .proxy_url
+                .is_none();
+            if !still_unbound {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "凭据在分配期间已绑定代理，未覆盖".to_string(),
+                });
+                continue;
+            }
+            let Some(proxy) = self.next_proxy_pool_entry()? else {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "代理池为空，未分配".to_string(),
+                });
+                continue;
+            };
+            self.token_manager
+                .set_credential_proxy(
+                    id,
+                    Some(proxy.proxy_url),
+                    proxy.proxy_username,
+                    proxy.proxy_password,
+                )
+                .map_err(|error| self.classify_error(error, id))?;
+            assigned_credential_ids.push(id);
+        }
+
+        Ok(AssignCredentialProxyFromPoolResponse {
+            assigned_credential_ids,
+            skipped,
+        })
+    }
+
+    /// 为代理不足或出口验证失败的所有账号自动补绑；只有代理与账号探针均通过才启用。
+    pub async fn reconcile_pending_pro_plus(&self) -> Result<(usize, usize), AdminServiceError> {
+        if !self.token_manager.get_require_pro_plus_credential_proxy() {
+            return Ok((0, self.pending_proxy_ids().len()));
+        }
+
+        let mut enabled_count = 0;
+        for id in self.pending_proxy_ids() {
+            let (credentials, _) = match self.token_manager.credential_and_effective_proxy(id) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.clear_proxy_pending(id)?;
+                    continue;
+                }
+            };
+
+            let (proxy, already_bound) = if Self::has_credential_proxy(&credentials) {
+                (
+                    ProxyPoolEntry {
+                        proxy_url: credentials.proxy_url.clone().unwrap_or_default(),
+                        proxy_username: credentials.proxy_username.clone(),
+                        proxy_password: credentials.proxy_password.clone(),
+                        last_test: None,
+                    },
+                    true,
+                )
+            } else {
+                let Some(proxy) = self.next_proxy_pool_entry()? else {
+                    break;
+                };
+                (proxy, false)
+            };
+
+            let proxy_test = if already_bound {
+                match self.test_credential_proxy(id).await {
+                    Ok(result) if Self::proxy_test_matches_expected_egress(&result) => true,
+                    Ok(_) | Err(_) => false,
+                }
+            } else {
+                self.test_proxy_pool_entry(ProxyPoolTestRequest {
+                    proxy_url: proxy.proxy_url.clone(),
+                })
+                .await?
+                .probe
+                .state
+                    == "passed"
+            };
+            if !proxy_test {
+                self.token_manager
+                    .set_disabled_for_proxy_pending(id)
+                    .map_err(|error| self.classify_error(error, id))?;
+                if already_bound {
+                    let _ = self.release_disabled_credential_proxy(id, false)?;
+                }
+                continue;
+            }
+
+            let balance = match self.probe_credential_with_proxy(id, &proxy).await {
+                Ok(balance) => balance,
+                Err(error) => {
+                    self.token_manager
+                        .set_disabled_for_proxy_pending(id)
+                        .map_err(|inner| self.classify_error(inner, id))?;
+                    if already_bound {
+                        let _ = self.release_disabled_credential_proxy(id, false)?;
+                    }
+                    tracing::warn!(
+                        credential_id = id,
+                        error_class = %Self::balance_error_class(&error),
+                        "代理通过但账号探针失败，继续等待恢复"
+                    );
+                    continue;
+                }
+            };
+            if Self::is_quota_exhausted_balance(&balance)
+                || !self.can_recover_after_probe(id, &balance)?
+            {
+                continue;
+            }
+
+            let commit_result = {
+                let _allocation_guard = self.allocation_lock.lock().await;
+                let current = self
+                    .token_manager
+                    .credential_and_effective_proxy(id)
+                    .map_err(|error| self.classify_error(error, id))?
+                    .0;
+                if !already_bound && Self::has_credential_proxy(&current) {
+                    Err(AdminServiceError::InvalidCredential(
+                        "账号在验证期间已绑定其他代理".to_string(),
+                    ))
+                } else {
+                    if !already_bound {
+                        self.ensure_proxy_binding_capacity(&proxy.proxy_url, &[id])?;
+                        self.token_manager
+                            .set_credential_proxy(
+                                id,
+                                Some(proxy.proxy_url.clone()),
+                                proxy.proxy_username.clone(),
+                                proxy.proxy_password.clone(),
+                            )
+                            .map_err(|error| self.classify_error(error, id))?;
+                    }
+                    if current.disabled {
+                        self.set_disabled(id, false)?;
+                    }
+                    Ok(())
+                }
+            };
+            match commit_result {
+                Ok(()) => {
+                    self.clear_proxy_pending(id)?;
+                    enabled_count += 1;
+                }
+                Err(error) => {
+                    if !already_bound {
+                        let _ = self
+                            .token_manager
+                            .set_credential_proxy(id, None, None, None);
+                    }
+                    tracing::warn!(credential_id = id, "代理自动补位提交失败: {}", error);
+                }
+            }
+        }
+
+        Ok((enabled_count, self.pending_proxy_ids().len()))
+    }
+    pub async fn run_quota_rotation_worker(
+        self: Arc<Self>,
+        mut events: tokio::sync::broadcast::Receiver<u64>,
+    ) {
+        loop {
+            let id = match events.recv().await {
+                Ok(id) => id,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "PRO+ 额度耗尽事件处理滞后，将继续处理最新事件");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
+            match self.retire_quota_exhausted_pool_credential(id) {
+                Ok(true) => match self.reconcile_pending_pro_plus().await {
+                    Ok((enabled, pending)) => tracing::info!(
+                        credential_id = id,
+                        enabled,
+                        pending,
+                        "额度失效的代理池账号已永久退役并完成补位"
+                    ),
+                    Err(error) => tracing::error!(
+                        credential_id = id,
+                        "额度失效的代理池账号已退役，但补位失败: {}",
+                        error
+                    ),
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(credential_id = id, "代理池账号永久退役失败: {}", error)
+                }
+            }
+        }
+    }
+
+    /// 定期刷新启用中的 PRO+ 额度；低于 50 时由额度退役事件释放代理并补位。
+    pub async fn run_pro_plus_quota_guard(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            PRO_PLUS_QUOTA_GUARD_INTERVAL_SECS,
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+            let ids: Vec<u64> = self
+                .token_manager
+                .snapshot()
+                .entries
+                .into_iter()
+                .filter(|entry| {
+                    !entry.disabled && Self::is_kiro_pro_plus(entry.subscription_title.as_deref())
+                })
+                .map(|entry| entry.id)
+                .collect();
+
+            for id in ids {
+                if let Err(error) = self.get_balance(id).await {
+                    tracing::warn!(credential_id = id, "PRO+ 自动额度检查失败: {}", error);
+                }
+            }
+        }
+    }
+
+    /// 监听手动禁用和确定性凭据失效事件，释放 PRO+ 代理并立即补位。
+    pub async fn run_stable_disabled_proxy_release_worker(
+        self: Arc<Self>,
+        mut events: tokio::sync::broadcast::Receiver<u64>,
+    ) {
+        loop {
+            let id = match events.recv().await {
+                Ok(id) => id,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "PRO+ 稳定禁用事件处理滞后，执行全量历史收口");
+                    match self.release_stale_disabled_proxy_bindings() {
+                        Ok(released) if released > 0 => {
+                            let _ = self.reconcile_pending_pro_plus().await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::error!("PRO+ 稳定禁用全量收口失败: {}", error),
+                    }
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
+            match self.release_disabled_credential_proxy(id, true) {
+                Ok(true) => match self.reconcile_pending_pro_plus().await {
+                    Ok((enabled, pending)) => tracing::info!(
+                        credential_id = id,
+                        enabled,
+                        pending,
+                        "稳定禁用账号已释放代理并完成补位"
+                    ),
+                    Err(error) => tracing::error!(
+                        credential_id = id,
+                        "稳定禁用账号已释放代理，但补位失败: {}",
+                        error
+                    ),
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(credential_id = id, "稳定禁用账号释放代理失败: {}", error)
+                }
+            }
+        }
+    }
+    /// 获取代理池及当前账号占用情况。已绑定但后来从池移除的账号不计入可分配池。
+    pub fn get_proxy_pool(&self) -> ProxyPoolResponse {
+        let snapshot = self.token_manager.snapshot();
+        let balance_cache = self.balance_cache.lock().clone();
+        let balance_errors = self.balance_errors.lock().clone();
+        let max_accounts_per_proxy = self.token_manager.get_max_accounts_per_proxy();
+        let pool = self.proxy_pool.lock();
+        let proxies = pool
+            .proxies
+            .iter()
+            .map(|entry| {
+                let assigned_credentials: Vec<ProxyAssignedCredentialStatus> = snapshot
+                    .entries
+                    .iter()
+                    .filter(|credential| {
+                        credential.proxy_url.as_deref() == Some(entry.proxy_url.as_str())
+                    })
+                    .map(|credential| {
+                        let balance = balance_cache.get(&credential.id);
+                        let remaining = balance.map(|cached| cached.data.remaining);
+                        let usage_limit = balance.map(|cached| cached.data.usage_limit);
+                        let proxy_probe_state = entry
+                            .last_test
+                            .as_ref()
+                            .map(|test| test.state.clone())
+                            .unwrap_or_else(|| "notTested".to_string());
+                        let account_probe_state = if balance_errors.contains_key(&credential.id) {
+                            "failed"
+                        } else if balance.is_some() {
+                            "passed"
+                        } else {
+                            "notTested"
+                        };
+                        let recovery_state = if credential.disabled {
+                            "blocked"
+                        } else {
+                            "passed"
+                        };
+                        let health = if credential.disabled
+                            || matches!(
+                                (remaining, usage_limit),
+                                (Some(value), Some(limit))
+                                    if limit > 0.0 && value <= BALANCE_EXHAUSTED_EPSILON
+                            ) {
+                            "abnormal"
+                        } else if remaining.is_some() && usage_limit.is_some() {
+                            "healthy"
+                        } else {
+                            "unknown"
+                        };
+                        ProxyAssignedCredentialStatus {
+                            credential_id: credential.id,
+                            email: credential.email.clone(),
+                            subscription_title: credential.subscription_title.clone(),
+                            import_note: credential.import_note.clone(),
+                            disabled: credential.disabled,
+                            disabled_reason: credential.disabled_reason.clone(),
+                            remaining,
+                            usage_limit,
+                            balance_cached_at: balance.map(|cached| cached.cached_at),
+                            proxy_probe_state,
+                            account_probe_state: account_probe_state.to_string(),
+                            recovery_state: recovery_state.to_string(),
+                            health: health.to_string(),
+                        }
+                    })
+                    .collect();
+                let assigned_credential_ids = assigned_credentials
+                    .iter()
+                    .map(|credential| credential.credential_id)
+                    .collect::<Vec<_>>();
+                let assigned_count = assigned_credentials.len();
+                let healthy_count = assigned_credentials
+                    .iter()
+                    .filter(|credential| credential.health == "healthy")
+                    .count();
+                let abnormal_count = assigned_credentials
+                    .iter()
+                    .filter(|credential| credential.health == "abnormal")
+                    .count();
+                let unknown_count = assigned_count - healthy_count - abnormal_count;
+                ProxyPoolEntryStatus {
+                    proxy_url: Self::redact_proxy_url(&entry.proxy_url),
+                    assigned_credential_ids,
+                    assigned_credentials,
+                    assigned_count,
+                    remaining_slots: max_accounts_per_proxy.saturating_sub(assigned_count),
+                    healthy_count,
+                    abnormal_count,
+                    unknown_count,
+                    last_test: entry.last_test.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let assigned_slots = proxies.iter().map(|entry| entry.assigned_count).sum();
+        let available_slots = proxies.iter().map(|entry| entry.remaining_slots).sum();
+        let empty_proxy_count = proxies
+            .iter()
+            .filter(|entry| entry.assigned_count == 0)
+            .count();
+        let full_proxy_count = proxies
+            .iter()
+            .filter(|entry| entry.remaining_slots == 0)
+            .count();
+        let partial_proxy_count = proxies.len() - empty_proxy_count - full_proxy_count;
+        let healthy_assigned_count = proxies.iter().map(|entry| entry.healthy_count).sum();
+        let abnormal_assigned_count = proxies.iter().map(|entry| entry.abnormal_count).sum();
+        let unknown_assigned_count = proxies.iter().map(|entry| entry.unknown_count).sum();
+        let pending_credential_count = pool.pending_credential_ids.len();
+        let unbound_enabled_count = snapshot
+            .entries
+            .iter()
+            .filter(|credential| !credential.disabled && !credential.has_proxy)
+            .count();
+        let empty_reason = if pending_credential_count > 0 && available_slots == 0 {
+            Some(format!(
+                "代理池已满，{} 个账号等待分配",
+                pending_credential_count
+            ))
+        } else if pending_credential_count > 0 {
+            Some(format!(
+                "有空位但仍有 {} 个账号等待：代理出口验证失败或账号不可用",
+                pending_credential_count
+            ))
+        } else if available_slots > 0 && unbound_enabled_count > 0 {
+            Some(format!(
+                "{} 个历史启用账号未绑定代理，未在部署时批量下线迁移",
+                unbound_enabled_count
+            ))
+        } else if available_slots > 0 {
+            Some("暂无待分配账号".to_string())
+        } else {
+            None
+        };
+
+        ProxyPoolResponse {
+            max_accounts_per_proxy,
+            total: proxies.len(),
+            total_capacity: proxies.len() * max_accounts_per_proxy,
+            assigned_slots,
+            available_slots,
+            empty_proxy_count,
+            partial_proxy_count,
+            full_proxy_count,
+            healthy_assigned_count,
+            abnormal_assigned_count,
+            unknown_assigned_count,
+            pending_credential_count,
+            unbound_enabled_count,
+            empty_reason,
+            proxies,
+        }
+    }
+
+    /// 追加代理池条目。重复 URL 会更新认证信息但不会产生重复槽位。
+
+    fn can_recover_after_probe(
+        &self,
+        id: u64,
+        balance: &BalanceResponse,
+    ) -> Result<bool, AdminServiceError> {
+        let entry = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        if !entry.disabled {
+            return Ok(true);
+        }
+        match entry.disabled_reason.as_deref() {
+            Some("UpstreamSuspended") | Some("InvalidRefreshToken") => Ok(false),
+            Some("QuotaExceeded") => Ok(balance.remaining > BALANCE_EXHAUSTED_EPSILON
+                && !self
+                    .proxy_pool
+                    .lock()
+                    .retired_quota_credential_ids
+                    .contains(&id)),
+            _ => Ok(true),
+        }
+    }
+
+    /// 从代理池手动绑定账号，并验证实际出口。
+    pub async fn manual_bind_proxy(
+        &self,
+        proxy_url: String,
+        credential_ids: Vec<u64>,
+    ) -> Result<ManualProxyOperationResponse, AdminServiceError> {
+        if credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        let proxy_url = proxy_url.trim_end_matches('/').to_string();
+        let proxy = self
+            .proxy_pool
+            .lock()
+            .proxies
+            .iter()
+            .find(|entry| {
+                let actual = entry.proxy_url.trim_end_matches('/');
+                let redacted = Self::redact_proxy_url(&entry.proxy_url);
+                actual == proxy_url || redacted.trim_end_matches('/') == proxy_url
+            })
+            .cloned()
+            .ok_or_else(|| AdminServiceError::InvalidCredential("代理不在代理池中".to_string()))?;
+        let proxy_test = self
+            .test_proxy_pool_entry(ProxyPoolTestRequest {
+                proxy_url: proxy.proxy_url.clone(),
+            })
+            .await?;
+        let proxy_failure = proxy_test
+            .probe
+            .failure_class
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let mut updated = Vec::new();
+        let mut failed = Vec::new();
+        for id in credential_ids {
+            if proxy_test.probe.state != "passed" {
+                self.token_manager
+                    .set_disabled_for_proxy_pending(id)
+                    .map_err(|error| self.classify_error(error, id))?;
+                self.mark_proxy_pending(id)?;
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: format!("代理侧验证失败：{}", proxy_failure),
+                });
+                continue;
+            }
+
+            let credentials = self
+                .token_manager
+                .credential_and_effective_proxy(id)
+                .map_err(|error| self.classify_error(error, id))?
+                .0;
+            if Self::has_credential_proxy(&credentials) {
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号已有代理绑定，请先解除占用".to_string(),
+                });
+                continue;
+            }
+
+            let balance = match self.probe_credential_with_proxy(id, &proxy).await {
+                Ok(balance) => balance,
+                Err(error) => {
+                    self.token_manager
+                        .set_disabled_for_proxy_pending(id)
+                        .map_err(|inner| self.classify_error(inner, id))?;
+                    self.mark_proxy_pending(id)?;
+                    failed.push(ProxyPoolAssignmentSkip {
+                        credential_id: id,
+                        reason: format!(
+                            "账号侧验证失败：{} ({})",
+                            Self::balance_error_class(&error),
+                            error
+                        ),
+                    });
+                    continue;
+                }
+            };
+            if Self::is_quota_exhausted_balance(&balance) {
+                self.token_manager
+                    .set_disabled_for_proxy_pending(id)
+                    .map_err(|error| self.classify_error(error, id))?;
+                self.mark_proxy_pending(id)?;
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号侧验证通过，但额度已耗尽".to_string(),
+                });
+                continue;
+            }
+            if !self.can_recover_after_probe(id, &balance)? {
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号当前禁用原因不允许直接恢复，请重新导入或等待上游处理".to_string(),
+                });
+                continue;
+            }
+
+            let commit_result = {
+                let _allocation_guard = self.allocation_lock.lock().await;
+                self.ensure_proxy_binding_capacity(&proxy.proxy_url, &[id])
+                    .and_then(|_| {
+                        self.token_manager
+                            .set_credential_proxy(
+                                id,
+                                Some(proxy.proxy_url.clone()),
+                                proxy.proxy_username.clone(),
+                                proxy.proxy_password.clone(),
+                            )
+                            .map_err(|error| self.classify_error(error, id))
+                    })
+                    .and_then(|_| {
+                        let currently_disabled = self
+                            .token_manager
+                            .snapshot()
+                            .entries
+                            .into_iter()
+                            .find(|entry| entry.id == id)
+                            .map(|entry| entry.disabled)
+                            .unwrap_or(false);
+                        if currently_disabled {
+                            self.set_disabled(id, false)
+                        } else {
+                            Ok(())
+                        }
+                    })
+            };
+            match commit_result {
+                Ok(()) => {
+                    self.clear_proxy_pending(id)?;
+                    updated.push(id);
+                }
+                Err(error) => {
+                    let _ = self
+                        .token_manager
+                        .set_credential_proxy(id, None, None, None);
+                    self.mark_proxy_pending(id)?;
+                    failed.push(ProxyPoolAssignmentSkip {
+                        credential_id: id,
+                        reason: format!("提交绑定失败：{}", error),
+                    });
+                }
+            }
+        }
+        Ok(ManualProxyOperationResponse {
+            updated_credential_ids: updated,
+            failed,
+            pending_credential_ids: self.pending_proxy_ids(),
+        })
+    }
+
+    /// 手动解除账号的代理池占用；启用账号会先禁用，避免解绑后直连。
+    pub async fn manual_unbind_proxy(
+        &self,
+        credential_ids: Vec<u64>,
+    ) -> Result<ManualProxyOperationResponse, AdminServiceError> {
+        if credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        let _allocation_guard = self.allocation_lock.lock().await;
+        let mut updated = Vec::new();
+        let mut failed = Vec::new();
+        for id in credential_ids {
+            let entry = self
+                .token_manager
+                .snapshot()
+                .entries
+                .into_iter()
+                .find(|entry| entry.id == id)
+                .ok_or(AdminServiceError::NotFound { id })?;
+            if !entry.has_proxy {
+                failed.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "账号没有代理占用".to_string(),
+                });
+                continue;
+            }
+            if !entry.disabled {
+                self.token_manager
+                    .set_disabled_without_release_event(id, true)
+                    .map_err(|error| self.classify_error(error, id))?;
+            }
+            self.token_manager
+                .set_credential_proxy(id, None, None, None)
+                .map_err(|error| self.classify_error(error, id))?;
+            if self.token_manager.get_require_pro_plus_credential_proxy() {
+                self.mark_proxy_pending(id)?;
+            } else {
+                self.clear_proxy_pending(id)?;
+            }
+            updated.push(id);
+        }
+        drop(_allocation_guard);
+        if !updated.is_empty() {
+            let _ = self.reconcile_pending_pro_plus().await?;
+        }
+        Ok(ManualProxyOperationResponse {
+            updated_credential_ids: updated,
+            failed,
+            pending_credential_ids: self.pending_proxy_ids(),
+        })
+    }
+    pub fn add_proxy_pool_entries(
+        &self,
+        req: AddProxyPoolEntriesRequest,
+    ) -> Result<usize, AdminServiceError> {
+        if req.proxies.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "代理池不能为空".to_string(),
+            ));
+        }
+
+        let mut candidates = Vec::with_capacity(req.proxies.len());
+        for proxy in req.proxies {
+            let (proxy_url, proxy_username, proxy_password) = Self::validate_proxy_binding(
+                proxy.proxy_url,
+                proxy.proxy_username,
+                proxy.proxy_password,
+            )?;
+            let proxy_url = proxy_url.ok_or_else(|| {
+                AdminServiceError::InvalidCredential("代理池条目必须提供 proxyUrl".to_string())
+            })?;
+            if proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "代理池不能包含 direct".to_string(),
+                ));
+            }
+            candidates.push(ProxyPoolEntry {
+                proxy_url,
+                proxy_username,
+                proxy_password,
+                last_test: None,
+            });
+        }
+
+        let mut pool = self.proxy_pool.lock();
+        for candidate in candidates {
+            if let Some(existing) = pool
+                .proxies
+                .iter_mut()
+                .find(|entry| entry.proxy_url == candidate.proxy_url)
+            {
+                *existing = candidate;
+            } else {
+                pool.proxies.push(candidate);
+            }
+        }
+        self.persist_proxy_pool(&pool)?;
+        Ok(pool.proxies.len())
+    }
+
+    /// 移除未使用的代理池条目，不触碰已经绑定到账号的出口配置。
+    pub fn remove_proxy_pool_entries(
+        &self,
+        req: RemoveProxyPoolEntriesRequest,
+    ) -> Result<usize, AdminServiceError> {
+        if req.proxy_urls.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供一个 proxyUrl".to_string(),
+            ));
+        }
+        let urls: HashSet<String> = req
+            .proxy_urls
+            .into_iter()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+            .collect();
+        if urls.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供一个非空 proxyUrl".to_string(),
+            ));
+        }
+
+        let mut pool = self.proxy_pool.lock();
+        let before = pool.proxies.len();
+        // GET /proxy-pool deliberately redacts proxy credentials before sending
+        // them to the admin UI. Accept both the persisted URL and that redacted
+        // representation here, otherwise a URL copied from the page can never
+        // match the stored entry and deletion silently removes zero rows.
+        pool.proxies.retain(|entry| {
+            !urls.contains(&entry.proxy_url)
+                && !urls.contains(&Self::redact_proxy_url(&entry.proxy_url))
+        });
+        let removed = before - pool.proxies.len();
+        self.persist_proxy_pool(&pool)?;
+        Ok(removed)
+    }
+
+    fn expected_egress_ip(proxy_url: Option<&str>) -> Option<std::net::IpAddr> {
+        proxy_url
+            .and_then(|url| Url::parse(url).ok())
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+    }
+
+    fn classify_proxy_probe_error(message: &str) -> String {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("407") || lower.contains("proxy authentication") {
+            "auth_failed".to_string()
+        } else if lower.contains("timed out") || lower.contains("timeout") {
+            "connect_timeout".to_string()
+        } else if lower.contains("dns")
+            || lower.contains("resolve")
+            || lower.contains("name or service")
+        {
+            "connect_failed".to_string()
+        } else if lower.contains("response") || lower.contains("status") {
+            "target_unreachable".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    async fn probe_proxy(
+        &self,
+        effective_proxy: Option<&crate::http_client::ProxyConfig>,
+        expected_proxy_url: Option<&str>,
+    ) -> Result<ProxyProbeSummary, AdminServiceError> {
+        let tested_at = Utc::now().to_rfc3339();
+        let started = Instant::now();
+        let client = crate::http_client::build_client(
+            effective_proxy,
+            15,
+            self.token_manager.config().tls_backend,
+        )
+        .map_err(|error| {
+            AdminServiceError::InvalidCredential(format!("代理配置无效: {}", error))
+        })?;
+        let response = client
+            .get("https://api.ipify.org?format=json")
+            .send()
+            .await
+            .map_err(|error| {
+                AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", error))
+            })?
+            .error_for_status()
+            .map_err(|error| {
+                AdminServiceError::UpstreamError(format!("代理出口测试失败: {}", error))
+            })?;
+        let body: serde_json::Value = response.json().await.map_err(|error| {
+            AdminServiceError::UpstreamError(format!("代理出口测试响应无效: {}", error))
+        })?;
+        let egress_ip = body
+            .get("ip")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AdminServiceError::UpstreamError("代理出口测试未返回 IP".to_string()))?
+            .to_string();
+        let expected_ip = Self::expected_egress_ip(expected_proxy_url);
+        let matches_expected = expected_ip
+            .map(|expected| egress_ip.parse::<std::net::IpAddr>().ok() == Some(expected))
+            .unwrap_or(true);
+        Ok(ProxyProbeSummary {
+            state: if matches_expected { "passed" } else { "failed" }.to_string(),
+            egress_ip: Some(egress_ip),
+            expected_ip: expected_ip.map(|value| value.to_string()),
+            latency_ms: Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            failure_class: if matches_expected {
+                None
+            } else {
+                Some("egress_mismatch".to_string())
+            },
+            tested_at,
+        })
+    }
+
+    pub async fn test_proxy_pool_entry(
+        &self,
+        req: ProxyPoolTestRequest,
+    ) -> Result<ProxyPoolTestResponse, AdminServiceError> {
+        let requested_url = req.proxy_url.trim_end_matches('/').to_string();
+        let entry = self
+            .proxy_pool
+            .lock()
+            .proxies
+            .iter()
+            .find(|entry| {
+                let actual = entry.proxy_url.trim_end_matches('/');
+                let redacted = Self::redact_proxy_url(&entry.proxy_url);
+                actual == requested_url || redacted.trim_end_matches('/') == requested_url
+            })
+            .cloned()
+            .ok_or_else(|| AdminServiceError::InvalidCredential("代理不在代理池中".to_string()))?;
+        let mut probe_credentials = KiroCredentials::default();
+        probe_credentials.proxy_url = Some(entry.proxy_url.clone());
+        probe_credentials.proxy_username = entry.proxy_username.clone();
+        probe_credentials.proxy_password = entry.proxy_password.clone();
+        let effective_proxy = probe_credentials.effective_proxy(None);
+        let summary = match self
+            .probe_proxy(effective_proxy.as_ref(), Some(&entry.proxy_url))
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => ProxyProbeSummary {
+                state: "failed".to_string(),
+                egress_ip: None,
+                expected_ip: Self::expected_egress_ip(Some(&entry.proxy_url))
+                    .map(|value| value.to_string()),
+                latency_ms: None,
+                failure_class: Some(Self::classify_proxy_probe_error(&error.to_string())),
+                tested_at: Utc::now().to_rfc3339(),
+            },
+        };
+        {
+            let mut pool = self.proxy_pool.lock();
+            if let Some(current) = pool
+                .proxies
+                .iter_mut()
+                .find(|current| current.proxy_url == entry.proxy_url)
+            {
+                current.last_test = Some(summary.clone());
+                self.persist_proxy_pool(&pool)?;
+            }
+        }
+        Ok(ProxyPoolTestResponse {
+            proxy_url: Self::redact_proxy_url(&entry.proxy_url),
+            probe: summary,
+        })
+    }
+
+    /// 以指定凭据实际会使用的代理访问出口探针，不触发 Kiro Token 刷新或上游模型调用。
+    pub async fn test_credential_proxy(
+        &self,
+        id: u64,
+    ) -> Result<CredentialProxyTestResponse, AdminServiceError> {
+        let (credentials, effective_proxy) = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|e| self.classify_error(e, id))?;
+        let summary = self
+            .probe_proxy(effective_proxy.as_ref(), credentials.proxy_url.as_deref())
+            .await?;
+        let egress_ip = summary
+            .egress_ip
+            .clone()
+            .ok_or_else(|| AdminServiceError::UpstreamError("代理出口测试未返回 IP".to_string()))?;
+
+        Ok(CredentialProxyTestResponse {
+            credential_id: id,
+            uses_proxy: effective_proxy.is_some(),
+            uses_credential_proxy: credentials.proxy_url.is_some(),
+            proxy_url: credentials.proxy_url.as_deref().map(Self::redact_proxy_url),
+            egress_ip,
+            tested_at: summary.tested_at,
+        })
+    }
+
+    /// PRO+ 自动启用要求账号级代理；若代理地址不是字面 IP，则只校验出口可用性。
+    fn proxy_test_matches_expected_egress(result: &CredentialProxyTestResponse) -> bool {
+        if !result.uses_proxy || !result.uses_credential_proxy {
+            return false;
+        }
+        Self::expected_egress_ip(result.proxy_url.as_deref())
+            .map(|expected| result.egress_ip.parse::<std::net::IpAddr>().ok() == Some(expected))
+            .unwrap_or(true)
+    }
+
+    fn validate_proxy_binding(
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> Result<(Option<String>, Option<String>, Option<String>), AdminServiceError> {
+        let proxy_url = proxy_url
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+        let proxy_username = proxy_username
+            .map(|username| username.trim().to_string())
+            .filter(|username| !username.is_empty());
+        let proxy_password = proxy_password.filter(|password| !password.is_empty());
+
+        match proxy_url.as_deref() {
+            None => {
+                if proxy_username.is_some() || proxy_password.is_some() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "清除代理时不能携带代理用户名或密码".to_string(),
+                    ));
+                }
+            }
+            Some(url) if url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) => {
+                if proxy_username.is_some() || proxy_password.is_some() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "direct 不能携带代理用户名或密码".to_string(),
+                    ));
+                }
+            }
+            Some(url) => {
+                let parsed = Url::parse(url).map_err(|_| {
+                    AdminServiceError::InvalidCredential("proxyUrl 必须是完整代理 URL".to_string())
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https" | "socks5")
+                    || parsed.host_str().is_none()
+                {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "proxyUrl 仅支持 http、https、socks5，且必须包含主机".to_string(),
+                    ));
+                }
+                if proxy_username.is_some() != proxy_password.is_some() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "代理用户名和密码必须同时提供".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok((proxy_url, proxy_username, proxy_password))
+    }
+
+    fn redact_proxy_url(value: &str) -> String {
+        if value.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+            return KiroCredentials::PROXY_DIRECT.to_string();
+        }
+        match Url::parse(value) {
+            Ok(mut url) => {
+                if !url.username().is_empty() || url.password().is_some() {
+                    let _ = url.set_username("***");
+                    let _ = url.set_password(Some("***"));
+                }
+                url.to_string()
+            }
+            Err(_) => "[invalid proxy URL]".to_string(),
+        }
+    }
+
+    /// 在池内按录入顺序选择第一个未达到动态账号上限的代理。
+    ///
+    /// ponytail: 代理清单独立落盘，但实际绑定仍随 credentials.json 保存；这让旧部署
+    /// 和手工绑定保持兼容。库存过期、健康度或调度策略需要时再升级为完整资源模型。
+    fn next_proxy_pool_entry(&self) -> Result<Option<ProxyPoolEntry>, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        let pool = self.proxy_pool.lock();
+        if pool.proxies.is_empty() {
+            return Ok(None);
+        }
+        pool.proxies
+            .iter()
+            .find(|entry| {
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|credential| {
+                        credential.proxy_url.as_deref() == Some(entry.proxy_url.as_str())
+                    })
+                    .count()
+                    < self.token_manager.get_max_accounts_per_proxy()
+                    && !entry
+                        .last_test
+                        .as_ref()
+                        .map(|test| test.state == "failed")
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(format!(
+                    "代理池已满：每个代理最多绑定 {} 个账号，请先添加新代理或显式指定 proxyUrl",
+                    self.token_manager.get_max_accounts_per_proxy()
+                ))
+            })
+    }
+
+    fn has_proxy_pool_entries(&self) -> bool {
+        !self.proxy_pool.lock().proxies.is_empty()
+    }
+
+    fn should_assign_proxy_from_pool(gate_enabled: bool, requested: Option<bool>) -> bool {
+        gate_enabled || requested.unwrap_or(true)
+    }
+
+    /// 全账号代理门禁开启后，不再按订阅类型区分代理资格。
+    fn proxy_pool_eligibility(usage: &UsageLimitsResponse) -> ProxyPoolEligibility {
+        let subscription_title = usage.subscription_title().map(str::to_owned);
+        let reason = subscription_title
+            .as_deref()
+            .map(|title| format!("全账号代理门禁已开启，{title:?} 允许自动分配代理"))
+            .unwrap_or_else(|| {
+                "全账号代理门禁已开启；即使未返回 subscriptionTitle 也允许分配代理".to_string()
+            });
+        ProxyPoolEligibility {
+            eligible: true,
+            subscription_title,
+            reason,
+        }
+    }
+
+    fn is_kiro_pro_plus(subscription_title: Option<&str>) -> bool {
+        subscription_title
+            .map(|title| {
+                matches!(
+                    title.trim().to_ascii_uppercase().as_str(),
+                    "KIRO PRO+" | "KIRO PRO MAX"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// `direct`、全局代理和格式无效的地址都不算账号已经绑定住宅 IP。
+    fn has_bound_proxy_url(proxy_url: Option<&str>) -> bool {
+        proxy_url
+            .and_then(|url| {
+                (!url
+                    .trim()
+                    .eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT))
+                .then(|| Url::parse(url).ok())
+                .flatten()
+            })
+            .is_some_and(|url| {
+                matches!(url.scheme(), "http" | "https" | "socks5") && url.host_str().is_some()
+            })
+    }
+
+    fn has_credential_proxy(credentials: &KiroCredentials) -> bool {
+        Self::has_bound_proxy_url(credentials.proxy_url.as_deref())
+    }
+
+    fn has_proxy_pool_binding(&self, credentials: &KiroCredentials) -> bool {
+        let Some(proxy_url) = credentials.proxy_url.as_deref() else {
+            return false;
+        };
+        self.proxy_pool_contains_url(proxy_url)
+    }
+
+    fn proxy_pool_contains_url(&self, proxy_url: &str) -> bool {
+        self.proxy_pool
+            .lock()
+            .proxies
+            .iter()
+            .any(|proxy| proxy.proxy_url == proxy_url)
+    }
+
+    /// 无代理例外只给官方识别为 KIRO POWER（固定 1 万积分档）的账号。
+    fn is_power_10k_without_proxy_allowed(credentials: &KiroCredentials) -> bool {
+        credentials
+            .subscription_title
+            .as_deref()
+            .map(|title| title.trim().eq_ignore_ascii_case("KIRO POWER"))
+            .unwrap_or(false)
+    }
+
+    fn requires_proxy_before_enable(&self, credentials: &KiroCredentials) -> bool {
+        if Self::has_credential_proxy(credentials) {
+            return false;
+        }
+        if self.token_manager.get_require_pro_plus_credential_proxy() {
+            return true;
+        }
+        !Self::is_power_10k_without_proxy_allowed(credentials)
+    }
+
+    /// 释放稳定禁用账号占用的自动代理池资源。
+    ///
+    /// `clear_pending=true` 用于人工或确定性失效禁用，表示该账号不能自动复活；
+    /// `clear_pending=false` 用于代理验证失败，账号继续等待下次分配，但不长期占槽。
+    fn release_disabled_credential_proxy(
+        &self,
+        id: u64,
+        clear_pending: bool,
+    ) -> Result<bool, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        let Some(entry) = snapshot.entries.into_iter().find(|entry| entry.id == id) else {
+            return Err(AdminServiceError::NotFound { id });
+        };
+        if !entry.disabled {
+            return Ok(false);
+        }
+        let credentials = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|error| self.classify_error(error, id))?
+            .0;
+        if !Self::is_kiro_pro_plus(credentials.subscription_title.as_deref())
+            && !self.has_proxy_pool_binding(&credentials)
+        {
+            return Ok(false);
+        }
+        if !Self::has_credential_proxy(&credentials) {
+            if clear_pending {
+                self.clear_proxy_pending(id)?;
+            }
+            return Ok(false);
+        }
+
+        self.token_manager
+            .set_credential_proxy(id, None, None, None)
+            .map_err(|error| self.classify_error(error, id))?;
+        if clear_pending {
+            self.clear_proxy_pending(id)?;
+        }
+        Ok(true)
+    }
+
+    /// 服务启动时清理旧版本遗留的“已稳定禁用但仍占代理”账号。
+    ///
+    /// `TooManyFailures` 是五分钟自动恢复的瞬时冷却，不属于稳定禁用；额度耗尽由
+    /// 专用退役流程处理。其余稳定禁用均释放代理。历史代理验证失败账号若仍在
+    /// pending 队列，则保留等待身份但释放失败绑定。
+    pub fn release_stale_disabled_proxy_bindings(&self) -> Result<usize, AdminServiceError> {
+        let pending_ids: HashSet<u64> = self.pending_proxy_ids().into_iter().collect();
+        let proxy_pool_urls: HashSet<String> = self
+            .proxy_pool
+            .lock()
+            .proxies
+            .iter()
+            .map(|proxy| proxy.proxy_url.clone())
+            .collect();
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.disabled
+                    && entry.has_proxy
+                    && (Self::is_kiro_pro_plus(entry.subscription_title.as_deref())
+                        || entry
+                            .proxy_url
+                            .as_ref()
+                            .map(|proxy_url| proxy_pool_urls.contains(proxy_url))
+                            .unwrap_or(false))
+                    && !matches!(
+                        entry.disabled_reason.as_deref(),
+                        Some("TooManyFailures" | "QuotaExceeded")
+                    )
+            })
+            .map(|entry| entry.id)
+            .collect();
+
+        let mut released = 0;
+        for id in ids {
+            if self.release_disabled_credential_proxy(id, !pending_ids.contains(&id))? {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    fn ensure_can_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+        if self
+            .proxy_pool
+            .lock()
+            .retired_quota_credential_ids
+            .contains(&id)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 已因额度耗尽永久退役，禁止重新启用",
+                id
+            )));
+        }
+        let credentials = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|error| self.classify_error(error, id))?
+            .0;
+        if self.requires_proxy_before_enable(&credentials) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 尚未绑定代理；请先绑定账号级代理 IP 后再启用",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    /// HTTP 启用入口的最终门禁：所有账号不仅要有账号级代理，还必须验证实际出口一致。
+    pub async fn ensure_proxy_verified_before_enable(
+        &self,
+        id: u64,
+    ) -> Result<(), AdminServiceError> {
+        if !self.token_manager.get_require_pro_plus_credential_proxy() {
+            return Ok(());
+        }
+        self.ensure_can_enable(id)?;
+        let result = self.test_credential_proxy(id).await?;
+        if !Self::proxy_test_matches_expected_egress(&result) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 的账号级代理出口 IP 与绑定 IP 不一致，禁止启用",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    /// 兼容已有凭据：服务启动时把已经识别为 PRO+、却没有账号级代理的活跃账号
+    /// 收口为禁用状态，避免旧数据绕过新规则。
+    fn disable_unbound_kiro_pro_plus(&self) {
+        if !self.token_manager.get_require_pro_plus_credential_proxy() {
+            return;
+        }
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && Self::is_kiro_pro_plus(entry.subscription_title.as_deref())
+                    && !Self::has_bound_proxy_url(entry.proxy_url.as_deref())
+            })
+            .map(|entry| entry.id)
+            .collect();
+        for id in ids {
+            if let Err(error) = self
+                .token_manager
+                .set_disabled_without_release_event(id, true)
+                .map_err(|error| self.classify_error(error, id))
+            {
+                tracing::warn!(
+                    credential_id = id,
+                    "KIRO PRO+ 无账号级代理，启动收口禁用失败: {}",
+                    error
+                );
+            } else {
+                if let Err(error) = self.mark_proxy_pending(id) {
+                    tracing::warn!(credential_id = id, "记录 PRO+ 代理等待状态失败: {}", error);
+                }
+                tracing::warn!(credential_id = id, "KIRO PRO+ 无账号级代理，已禁止启用");
+            }
+        }
+    }
+
+    fn mark_proxy_pending(&self, id: u64) -> Result<(), AdminServiceError> {
+        let mut pool = self.proxy_pool.lock();
+        if pool.retired_quota_credential_ids.contains(&id) {
+            return Ok(());
+        }
+        if !pool.pending_credential_ids.contains(&id) {
+            pool.pending_credential_ids.push(id);
+            self.persist_proxy_pool(&pool)?;
+        }
+        Ok(())
+    }
+
+    /// 永久退役额度耗尽的代理池账号：保持禁用、释放账号代理，并确保永不重新排队。
+    /// 套餐失效后可能从 PRO+ 降成 FREE，因此以“是否占用代理池槽位”为准。
+    fn retire_quota_exhausted_pool_credential(&self, id: u64) -> Result<bool, AdminServiceError> {
+        let already_disabled = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?
+            .disabled;
+        let credentials = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|error| self.classify_error(error, id))?
+            .0;
+        if !Self::is_kiro_pro_plus(credentials.subscription_title.as_deref())
+            && !self.has_proxy_pool_binding(&credentials)
+        {
+            return Ok(false);
+        }
+
+        if !already_disabled {
+            self.token_manager
+                .set_disabled_without_release_event(id, true)
+                .map_err(|error| self.classify_error(error, id))?;
+        }
+        if Self::has_credential_proxy(&credentials) {
+            self.token_manager
+                .set_credential_proxy(id, None, None, None)
+                .map_err(|error| self.classify_error(error, id))?;
+        }
+
+        let mut pool = self.proxy_pool.lock();
+        pool.pending_credential_ids
+            .retain(|pending_id| *pending_id != id);
+        if !pool.retired_quota_credential_ids.contains(&id) {
+            pool.retired_quota_credential_ids.push(id);
+        }
+        self.persist_proxy_pool(&pool)?;
+        Ok(true)
+    }
+
+    /// 启动时利用已持久化的余额缓存收口低于 50 的 PRO+，以及额度归零但
+    /// 套餐标签已经变化的代理池账号。人工禁用但额度仍可用的账号保持原样。
+    pub fn retire_cached_nonviable_pool_credentials(&self) -> Result<usize, AdminServiceError> {
+        let proxy_pool_urls: HashSet<String> = self
+            .proxy_pool
+            .lock()
+            .proxies
+            .iter()
+            .map(|proxy| proxy.proxy_url.clone())
+            .collect();
+        let cache = self.balance_cache.lock();
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.disabled
+                    && entry.has_proxy
+                    && cache
+                        .get(&entry.id)
+                        .map(|cached| {
+                            Self::is_pro_plus_below_quota_threshold(&cached.data)
+                                || (entry
+                                    .proxy_url
+                                    .as_ref()
+                                    .map(|proxy_url| proxy_pool_urls.contains(proxy_url))
+                                    .unwrap_or(false)
+                                    && Self::is_quota_exhausted_balance(&cached.data))
+                        })
+                        .unwrap_or(false)
+            })
+            .map(|entry| entry.id)
+            .collect();
+        drop(cache);
+
+        let mut retired = 0;
+        for id in ids {
+            if self.retire_quota_exhausted_pool_credential(id)? {
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    }
+
+    fn clear_proxy_pending(&self, id: u64) -> Result<(), AdminServiceError> {
+        let mut pool = self.proxy_pool.lock();
+        let before = pool.pending_credential_ids.len();
+        pool.pending_credential_ids
+            .retain(|pending_id| *pending_id != id);
+        if pool.pending_credential_ids.len() != before {
+            self.persist_proxy_pool(&pool)?;
+        }
+        Ok(())
+    }
+
+    fn clear_proxy_tracking(&self, id: u64) -> Result<(), AdminServiceError> {
+        let mut pool = self.proxy_pool.lock();
+        let pending_before = pool.pending_credential_ids.len();
+        let retired_before = pool.retired_quota_credential_ids.len();
+        pool.pending_credential_ids
+            .retain(|pending_id| *pending_id != id);
+        pool.retired_quota_credential_ids
+            .retain(|retired_id| *retired_id != id);
+        if pool.pending_credential_ids.len() != pending_before
+            || pool.retired_quota_credential_ids.len() != retired_before
+        {
+            self.persist_proxy_pool(&pool)?;
+        }
+        Ok(())
+    }
+
+    fn pending_proxy_ids(&self) -> Vec<u64> {
+        self.proxy_pool.lock().pending_credential_ids.clone()
+    }
+
+    fn load_proxy_pool_from(path: &Option<PathBuf>) -> ProxyPool {
+        let Some(path) = path else {
+            return ProxyPool::default();
+        };
+        match std::fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(pool) => pool,
+                Err(error) => {
+                    tracing::warn!("代理池文件解析失败，将以空池启动: {}", error);
+                    ProxyPool::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxyPool::default(),
+            Err(error) => {
+                tracing::warn!("代理池文件读取失败，将以空池启动: {}", error);
+                ProxyPool::default()
+            }
+        }
+    }
+
+    fn persist_proxy_pool(&self, pool: &ProxyPool) -> Result<(), AdminServiceError> {
+        let Some(path) = &self.proxy_pool_path else {
+            return Err(AdminServiceError::InternalError(
+                "凭据未配置持久化路径，无法保存代理池".to_string(),
+            ));
+        };
+        let json = serde_json::to_string_pretty(pool).map_err(|error| {
+            AdminServiceError::InternalError(format!("序列化代理池失败: {}", error))
+        })?;
+        std::fs::write(path, json)
+            .map_err(|error| AdminServiceError::InternalError(format!("保存代理池失败: {}", error)))
     }
 
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.ensure_can_enable(id)?;
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        self.record_admin_log(
+            id,
+            "credential_status",
+            "info",
+            "success",
+            "管理员重置失败计数并启用凭据",
+        );
+        Ok(())
     }
 
-    /// 获取凭据余额（带缓存）
+    pub async fn recover_quota_retired(
+        &self,
+        req: RecoverQuotaRetiredRequest,
+    ) -> Result<RecoverQuotaRetiredResponse, AdminServiceError> {
+        let _ = self
+            .assign_credentials_proxy_from_pool(AssignCredentialProxyFromPoolRequest {
+                ids: req.ids.clone(),
+            })
+            .await?;
+        let mut recovered = Vec::new();
+        let mut skipped = Vec::new();
+        for id in req.ids {
+            let balance = self.get_balance(id).await?;
+            if balance.remaining <= 0.0 {
+                skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: "余额仍为 0，未恢复".to_string(),
+                });
+                continue;
+            }
+            {
+                let mut pool = self.proxy_pool.lock();
+                pool.retired_quota_credential_ids
+                    .retain(|retired_id| *retired_id != id);
+                self.persist_proxy_pool(&pool)?;
+            }
+            match self.token_manager.reset_and_enable(id) {
+                Ok(()) => recovered.push(id),
+                Err(error) => skipped.push(ProxyPoolAssignmentSkip {
+                    credential_id: id,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        Ok(RecoverQuotaRetiredResponse {
+            recovered_credential_ids: recovered,
+            skipped,
+        })
+    }
+
+    /// 获取凭据余额（带缓存）。
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        let cached_balance = {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    Some(cached.data.clone())
+        self.get_balance_with_options(id, false).await
+    }
+
+    pub async fn get_balance_with_options(
+        &self,
+        id: u64,
+        force_refresh: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        if !force_refresh {
+            let cached_balance = {
+                let cache = self.balance_cache.lock();
+                if let Some(cached) = cache.get(&id) {
+                    let now = Utc::now().timestamp() as f64;
+                    if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                        tracing::debug!("凭据 #{} 余额命中缓存", id);
+                        Some(cached.data.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
+            };
+            if let Some(balance) = cached_balance {
+                self.balance_errors.lock().remove(&id);
+                self.disable_if_quota_exhausted_balance(&balance);
+                self.backfill_disabled_reason(id, &balance);
+                self.record_admin_log(id, "balance", "info", "success", "余额查询命中缓存");
+                return Ok(balance);
+            }
+        }
+
+        let balance = match self.fetch_balance(id).await {
+            Ok(balance) => balance,
+            Err(error) => {
+                self.balance_errors.lock().insert(
+                    id,
+                    BalanceFailure {
+                        checked_at: Utc::now().to_rfc3339(),
+                        error_class: Self::balance_error_class(&error),
+                    },
+                );
+                self.record_admin_log(id, "balance", "error", "failure", "余额查询失败");
+                return Err(error);
             }
         };
-        if let Some(balance) = cached_balance {
-            self.disable_if_quota_exhausted_balance(&balance);
-            return Ok(balance);
-        }
 
-        // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
-
-        // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
-        self.save_balance_cache();
+        self.cache_balance(&balance);
         self.disable_if_quota_exhausted_balance(&balance);
-
+        self.backfill_disabled_reason(id, &balance);
+        self.record_admin_log(id, "balance", "info", "success", "余额查询完成");
         Ok(balance)
     }
 
+    pub async fn batch_balance(
+        &self,
+        req: BatchBalanceRequest,
+    ) -> Result<BatchBalanceResponse, AdminServiceError> {
+        if req.ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        let mut results = Vec::new();
+        for id in req.ids.into_iter().filter(|id| seen.insert(*id)).take(100) {
+            match self.get_balance_with_options(id, req.force_refresh).await {
+                Ok(balance) => {
+                    let summary = self.balance_probe_summary(id);
+                    results.push(BalanceProbeResult {
+                        credential_id: id,
+                        state: summary.state,
+                        balance: Some(balance),
+                        checked_at: summary.checked_at,
+                        source: summary.source,
+                        error_class: None,
+                    });
+                }
+                Err(error) => {
+                    let summary = self.balance_probe_summary(id);
+                    results.push(BalanceProbeResult {
+                        credential_id: id,
+                        state: "failed".to_string(),
+                        balance: None,
+                        checked_at: summary.checked_at,
+                        source: summary.source,
+                        error_class: Some(Self::balance_error_class(&error)),
+                    });
+                }
+            }
+        }
+        Ok(BatchBalanceResponse { results })
+    }
+
+    fn balance_error_class(error: &AdminServiceError) -> String {
+        let lower = error.to_string().to_ascii_lowercase();
+        if lower.contains("invalid") || lower.contains("权限") || lower.contains("403") {
+            "token_invalid".to_string()
+        } else if lower.contains("429") {
+            "upstream_429".to_string()
+        } else if lower.contains("5") && lower.contains("上游") {
+            "upstream_5xx".to_string()
+        } else if lower.contains("响应") || lower.contains("json") {
+            "malformed_response".to_string()
+        } else if lower.contains("timeout") || lower.contains("超时") {
+            "network".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+
     fn disable_if_quota_exhausted_balance(&self, balance: &BalanceResponse) {
-        if !Self::is_quota_exhausted_balance(balance) {
+        let pro_plus_below_threshold = Self::is_pro_plus_below_quota_threshold(balance);
+        if !pro_plus_below_threshold && !Self::is_quota_exhausted_balance(balance) {
             return;
         }
 
-        // AWS 侧 overage=ENABLED 且全局开关开启：进入超额、保持启用，不永久禁用
-        if self.token_manager.is_overage_enabled(balance.id) {
+        // PRO+ 的 50 额度规则优先于付费超额；其他套餐维持原有 overage 行为。
+        if !pro_plus_below_threshold && self.token_manager.is_overage_enabled(balance.id) {
             tracing::info!(
                 "凭据 #{} 余额耗尽但 overage=ENABLED，进入超额、保持启用",
                 balance.id
@@ -203,21 +2350,45 @@ impl AdminService {
         }
 
         let has_available = self.token_manager.report_quota_exhausted(balance.id);
+        let reason = if pro_plus_below_threshold {
+            "PRO+ 剩余额度低于 50"
+        } else {
+            "余额已耗尽"
+        };
         if has_available {
             tracing::warn!(
-                "凭据 #{} 余额已耗尽（remaining={} usageLimit={}），已自动禁用",
+                "凭据 #{} {}（remaining={} usageLimit={}），已自动禁用",
                 balance.id,
+                reason,
                 balance.remaining,
                 balance.usage_limit
             );
         } else {
             tracing::error!(
-                "凭据 #{} 余额已耗尽（remaining={} usageLimit={}），已自动禁用；当前无可用凭据",
+                "凭据 #{} {}（remaining={} usageLimit={}），已自动禁用；当前无可用凭据",
                 balance.id,
+                reason,
                 balance.remaining,
                 balance.usage_limit
             );
         }
+    }
+
+    fn is_pro_plus_below_quota_threshold(balance: &BalanceResponse) -> bool {
+        if !Self::is_kiro_pro_plus(balance.subscription_title.as_deref())
+            || balance.usage_limit <= 0.0
+        {
+            return false;
+        }
+
+        if let Some(next_reset_at) = balance.next_reset_at {
+            let now = Utc::now().timestamp() as f64;
+            if next_reset_at <= now {
+                return false;
+            }
+        }
+
+        balance.remaining < PRO_PLUS_MIN_REMAINING
     }
 
     fn is_quota_exhausted_balance(balance: &BalanceResponse) -> bool {
@@ -235,14 +2406,7 @@ impl AdminService {
         true
     }
 
-    /// 从上游获取余额（无缓存）
-    async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
-            .token_manager
-            .get_usage_limits_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
-
+    fn usage_to_balance(id: u64, usage: &UsageLimitsResponse) -> BalanceResponse {
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
         let remaining = (usage_limit - current_usage).max(0.0);
@@ -251,8 +2415,7 @@ impl AdminService {
         } else {
             0.0
         };
-
-        Ok(BalanceResponse {
+        BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
             current_usage,
@@ -264,7 +2427,130 @@ impl AdminService {
             current_overages: usage.current_overages(),
             overage_cap: usage.overage_cap(),
             overage_rate: usage.overage_rate(),
-        })
+        }
+    }
+
+    /// 使用候选账号级代理验证账号，不修改最终代理绑定。
+    async fn probe_credential_with_proxy(
+        &self,
+        id: u64,
+        proxy: &ProxyPoolEntry,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        let (mut credentials, _) = self
+            .token_manager
+            .credential_and_effective_proxy(id)
+            .map_err(|error| self.classify_error(error, id))?;
+        credentials.proxy_url = Some(proxy.proxy_url.clone());
+        credentials.proxy_username = proxy.proxy_username.clone();
+        credentials.proxy_password = proxy.proxy_password.clone();
+        let candidate = self
+            .token_manager
+            .get_usage_limits_for_candidate(&credentials)
+            .await
+            .map_err(|error| self.classify_balance_error(error, id))?;
+        let balance = Self::usage_to_balance(id, &candidate.usage_limits);
+        self.token_manager
+            .store_usage_metadata(id, &candidate.usage_limits);
+        self.cache_balance(&balance);
+        Ok(balance)
+    }
+
+    /// 从上游获取余额（无缓存）
+    async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        let usage = match self.token_manager.get_usage_limits_for(id).await {
+            Ok(usage) => usage,
+            Err(error) => {
+                let message = error.to_string();
+                if Self::is_token_dead_balance_error(&message) {
+                    if let Err(reason_error) = self
+                        .token_manager
+                        .set_disabled_reason(id, DisabledReason::InvalidRefreshToken)
+                    {
+                        tracing::warn!(
+                            credential_id = id,
+                            "Token 失效原因标记失败: {}",
+                            reason_error
+                        );
+                    }
+                }
+                return Err(self.classify_balance_error(error, id));
+            }
+        };
+
+        let response = Self::usage_to_balance(id, &usage);
+
+        if self.token_manager.get_require_pro_plus_credential_proxy()
+            && Self::is_kiro_pro_plus(response.subscription_title.as_deref())
+        {
+            let credentials = self
+                .token_manager
+                .credential_and_effective_proxy(id)
+                .map_err(|error| self.classify_error(error, id))?
+                .0;
+            if !Self::has_credential_proxy(&credentials) {
+                self.token_manager
+                    .set_disabled_for_proxy_pending(id)
+                    .map_err(|error| self.classify_error(error, id))?;
+                self.mark_proxy_pending(id)?;
+                let _ = self.reconcile_pending_pro_plus().await?;
+            }
+        }
+
+        Ok(response)
+    }
+
+    /// 余额查询错误中表示"上游 token 已失效/无权限"的特征。
+    fn is_token_dead_balance_error(message: &str) -> bool {
+        message.contains("权限不足")
+            || message.contains("凭证已过期或无效")
+            || message.contains("403")
+            || message.contains("Forbidden")
+    }
+
+    /// 给"已禁用但无原因"的账号补记原因：额度用尽 / 手动禁用。
+    fn backfill_disabled_reason(&self, id: u64, balance: &BalanceResponse) {
+        let entry = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id);
+        let Some(entry) = entry else {
+            return;
+        };
+        if !entry.disabled || entry.disabled_reason.is_some() {
+            return;
+        }
+        let reason = if balance.remaining <= BALANCE_EXHAUSTED_EPSILON {
+            DisabledReason::QuotaExceeded
+        } else {
+            DisabledReason::Manual
+        };
+        if let Err(error) = self.token_manager.set_disabled_reason(id, reason) {
+            tracing::warn!(credential_id = id, "禁用原因补记失败: {}", error);
+        }
+    }
+
+    /// 启动时对"已禁用但无原因"的账号逐个刷新余额，补记具体禁用原因。
+    pub async fn backfill_disabled_reasons(&self) -> Result<usize, AdminServiceError> {
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.disabled && entry.disabled_reason.is_none())
+            .map(|entry| entry.id)
+            .collect();
+        let mut backfilled = 0;
+        for id in ids {
+            match self.get_balance(id).await {
+                Ok(_) => backfilled += 1,
+                Err(error) => {
+                    tracing::warn!(credential_id = id, "禁用原因启动回填失败: {}", error)
+                }
+            }
+        }
+        Ok(backfilled)
     }
 
     /// 添加新凭据
@@ -285,13 +2571,23 @@ impl AdminService {
             }
         }
 
-        // 构建凭据对象
+        // 显式代理优先；未提供时才考虑代理池。导入入口也复用代理校验，避免把
+        // `direct` 或不完整 URL 当成已绑定 IP。
+        let (proxy_url, proxy_username, proxy_password) =
+            Self::validate_proxy_binding(req.proxy_url, req.proxy_username, req.proxy_password)?;
+        let explicit_proxy = proxy_url.is_some();
+        let gate_enabled = self.token_manager.get_require_pro_plus_credential_proxy();
+        // 门禁开启时，PRO+ 自动分配是系统不变量，调用方不能用 false 绕过。
+        let assign_from_pool =
+            Self::should_assign_proxy_from_pool(gate_enabled, req.assign_proxy_from_pool);
+
+        // 先构建未绑定代理的凭据，使用官方 getUsageLimits 的 subscriptionTitle 判断资格。
         let email = req.email.clone();
         let import_note = req
             .import_note
             .map(|note| note.trim().to_string())
             .filter(|note| !note.is_empty());
-        let new_cred = KiroCredentials {
+        let mut new_cred = KiroCredentials {
             id: None,
             access_token: None,
             refresh_token: req.refresh_token,
@@ -309,32 +2605,210 @@ impl AdminService {
             import_note,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             overage_status: None,     // 将在首次获取使用额度时自动同步
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
-            disabled: false, // 新添加的凭据默认启用
+            proxy_url,
+            proxy_username,
+            proxy_password,
+            // 门禁开启时先以禁用状态入库，完成套餐识别与代理出口验证后再启用。
+            disabled: gate_enabled,
+            disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             rpm: None,
         };
 
-        // 调用 token_manager 添加凭据
-        let credential_id = self
-            .token_manager
-            .add_credential(new_cred)
-            .await
-            .map_err(|e| self.classify_add_error(e))?;
+        let should_check_pool =
+            !explicit_proxy && assign_from_pool && (gate_enabled || self.has_proxy_pool_entries());
+        let mut prevalidated_credential = None;
+        let (proxy_pool_eligibility, inspected_usage) = if should_check_pool {
+            match self
+                .token_manager
+                .get_usage_limits_for_candidate(&new_cred)
+                .await
+            {
+                Ok(candidate) => {
+                    prevalidated_credential = Some(candidate.credentials.clone());
+                    new_cred = candidate.credentials;
+                    (
+                        Some(Self::proxy_pool_eligibility(&candidate.usage_limits)),
+                        Some(candidate.usage_limits),
+                    )
+                }
+                Err(error) => (
+                    Some(ProxyPoolEligibility {
+                        eligible: true,
+                        subscription_title: None,
+                        reason: format!("套餐识别失败，但全账号代理门禁要求仍分配代理: {error}"),
+                    }),
+                    None,
+                ),
+            }
+        } else {
+            (None, None)
+        };
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        // 序列化分配到实际写入，防止两个并发导入拿到同一个最后的空槽。
+        let _allocation_guard = self.allocation_lock.lock().await;
+        let mut assigned_proxy = if proxy_pool_eligibility
+            .as_ref()
+            .map(|eligibility| eligibility.eligible)
+            .unwrap_or(false)
+        {
+            match self.next_proxy_pool_entry() {
+                Ok(proxy) => proxy,
+                // 池满时仍保存 PRO+ 凭据为待绑定禁用状态，而不是丢弃导入。
+                Err(AdminServiceError::InvalidCredential(message))
+                    if message.starts_with("代理池已满") =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        if let Some(proxy) = &assigned_proxy {
+            new_cred.proxy_url = Some(proxy.proxy_url.clone());
+            new_cred.proxy_username = proxy.proxy_username.clone();
+            new_cred.proxy_password = proxy.proxy_password.clone();
+        }
+
+        // 候选查询已经拿到官方套餐时，在持久化前写入元数据。这样代理池满、
+        // 没有分到代理的 PRO+ 不会短暂进入可调度状态。
+        let mut subscription_inspected = inspected_usage.is_some();
+        if let Some(usage) = inspected_usage.as_ref() {
+            new_cred.subscription_title = usage.subscription_title().map(str::to_owned);
+            new_cred.overage_status = usage.overage_status().map(str::to_owned);
+        }
+
+        // KIRO PRO+ 必须有账号级代理才允许进入调度；未绑定的号保留在库中，
+        // 方便后续加入代理池或人工绑定后再启用。
+        let mut activation_requires_proxy = self.requires_proxy_before_enable(&new_cred);
+        if activation_requires_proxy {
+            new_cred.disabled = true;
+        }
+
+        // 候选额度校验已经完成 Token 刷新时直接复用结果，避免同一 refreshToken
+        // 在一次导入中连续请求两次 AWS OIDC。
+        let credential_id = if let Some(validated_cred) = prevalidated_credential {
+            self.token_manager
+                .add_credential_with_validated_token(new_cred, validated_cred)
+                .await
+        } else {
+            self.token_manager.add_credential(new_cred).await
+        }
+        .map_err(|e| self.classify_add_error(e))?;
+        drop(_allocation_guard);
+
+        // 自动分配前已经查询过的结果直接保存，避免重复请求官方接口。
+        if let Some(usage) = inspected_usage.as_ref() {
+            self.token_manager
+                .store_usage_metadata(credential_id, usage);
+        } else {
+            match self.token_manager.get_usage_limits_for(credential_id).await {
+                Ok(_) => {
+                    subscription_inspected = true;
+                    // 候选查询偶发失败、但添加后的官方查询成功时，也不能让刚识别
+                    // 为 PRO+ 的无代理账号继续处于启用状态。
+                    let credentials = self
+                        .token_manager
+                        .credential_and_effective_proxy(credential_id)
+                        .map_err(|error| self.classify_error(error, credential_id))?
+                        .0;
+                    activation_requires_proxy = self.requires_proxy_before_enable(&credentials);
+                    if activation_requires_proxy {
+                        self.token_manager
+                            .set_disabled_for_proxy_pending(credential_id)
+                            .map_err(|error| self.classify_error(error, credential_id))?;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", error);
+                }
+            }
+        }
+
+        let mut proxy_test_failed = false;
+        if gate_enabled {
+            let credentials = self
+                .token_manager
+                .credential_and_effective_proxy(credential_id)
+                .map_err(|error| self.classify_error(error, credential_id))?
+                .0;
+            activation_requires_proxy = true;
+            if Self::has_credential_proxy(&credentials) {
+                match self.test_credential_proxy(credential_id).await {
+                    Ok(result) if Self::proxy_test_matches_expected_egress(&result) => {
+                        self.clear_proxy_pending(credential_id)?;
+                        activation_requires_proxy = false;
+                        if subscription_inspected {
+                            self.set_disabled(credential_id, false)?;
+                        } else {
+                            self.token_manager
+                                .set_disabled_for_proxy_pending(credential_id)
+                                .map_err(|error| self.classify_error(error, credential_id))?;
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        proxy_test_failed = true;
+                        self.token_manager
+                            .set_disabled_for_proxy_pending(credential_id)
+                            .map_err(|error| self.classify_error(error, credential_id))?;
+                        self.release_disabled_credential_proxy(credential_id, false)?;
+                        assigned_proxy = None;
+                        self.mark_proxy_pending(credential_id)?;
+                    }
+                }
+            } else {
+                self.mark_proxy_pending(credential_id)?;
+            }
+        }
+
+        self.record_admin_log(
+            credential_id,
+            "credential_status",
+            "info",
+            "success",
+            "管理员添加凭据",
+        );
+        if assigned_proxy.is_some() || explicit_proxy {
+            self.record_admin_log(
+                credential_id,
+                "proxy",
+                "info",
+                "success",
+                "凭据代理配置已保存",
+            );
         }
 
         Ok(AddCredentialResponse {
             success: true,
-            message: format!("凭据添加成功，ID: {}", credential_id),
+            message: if proxy_test_failed {
+                format!(
+                    "凭据添加成功，ID: {}；账号级代理出口验证失败，凭据保持禁用",
+                    credential_id
+                )
+            } else if activation_requires_proxy {
+                format!(
+                    "凭据添加成功，ID: {}；待绑定账号级代理后启用",
+                    credential_id
+                )
+            } else if gate_enabled && !subscription_inspected {
+                format!(
+                    "凭据添加成功，ID: {}；代理已绑定并验证，但套餐识别失败，凭据保持禁用",
+                    credential_id
+                )
+            } else {
+                format!("凭据添加成功，ID: {}", credential_id)
+            },
             credential_id,
             email,
+            assigned_proxy_url: assigned_proxy
+                .as_ref()
+                .map(|entry| Self::redact_proxy_url(&entry.proxy_url)),
+            assigned_proxy_from_pool: assigned_proxy.is_some(),
+            activation_requires_proxy,
+            proxy_pool_eligibility,
         })
     }
 
@@ -343,13 +2817,16 @@ impl AdminService {
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
+        self.clear_proxy_tracking(id)?;
 
-        // 清理已删除凭据的余额缓存
+        // 清理已删除凭据的余额缓存与失败状态
         {
             let mut cache = self.balance_cache.lock();
             cache.remove(&id);
         }
+        self.balance_errors.lock().remove(&id);
         self.save_balance_cache();
+        self.record_admin_log(id, "credential_status", "info", "success", "管理员删除凭据");
 
         Ok(())
     }
@@ -393,6 +2870,38 @@ impl AdminService {
             .set_credentials_rpm_batch(ids, rpm)
             .map(|updated| updated.len())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 批量更新多个凭据的备注和/或优先级。
+    pub fn batch_update_credentials(
+        &self,
+        ids: &[u64],
+        import_note: Option<String>,
+        priority: Option<u32>,
+    ) -> Result<usize, AdminServiceError> {
+        if ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要一个凭据 ID".to_string(),
+            ));
+        }
+        let import_note = import_note
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if import_note.is_none() && priority.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "备注和优先级至少需要提供一项".to_string(),
+            ));
+        }
+        self.token_manager
+            .batch_update_credentials(ids, import_note, priority)
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("凭据不存在") || message.contains("至少需要") {
+                    AdminServiceError::InvalidCredential(message)
+                } else {
+                    AdminServiceError::InternalError(message)
+                }
+            })
     }
 
     /// 获取全局默认 RPM
@@ -451,6 +2960,52 @@ impl AdminService {
         })
     }
 
+    /// 获取 PRO+ 账号级代理门禁配置。
+    pub fn get_pro_plus_proxy_gate(&self) -> ProPlusProxyGateResponse {
+        ProPlusProxyGateResponse {
+            enabled: self.token_manager.get_require_pro_plus_credential_proxy(),
+            max_accounts_per_proxy: self.token_manager.get_max_accounts_per_proxy(),
+        }
+    }
+
+    /// 热更新 PRO+ 账号级代理门禁配置。
+    pub fn set_pro_plus_proxy_gate(
+        &self,
+        req: SetProPlusProxyGateRequest,
+    ) -> Result<ProPlusProxyGateResponse, AdminServiceError> {
+        if req.max_accounts_per_proxy == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "每个代理账号数必须大于 0".to_string(),
+            ));
+        }
+
+        let mut assignments_by_proxy: HashMap<String, usize> = HashMap::new();
+        for entry in self.token_manager.snapshot().entries {
+            if let Some(proxy_url) = entry.proxy_url {
+                if !proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                    *assignments_by_proxy.entry(proxy_url).or_default() += 1;
+                }
+            }
+        }
+        let current_max_assigned = assignments_by_proxy.values().copied().max().unwrap_or(0);
+        if req.max_accounts_per_proxy < current_max_assigned {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "无法把每个代理账号数降到 {}：当前单个代理最大已绑定 {} 个账号",
+                req.max_accounts_per_proxy, current_max_assigned
+            )));
+        }
+
+        let was_enabled = self.token_manager.get_require_pro_plus_credential_proxy();
+        self.token_manager
+            .set_pro_plus_proxy_gate(req.enabled, req.max_accounts_per_proxy)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        if req.enabled && !was_enabled {
+            self.disable_unbound_kiro_pro_plus();
+        }
+        Ok(self.get_pro_plus_proxy_gate())
+    }
+
     /// 获取 CC Test 透传配置
     pub fn get_max_relay(&self) -> MaxRelayResponse {
         let cfg = self.token_manager.get_max_relay();
@@ -485,10 +3040,28 @@ impl AdminService {
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .force_refresh_token_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))
+        match self.token_manager.force_refresh_token_for(id).await {
+            Ok(()) => {
+                self.record_admin_log(
+                    id,
+                    "token_refresh",
+                    "info",
+                    "success",
+                    "管理员强制刷新 Token 成功",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.record_admin_log(
+                    id,
+                    "token_refresh",
+                    "error",
+                    "failure",
+                    "管理员强制刷新 Token 失败",
+                );
+                Err(self.classify_balance_error(error, id))
+            }
+        }
     }
 
     // ============ 余额缓存持久化 ============
@@ -666,6 +3239,12 @@ mod tests {
         }
     }
 
+    fn pro_plus_balance_response(id: u64, usage_limit: f64, remaining: f64) -> BalanceResponse {
+        let mut balance = balance_response(id, usage_limit, remaining);
+        balance.subscription_title = Some("KIRO PRO+".to_string());
+        balance
+    }
+
     #[test]
     fn test_quota_exhausted_balance_detection() {
         assert!(AdminService::is_quota_exhausted_balance(&balance_response(
@@ -685,6 +3264,347 @@ mod tests {
         expired_reset.next_reset_at =
             Some((Utc::now() - chrono::Duration::seconds(1)).timestamp() as f64);
         assert!(!AdminService::is_quota_exhausted_balance(&expired_reset));
+    }
+
+    #[test]
+    fn test_pro_plus_quota_threshold_is_strictly_below_fifty() {
+        assert!(AdminService::is_pro_plus_below_quota_threshold(
+            &pro_plus_balance_response(1, 2000.0, 49.99)
+        ));
+        assert!(!AdminService::is_pro_plus_below_quota_threshold(
+            &pro_plus_balance_response(1, 2000.0, 50.0)
+        ));
+        assert!(!AdminService::is_pro_plus_below_quota_threshold(
+            &pro_plus_balance_response(1, 2000.0, 199.99)
+        ));
+        assert!(!AdminService::is_pro_plus_below_quota_threshold(
+            &balance_response(1, 10000.0, 1.0)
+        ));
+    }
+
+    #[test]
+    fn test_shared_proxy_binding_allows_two_credentials_and_persists() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-shared-proxy-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.machine_id = Some("machine-1".to_string());
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.machine_id = Some("machine-2".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![first.clone(), second.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![first, second],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+        let proxy_url = "http://residential.example:8080".to_string();
+
+        assert_eq!(
+            service
+                .set_credentials_proxy_batch(BatchSetCredentialProxyRequest {
+                    ids: vec![1, 2],
+                    proxy_url: Some(proxy_url.clone()),
+                    proxy_username: Some("buyer".to_string()),
+                    proxy_password: Some("secret".to_string()),
+                })
+                .unwrap(),
+            2
+        );
+
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        for id in [1, 2] {
+            let credential = persisted
+                .iter()
+                .find(|credential| credential.id == Some(id))
+                .unwrap();
+            assert_eq!(credential.proxy_url.as_deref(), Some(proxy_url.as_str()));
+            assert_eq!(credential.proxy_username.as_deref(), Some("buyer"));
+            assert_eq!(credential.proxy_password.as_deref(), Some("secret"));
+        }
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_manual_proxy_binding_cannot_exceed_configured_capacity() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-manual-proxy-capacity-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut credentials = Vec::new();
+        for id in 1..=3 {
+            let mut credential = KiroCredentials::default();
+            credential.id = Some(id);
+            credential.machine_id = Some(format!("machine-{id}"));
+            credentials.push(credential);
+        }
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&credentials).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                credentials,
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+
+        let error = service
+            .set_credentials_proxy_batch(BatchSetCredentialProxyRequest {
+                ids: vec![1, 2, 3],
+                proxy_url: Some("http://shared.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("最多允许绑定 2 个账号"));
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_binding_rejects_partial_authentication() {
+        let result = AdminService::validate_proxy_binding(
+            Some("http://residential.example:8080".to_string()),
+            Some("buyer".to_string()),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proxy_gate_requires_credential_proxy_with_matching_egress_ip() {
+        let matching = CredentialProxyTestResponse {
+            credential_id: 1,
+            uses_proxy: true,
+            uses_credential_proxy: true,
+            proxy_url: Some("http://203.0.113.10:443".to_string()),
+            egress_ip: "203.0.113.10".to_string(),
+            tested_at: Utc::now().to_rfc3339(),
+        };
+        assert!(AdminService::proxy_test_matches_expected_egress(&matching));
+
+        let mismatch = CredentialProxyTestResponse {
+            egress_ip: "203.0.113.11".to_string(),
+            ..matching.clone()
+        };
+        assert!(!AdminService::proxy_test_matches_expected_egress(&mismatch));
+
+        let global_only = CredentialProxyTestResponse {
+            uses_credential_proxy: false,
+            ..matching
+        };
+        assert!(!AdminService::proxy_test_matches_expected_egress(
+            &global_only
+        ));
+    }
+
+    #[test]
+    fn test_kiro_pro_plus_requires_credential_proxy_before_enable() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-pro-plus-proxy-gate-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+        credential.subscription_title = Some(" KIRO PRO+ ".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        let error = service.set_disabled(1, false).unwrap_err();
+        assert!(error.to_string().contains("先绑定账号级代理"));
+        assert!(manager.snapshot().entries[0].disabled);
+
+        service
+            .set_credential_proxy(
+                1,
+                SetCredentialProxyRequest {
+                    proxy_url: Some("http://residential.example:443".to_string()),
+                    proxy_username: Some("buyer".to_string()),
+                    proxy_password: Some("secret".to_string()),
+                },
+            )
+            .unwrap();
+        service.set_disabled(1, false).unwrap();
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.entries[0].disabled);
+        assert!(snapshot.entries[0].has_proxy);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_power_10k_can_enable_without_credential_proxy_when_gate_is_off() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-pro-plus-proxy-gate-off-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+        credential.subscription_title = Some("KIRO POWER".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.require_pro_plus_credential_proxy = false;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service.set_disabled(1, false).unwrap();
+        assert!(!manager.snapshot().entries[0].disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_pro_plus_proxy_gate_can_be_disabled_at_runtime_and_persists() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-pro-plus-runtime-gate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let config_path = test_dir.join("config.json");
+        let credentials_path = test_dir.join("credentials.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string(&Config::default()).unwrap(),
+        )
+        .unwrap();
+
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+        credential.subscription_title = Some("KIRO POWER".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::load(&config_path).unwrap(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service
+            .set_pro_plus_proxy_gate(SetProPlusProxyGateRequest {
+                enabled: false,
+                max_accounts_per_proxy: 2,
+            })
+            .unwrap();
+        service.set_disabled(1, false).unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(!persisted.require_pro_plus_credential_proxy);
+        assert_eq!(persisted.max_accounts_per_proxy, 2);
+        assert!(!manager.snapshot().entries[0].disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_startup_disables_existing_unbound_kiro_pro_plus() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-pro-plus-startup-gate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("Manual")
+        );
+        assert_eq!(service.pending_proxy_ids(), vec![1]);
+        drop(service);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
     }
 
     #[test]
@@ -825,6 +3745,46 @@ mod tests {
     }
 
     #[test]
+    fn test_overage_enabled_pro_plus_below_fifty_is_disabled() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-overage-pro-plus-low-quota-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.machine_id = Some("machine-1".to_string());
+        cred.subscription_title = Some("KIRO PRO+".to_string());
+        cred.overage_status = Some("ENABLED".to_string());
+        cred.proxy_url = Some("http://pro-plus-low-quota.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service.disable_if_quota_exhausted_balance(&pro_plus_balance_response(1, 2000.0, 49.99));
+
+        let first = manager.snapshot().entries.into_iter().next().unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.disabled_reason.as_deref(), Some("QuotaExceeded"));
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
     fn test_overage_disabled_still_disabled() {
         // overage_status=None（未知/未开启）的号，余额耗尽时维持现状：永久禁用
         let credentials_path = std::env::temp_dir().join(format!(
@@ -863,5 +3823,1216 @@ mod tests {
         assert_eq!(first.disabled_reason.as_deref(), Some("QuotaExceeded"));
 
         std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[test]
+    fn test_backfill_disabled_reason_marks_quota_or_manual_without_overwrite() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-backfill-reason-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.disabled = true; // 禁用但无原因（加载时派生 Manual）
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![cred1.clone(), cred2.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred1, cred2],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        // 加载后禁用账号派生为 Manual（既有行为）
+        assert_eq!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("Manual")
+        );
+
+        // backfill 不覆盖已有原因
+        service.backfill_disabled_reason(1, &balance_response(1, 10000.0, 0.0));
+        service.backfill_disabled_reason(2, &balance_response(2, 10000.0, 500.0));
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("Manual")
+        );
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == 2)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("Manual")
+        );
+
+        // set_disabled_reason 可写入具体原因并持久化
+        manager
+            .set_disabled_reason(1, DisabledReason::QuotaExceeded)
+            .unwrap();
+        manager
+            .set_disabled_reason(2, DisabledReason::InvalidRefreshToken)
+            .unwrap();
+        let persisted: Vec<KiroCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        let p1 = persisted.iter().find(|c| c.id == Some(1)).unwrap();
+        let p2 = persisted.iter().find(|c| c.id == Some(2)).unwrap();
+        assert_eq!(p1.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(p2.disabled_reason.as_deref(), Some("InvalidRefreshToken"));
+
+        // 重新加载后原因不丢失
+        let reloaded = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                persisted.clone(),
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("QuotaExceeded")
+        );
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .entries
+                .iter()
+                .find(|e| e.id == 2)
+                .unwrap()
+                .disabled_reason
+                .as_deref(),
+            Some("InvalidRefreshToken")
+        );
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_proxy_pool_tracks_two_accounts_before_rotating_and_persists() {
+        let test_dir =
+            std::env::temp_dir().join(format!("kiro-admin-proxy-pool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        std::fs::write(&credentials_path, "[]").unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![
+                    SetCredentialProxyRequest {
+                        proxy_url: Some("http://proxy-one.example:443".to_string()),
+                        proxy_username: Some("user-one".to_string()),
+                        proxy_password: Some("pass-one".to_string()),
+                    },
+                    SetCredentialProxyRequest {
+                        proxy_url: Some("http://proxy-two.example:443".to_string()),
+                        proxy_username: Some("user-two".to_string()),
+                        proxy_password: Some("pass-two".to_string()),
+                    },
+                ],
+            })
+            .unwrap();
+
+        for (index, proxy_url) in [
+            "http://proxy-one.example:443",
+            "http://proxy-one.example:443",
+            "http://proxy-two.example:443",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut credential = KiroCredentials::default();
+            credential.auth_method = Some("api_key".to_string());
+            credential.kiro_api_key = Some(format!("ksk-proxy-pool-{index}"));
+            credential.proxy_url = Some((*proxy_url).to_string());
+            manager.add_credential(credential).await.unwrap();
+        }
+
+        let pool = service.get_proxy_pool();
+        assert_eq!(pool.total, 2);
+        assert_eq!(pool.available_slots, 1);
+        assert_eq!(pool.proxies[0].assigned_count, 2);
+        assert_eq!(pool.proxies[1].assigned_count, 1);
+        assert_eq!(pool.total_capacity, 4);
+        assert_eq!(pool.assigned_slots, 3);
+        assert_eq!(pool.empty_proxy_count, 0);
+        assert_eq!(pool.partial_proxy_count, 1);
+        assert_eq!(pool.full_proxy_count, 1);
+        assert_eq!(pool.healthy_assigned_count, 0);
+        assert_eq!(pool.abnormal_assigned_count, 0);
+        assert_eq!(pool.unknown_assigned_count, 3);
+        assert_eq!(pool.pending_credential_count, 0);
+        assert_eq!(pool.unbound_enabled_count, 0);
+        assert_eq!(pool.empty_reason.as_deref(), Some("暂无待分配账号"));
+        assert_eq!(
+            service.next_proxy_pool_entry().unwrap().unwrap().proxy_url,
+            "http://proxy-two.example:443"
+        );
+
+        let proxy_pool_path = credentials_path
+            .parent()
+            .unwrap()
+            .join("kiro_proxy_pool.json");
+        let reloaded = AdminService::load_proxy_pool_from(&Some(proxy_pool_path.clone()));
+        assert_eq!(reloaded.proxies.len(), 2);
+        assert_eq!(
+            reloaded.proxies[0].proxy_username.as_deref(),
+            Some("user-one")
+        );
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(&proxy_pool_path).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_pool_refuses_a_third_account_when_all_slots_are_full() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-proxy-pool-full-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credentials = Vec::new();
+        for id in 1..=2 {
+            let mut credential = KiroCredentials::default();
+            credential.id = Some(id);
+            credential.machine_id = Some(format!("machine-{}", id));
+            credential.proxy_url = Some("http://full.example:443".to_string());
+            credentials.push(credential);
+        }
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&credentials).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                credentials,
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://full.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+
+        let result = service.next_proxy_pool_entry();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("代理池已满"));
+
+        let proxy_pool_path = credentials_path
+            .parent()
+            .unwrap()
+            .join("kiro_proxy_pool.json");
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(&proxy_pool_path).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_pool_uses_configured_accounts_per_proxy_limit() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-proxy-pool-dynamic-limit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credentials = Vec::new();
+        for id in 1..=3 {
+            let mut credential = KiroCredentials::default();
+            credential.id = Some(id);
+            credential.machine_id = Some(format!("machine-{id}"));
+            credential.proxy_url = Some("http://shared.example:443".to_string());
+            credentials.push(credential);
+        }
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&credentials).unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.max_accounts_per_proxy = 3;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                credentials,
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://shared.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+
+        let pool = service.get_proxy_pool();
+        assert_eq!(pool.max_accounts_per_proxy, 3);
+        assert_eq!(pool.proxies[0].assigned_count, 3);
+        assert_eq!(pool.available_slots, 0);
+        assert!(service.next_proxy_pool_entry().is_err());
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_gate_rejects_lower_limit_below_existing_assignment() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-proxy-gate-reject-lower-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credentials = Vec::new();
+        for id in 1..=2 {
+            let mut credential = KiroCredentials::default();
+            credential.id = Some(id);
+            credential.machine_id = Some(format!("machine-{id}"));
+            credential.proxy_url = Some("http://shared.example:443".to_string());
+            credentials.push(credential);
+        }
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&credentials).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                credentials,
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://shared.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+
+        let error = service
+            .set_pro_plus_proxy_gate(SetProPlusProxyGateRequest {
+                enabled: true,
+                max_accounts_per_proxy: 1,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("当前单个代理最大已绑定 2 个账号")
+        );
+        assert_eq!(service.get_pro_plus_proxy_gate().max_accounts_per_proxy, 2);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_pool_accepts_all_subscription_types() {
+        let pro_plus: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": " Kiro Pro+ "}
+        }))
+        .unwrap();
+        let pro_max: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": "kiro pro max"}
+        }))
+        .unwrap();
+        let power: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": "KIRO POWER"}
+        }))
+        .unwrap();
+        let free: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": "KIRO FREE"}
+        }))
+        .unwrap();
+        let missing: UsageLimitsResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        for usage in [&pro_plus, &pro_max, &power, &free, &missing] {
+            assert!(AdminService::proxy_pool_eligibility(usage).eligible);
+        }
+        assert_eq!(
+            AdminService::proxy_pool_eligibility(&pro_plus)
+                .subscription_title
+                .as_deref(),
+            Some(" Kiro Pro+ ")
+        );
+    }
+
+    #[test]
+    fn test_enabled_gate_requires_proxy_for_every_subscription_type() {
+        let mut config = Config::default();
+        config.require_pro_plus_credential_proxy = true;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+        let service = AdminService::new(manager, Vec::<String>::new());
+
+        for title in ["KIRO FREE", "KIRO POWER", "KIRO PRO+", "KIRO PRO MAX"] {
+            let mut credential = KiroCredentials::default();
+            credential.subscription_title = Some(title.to_string());
+            assert!(service.requires_proxy_before_enable(&credential));
+            credential.proxy_url = Some("socks5://203.0.113.9:443".to_string());
+            assert!(!service.requires_proxy_before_enable(&credential));
+        }
+    }
+
+    #[test]
+    fn test_enabled_gate_cannot_be_bypassed_by_assign_proxy_false() {
+        assert!(AdminService::should_assign_proxy_from_pool(
+            true,
+            Some(false)
+        ));
+        assert!(!AdminService::should_assign_proxy_from_pool(
+            false,
+            Some(false)
+        ));
+        assert!(AdminService::should_assign_proxy_from_pool(false, None));
+    }
+
+    #[test]
+    fn test_disabled_gate_allows_only_power_10k_without_proxy() {
+        let mut config = Config::default();
+        config.require_pro_plus_credential_proxy = false;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+        let service = AdminService::new(manager, Vec::<String>::new());
+
+        let mut power = KiroCredentials::default();
+        power.subscription_title = Some("KIRO POWER".to_string());
+        assert!(!service.requires_proxy_before_enable(&power));
+
+        for title in ["KIRO FREE", "KIRO PRO+", "KIRO PRO MAX"] {
+            let mut credential = KiroCredentials::default();
+            credential.subscription_title = Some(title.to_string());
+            assert!(service.requires_proxy_before_enable(&credential));
+        }
+    }
+
+    #[test]
+    fn test_quota_exhausted_pro_plus_releases_proxy_and_never_requeues() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-quota-retirement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://retired.example:443".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://retired.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+        service.mark_proxy_pending(1).unwrap();
+
+        assert!(service.retire_quota_exhausted_pool_credential(1).unwrap());
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert!(!snapshot.entries[0].has_proxy);
+        assert!(service.pending_proxy_ids().is_empty());
+        assert_eq!(
+            service.proxy_pool.lock().retired_quota_credential_ids,
+            vec![1]
+        );
+        assert_eq!(service.get_proxy_pool().available_slots, 2);
+        assert_eq!(
+            service.get_all_credentials().credentials[0]
+                .disabled_reason
+                .as_deref(),
+            Some("QuotaExceeded")
+        );
+        assert!(
+            service
+                .ensure_can_enable(1)
+                .unwrap_err()
+                .to_string()
+                .contains("永久退役")
+        );
+
+        service.delete_credential(1).unwrap();
+        assert!(
+            service
+                .proxy_pool
+                .lock()
+                .retired_quota_credential_ids
+                .is_empty()
+        );
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_balance_cache.json")).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_quota_exhausted_pool_account_releases_proxy_after_plan_downgrade() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-downgraded-quota-retirement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO FREE".to_string());
+        credential.proxy_url = Some("http://downgraded.example:443".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://downgraded.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+
+        assert!(service.retire_quota_exhausted_pool_credential(1).unwrap());
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert!(!snapshot.entries[0].has_proxy);
+        assert_eq!(
+            service.proxy_pool.lock().retired_quota_credential_ids,
+            vec![1]
+        );
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        if test_dir.join("kiro_stats.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_manual_disable_releases_pro_plus_proxy_without_requeueing() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-manual-disabled-proxy-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://manual-disabled.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        // 无代理例外开关关闭时，失效账号的解绑仍必须运行。
+        config.require_pro_plus_credential_proxy = false;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        service.set_disabled_and_reconcile(1, true).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert!(!snapshot.entries[0].has_proxy);
+        assert!(service.pending_proxy_ids().is_empty());
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_proxy_pool.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_manual_disable_releases_pool_proxy_after_plan_downgrade() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-downgraded-manual-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO FREE".to_string());
+        credential.proxy_url = Some("http://downgraded-manual.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://downgraded-manual.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+
+        service.set_disabled_and_reconcile(1, true).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert!(!snapshot.entries[0].has_proxy);
+        assert_eq!(service.get_proxy_pool().available_slots, 2);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_startup_releases_stale_disabled_pro_plus_proxy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-stale-disabled-proxy-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://stale-disabled.example:443".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        assert_eq!(service.release_stale_disabled_proxy_bindings().unwrap(), 1);
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert!(!snapshot.entries[0].has_proxy);
+        assert!(service.pending_proxy_ids().is_empty());
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_proxy_pool.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_invalid_refresh_token_event_releases_pro_plus_proxy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-invalid-refresh-proxy-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://invalid-refresh.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let events = manager.subscribe_stable_disabled();
+        let service = Arc::new(AdminService::new(manager.clone(), Vec::<String>::new()));
+        let worker = tokio::spawn(
+            service
+                .clone()
+                .run_stable_disabled_proxy_release_worker(events),
+        );
+
+        manager.report_refresh_token_invalid(1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !manager.snapshot().entries[0].has_proxy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        let _ = worker.await;
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("InvalidRefreshToken")
+        );
+        assert!(!snapshot.entries[0].has_proxy);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_proxy_pool.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        }
+        if test_dir.join("kiro_stats.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_upstream_suspension_event_releases_downgraded_pool_proxy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-suspended-downgraded-release-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO FREE".to_string());
+        credential.proxy_url = Some("http://suspended-downgraded.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let events = manager.subscribe_stable_disabled();
+        let service = Arc::new(AdminService::new(manager.clone(), Vec::<String>::new()));
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://suspended-downgraded.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+        let worker = tokio::spawn(
+            service
+                .clone()
+                .run_stable_disabled_proxy_release_worker(events),
+        );
+
+        manager.report_upstream_suspended(1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !manager.snapshot().entries[0].has_proxy {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        let _ = worker.await;
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("UpstreamSuspended")
+        );
+        assert!(!snapshot.entries[0].has_proxy);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        if test_dir.join("kiro_stats.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_transient_failure_cooldown_keeps_pro_plus_proxy() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-transient-disabled-proxy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://transient-failure.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        manager.report_failure(1);
+        manager.report_failure(1);
+        manager.report_failure(1);
+
+        assert_eq!(service.release_stale_disabled_proxy_bindings().unwrap(), 0);
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("TooManyFailures")
+        );
+        assert!(snapshot.entries[0].has_proxy);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        if test_dir.join("kiro_stats.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_quota_exhausted_event_automatically_retires_pro_plus() {
+        let test_dir =
+            std::env::temp_dir().join(format!("kiro-admin-quota-event-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO PRO+".to_string());
+        credential.proxy_url = Some("http://event.example:443".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let events = manager.subscribe_quota_exhausted();
+        let service = Arc::new(AdminService::new(manager.clone(), Vec::<String>::new()));
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://event.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+        let worker = tokio::spawn(service.clone().run_quota_rotation_worker(events));
+
+        manager.report_quota_exhausted(1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !manager.snapshot().entries[0].has_proxy
+                    && service
+                        .proxy_pool
+                        .lock()
+                        .retired_quota_credential_ids
+                        .contains(&1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("QuotaExceeded")
+        );
+        assert_eq!(
+            service.proxy_pool.lock().retired_quota_credential_ids,
+            vec![1]
+        );
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        if test_dir.join("kiro_stats.json").exists() {
+            std::fs::remove_file(test_dir.join("kiro_stats.json")).unwrap();
+        }
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_startup_retires_only_cached_exhausted_pro_plus() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-startup-retirement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let credentials: Vec<KiroCredentials> = (1..=2)
+            .map(|id| {
+                let mut credential = KiroCredentials::default();
+                credential.id = Some(id);
+                credential.subscription_title = Some("KIRO PRO+".to_string());
+                credential.proxy_url = Some(format!("http://startup-{id}.example:443"));
+                credential.disabled = true;
+                credential
+            })
+            .collect();
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&credentials).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                credentials,
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![
+                    SetCredentialProxyRequest {
+                        proxy_url: Some("http://startup-1.example:443".to_string()),
+                        proxy_username: None,
+                        proxy_password: None,
+                    },
+                    SetCredentialProxyRequest {
+                        proxy_url: Some("http://startup-2.example:443".to_string()),
+                        proxy_username: None,
+                        proxy_password: None,
+                    },
+                ],
+            })
+            .unwrap();
+        service.balance_cache.lock().insert(
+            1,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64,
+                data: pro_plus_balance_response(1, 2000.0, 49.99),
+            },
+        );
+        service.balance_cache.lock().insert(
+            2,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64,
+                data: pro_plus_balance_response(2, 2000.0, 500.0),
+            },
+        );
+
+        assert_eq!(
+            service.retire_cached_nonviable_pool_credentials().unwrap(),
+            1
+        );
+
+        let snapshot = manager.snapshot();
+        assert!(
+            !snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .has_proxy
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == 2)
+                .unwrap()
+                .has_proxy
+        );
+        assert_eq!(
+            service.proxy_pool.lock().retired_quota_credential_ids,
+            vec![1]
+        );
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_startup_retires_cached_exhausted_pool_account_after_plan_downgrade() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-startup-downgraded-retirement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.subscription_title = Some("KIRO FREE".to_string());
+        credential.proxy_url = Some("http://startup-downgraded.example:443".to_string());
+        credential.disabled = true;
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![SetCredentialProxyRequest {
+                    proxy_url: Some("http://startup-downgraded.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                }],
+            })
+            .unwrap();
+        service.mark_proxy_pending(1).unwrap();
+        service.balance_cache.lock().insert(
+            1,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64,
+                data: BalanceResponse {
+                    id: 1,
+                    subscription_title: Some("KIRO FREE".to_string()),
+                    current_usage: 50.0,
+                    usage_limit: 50.0,
+                    remaining: 0.0,
+                    usage_percentage: 100.0,
+                    next_reset_at: Some(
+                        (Utc::now() + chrono::Duration::hours(1)).timestamp() as f64
+                    ),
+                    overage_status: Some("DISABLED".to_string()),
+                    current_overages: 0.0,
+                    overage_cap: 0.0,
+                    overage_rate: 0.0,
+                },
+            },
+        );
+
+        assert_eq!(
+            service.retire_cached_nonviable_pool_credentials().unwrap(),
+            1
+        );
+
+        assert!(!manager.snapshot().entries[0].has_proxy);
+        assert!(service.pending_proxy_ids().is_empty());
+        assert_eq!(
+            service.proxy_pool.lock().retired_quota_credential_ids,
+            vec![1]
+        );
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_proxy_pool.json")).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+    #[test]
+    fn test_recovery_metadata_matches_disabled_reason() {
+        assert_eq!(
+            AdminService::recovery_metadata(true, Some("QuotaExceeded")),
+            (
+                "never".to_string(),
+                vec!["quota_reset_observed".to_string()]
+            )
+        );
+        assert_eq!(
+            AdminService::recovery_metadata(true, Some("TooManyFailures")),
+            (
+                "conditional".to_string(),
+                vec![
+                    "proxy_egress_passed".to_string(),
+                    "account_probe_passed".to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            AdminService::recovery_metadata(false, Some("Manual")),
+            ("none".to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn test_domain_proxy_accepts_any_successful_egress() {
+        let result = CredentialProxyTestResponse {
+            credential_id: 1,
+            uses_proxy: true,
+            uses_credential_proxy: true,
+            proxy_url: Some("http://proxy.example:8080".to_string()),
+            egress_ip: "203.0.113.10".to_string(),
+            tested_at: "2026-09-03T00:00:00Z".to_string(),
+        };
+        assert!(AdminService::proxy_test_matches_expected_egress(&result));
     }
 }
