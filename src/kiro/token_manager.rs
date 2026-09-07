@@ -1571,10 +1571,13 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    // IdC/刷新接口的 400 通常表示共享请求链路或参数问题，
-                    // 不能把它当成账号永久失效累计，否则同一故障会批量禁用有余额账号。
+                    // IdC 刷新可能把永久失效包装成 400 Bad Request；必须先看
+                    // invalid_grant，避免把它误判成临时链路错误并反复调度。
                     let error_text = e.to_string();
-                    if error_text.contains("400 Bad Request") {
+                    let permanently_invalid = e.downcast_ref::<RefreshTokenInvalidError>().is_some()
+                        || error_text.contains("invalid_grant")
+                        || error_text.contains("Invalid token provided");
+                    if !permanently_invalid && error_text.contains("400 Bad Request") {
                         log_token_acquire_failure(id, &e, false);
                         tracing::warn!(
                             credential_id = id,
@@ -1583,7 +1586,7 @@ impl MultiTokenManager {
                         return Err(e);
                     }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                    let has_available = if permanently_invalid {
                         log_token_acquire_failure(id, &e, true);
                         self.report_refresh_token_invalid(id)
                     } else {
