@@ -13,6 +13,7 @@ use tokio::sync::{Mutex as TokioMutex, broadcast};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -570,25 +571,159 @@ async fn refresh_idc_token(
     // 上游已把 profileArn 改成必填；IdC 账号缺 profileArn 时用占位符会被拒 403。
     // refresh 后若仍无 profileArn，探测真实 profile 并存下。探测失败不阻塞刷新。
     if new_credentials.profile_arn.is_none() {
-        if let Some(arn) =
-            list_available_profiles(&new_credentials, config, &data.access_token, proxy).await
-        {
-            new_credentials.profile_arn = Some(arn);
+        let current_region = new_credentials.effective_api_region(config).to_string();
+        let current_probe = list_available_profiles(
+            &new_credentials,
+            config,
+            &data.access_token,
+            proxy,
+            &current_region,
+        )
+        .await;
+        match current_probe {
+            Some(arn) => new_credentials.profile_arn = Some(arn),
+            // 当前地区查不到档案：号本身可能属于别的地区（例如欧洲号）。
+            // 按配置的候选地区依次探测，命中就把该地区记到凭据上，后续请求自动走对地方。
+            None => {
+                if let Some((region, arn)) = probe_profile_regions_for(
+                    &new_credentials,
+                    config,
+                    &data.access_token,
+                    proxy,
+                    &current_region,
+                )
+                .await
+                {
+                    new_credentials.api_region = Some(region);
+                    new_credentials.profile_arn = Some(arn);
+                }
+            }
         }
     }
 
     Ok(new_credentials)
 }
 
-/// 列出 IdC 账号可用的 profile（上游把 profileArn 当必填后，IdC 必须用真实 profile，
-/// 不能用 Builder ID 占位符）。仅 IdC/Enterprise 有意义；Builder ID / 社交返回 None。
+/// 在当前地区查不到档案时，按配置的候选地区依次探测档案真正归属的地区。
+///
+/// 命中返回 `(地区, profileArn)`；全部未命中返回 `None`，调用方保持原地区不变。
+/// 同一凭据在冷却窗口内只探测一次，避免「哪里都没有档案」的账号每次刷新都重复打上游。
+async fn probe_profile_regions_for(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    current_region: &str,
+) -> Option<(String, String)> {
+    let candidates = profile_probe_regions(config, current_region);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // 新增账号在拿到 id 之前就会刷新一次，此时没有可用的冷却键，直接探测即可：
+    // 每个凭据在导入流程里只刷新一次，代价有界。
+    let credential_id = credentials.id;
+    if let Some(id) = credential_id {
+        if !profile_probe_allowed(id) {
+            tracing::debug!(
+                event_type = "token_refresh",
+                credential_id = id,
+                "档案地区探测处于冷却窗口，跳过候选地区探测"
+            );
+            return None;
+        }
+    }
+
+    for region in candidates {
+        if let Some(arn) =
+            list_available_profiles(credentials, config, token, proxy, &region).await
+        {
+            tracing::warn!(
+                event_type = "token_refresh",
+                credential_id = credential_id.unwrap_or_default(),
+                credential_id_present = credential_id.is_some(),
+                region = %region,
+                "当前地区无可用档案，已在候选地区命中并将该地区记录到凭据"
+            );
+            return Some((region, arn));
+        }
+        tracing::debug!(
+            event_type = "token_refresh",
+            credential_id = credential_id.unwrap_or_default(),
+            region = %region,
+            "候选地区无可用档案"
+        );
+    }
+
+    tracing::warn!(
+        event_type = "token_refresh",
+        credential_id = credential_id.unwrap_or_default(),
+        credential_id_present = credential_id.is_some(),
+        "所有候选地区均无可用档案，保持原地区"
+    );
+    None
+}
+
+/// 计算本次要探测的候选地区：按配置顺序，去掉空白项、去重，并排除当前地区。
+fn profile_probe_regions(config: &Config, current_region: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(current_region.trim().to_string());
+
+    let mut regions = Vec::new();
+    for candidate in &config.profile_region_candidates {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || !seen.insert(candidate.to_string()) {
+            continue;
+        }
+        regions.push(candidate.to_string());
+    }
+    regions
+}
+
+/// 档案地区探测的最小间隔：窗口内同一凭据不重复探测。
+const PROFILE_REGION_PROBE_COOLDOWN: StdDuration = StdDuration::from_secs(1800);
+
+/// 记录每个凭据上次探测的时间点。
+///
+/// 只存在于进程内：重启后最多再探测一轮，可接受。探测命中会写入凭据的
+/// `apiRegion`，下次刷新在当前地区就能查到档案，不再进入这里。
+static PROFILE_PROBE_COOLDOWNS: LazyLock<Mutex<HashMap<u64, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 判断该凭据此时是否允许探测，并记录本次探测时间。
+fn profile_probe_allowed(credential_id: u64) -> bool {
+    let now = Instant::now();
+    let mut cooldowns = PROFILE_PROBE_COOLDOWNS.lock();
+
+    if let Some(previous) = cooldowns.get(&credential_id) {
+        if now.duration_since(*previous) < PROFILE_REGION_PROBE_COOLDOWN {
+            return false;
+        }
+    }
+
+    // 长期运行下已删除的凭据会留下条目，顺手清掉过期的，避免无界增长。
+    if cooldowns.len() > PROFILE_PROBE_COOLDOWN_ENTRY_LIMIT {
+        cooldowns.retain(|_, previous| {
+            now.duration_since(*previous) < PROFILE_REGION_PROBE_COOLDOWN
+        });
+    }
+
+    cooldowns.insert(credential_id, now);
+    true
+}
+
+/// 冷却表的清理阈值。
+const PROFILE_PROBE_COOLDOWN_ENTRY_LIMIT: usize = 4096;
+
+/// 列出 IdC 账号在指定地区可用的 profile（上游把 profileArn 当必填后，IdC 必须用真实
+/// profile，不能用 Builder ID 占位符）。仅 IdC/Enterprise 有意义；Builder ID / 社交返回 None。
 async fn list_available_profiles(
     credentials: &KiroCredentials,
     config: &Config,
     token: &str,
     proxy: Option<&ProxyConfig>,
+    region: &str,
 ) -> Option<String> {
-    let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let url = format!("https://{}/ListAvailableProfiles", host);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
@@ -3060,7 +3195,11 @@ impl MultiTokenManager {
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
-        validated_cred.api_region = new_cred.api_region;
+        // 地区字段：导入显式给了就听导入的；没给则保留刷新阶段探测到的地区
+        // （欧洲号档案只在 eu-central-1，导入时不带地区也要能被识别出来）。
+        if new_cred.api_region.is_some() {
+            validated_cred.api_region = new_cred.api_region;
+        }
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
         validated_cred.import_note = new_cred.import_note;
@@ -3572,6 +3711,53 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
 
+    #[test]
+    fn profile_probe_regions_keeps_config_order_and_skips_current_duplicates_blanks() {
+        let mut config = Config::default();
+        config.profile_region_candidates = vec![
+            "eu-central-1".into(),
+            "us-east-1".into(),
+            "  ".into(),
+            "ap-southeast-1".into(),
+            "eu-central-1".into(),
+            "".into(),
+        ];
+
+        assert_eq!(
+            profile_probe_regions(&config, "us-east-1"),
+            vec!["eu-central-1".to_string(), "ap-southeast-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn profile_probe_regions_default_candidates_skip_current_api_region() {
+        let config = Config::default();
+        let probed = profile_probe_regions(&config, config.effective_api_region());
+        let regions: Vec<&str> = probed.iter().map(String::as_str).collect();
+
+        assert_eq!(
+            regions,
+            vec!["eu-central-1", "ap-southeast-1", "us-east-2", "eu-west-1"]
+        );
+    }
+
+    #[test]
+    fn profile_probe_regions_empty_config_disables_probing() {
+        let mut config = Config::default();
+        config.profile_region_candidates.clear();
+
+        assert!(profile_probe_regions(&config, "us-east-1").is_empty());
+    }
+
+    #[test]
+    fn profile_probe_allowed_blocks_repeat_within_cooldown_window() {
+        // 用一个不与其它测试共用的凭据 ID，避免全局冷却表互相干扰。
+        let credential_id = u64::MAX - 7;
+
+        assert!(profile_probe_allowed(credential_id));
+        assert!(!profile_probe_allowed(credential_id));
+    }
+
     fn make_entry(id: u64, rpm: Option<u32>) -> CredentialEntry {
         let mut cred = KiroCredentials::default();
         cred.id = Some(id);
@@ -3955,6 +4141,58 @@ mod tests {
         assert_eq!(
             entries[0].credentials.access_token.as_deref(),
             Some("access-token-from-candidate")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_keeps_probed_api_region_when_import_omits_it() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.kiro_api_key = Some("ksk-region-autodetect-keep".to_string());
+        assert!(new_cred.api_region.is_none());
+
+        // 刷新阶段探测到的地区与档案：导入没显式给地区时必须保留。
+        let mut probed_cred = new_cred.clone();
+        probed_cred.api_region = Some("eu-central-1".to_string());
+        probed_cred.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:080689548220:profile/WHVNRRNDY37C".to_string(),
+        );
+
+        manager
+            .add_credential_with_validated_token(new_cred, probed_cred)
+            .await
+            .unwrap();
+
+        let entries = manager.entries.lock();
+        assert_eq!(
+            entries[0].credentials.api_region.as_deref(),
+            Some("eu-central-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_explicit_api_region_overrides_probed_region() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.kiro_api_key = Some("ksk-region-autodetect-override".to_string());
+        new_cred.api_region = Some("us-east-2".to_string());
+
+        let mut probed_cred = new_cred.clone();
+        probed_cred.api_region = Some("eu-central-1".to_string());
+
+        manager
+            .add_credential_with_validated_token(new_cred, probed_cred)
+            .await
+            .unwrap();
+
+        let entries = manager.entries.lock();
+        assert_eq!(
+            entries[0].credentials.api_region.as_deref(),
+            Some("us-east-2")
         );
     }
 

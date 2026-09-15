@@ -61,6 +61,14 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
+    /// IdC 档案归属地区探测的候选列表（按顺序尝试）。
+    ///
+    /// 上游存在「档案不在默认地区」的账号（例如欧洲号只在 eu-central-1 有档案）。
+    /// 刷新令牌后若在当前地区查不到档案，会按此列表依次探测，命中即把该地区写入
+    /// 凭据的 `apiRegion`，后续请求与查询都按该地区走。留空表示不做探测。
+    #[serde(default = "default_profile_region_candidates")]
+    pub profile_region_candidates: Vec<String>,
+
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
@@ -245,6 +253,19 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+/// IdC 档案归属地区探测的默认候选列表。
+///
+/// 只放已知存在 `q.<region>.amazonaws.com` 接口的地区；探测超时或连不上按
+/// 「该地区没有档案」处理，不影响刷新流程。配置里显式给空数组即关闭探测。
+fn default_profile_region_candidates() -> Vec<String> {
+    vec![
+        "eu-central-1".to_string(),
+        "ap-southeast-1".to_string(),
+        "us-east-2".to_string(),
+        "eu-west-1".to_string(),
+    ]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -253,6 +274,7 @@ impl Default for Config {
             region: default_region(),
             auth_region: None,
             api_region: None,
+            profile_region_candidates: default_profile_region_candidates(),
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
