@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::endpoint::{Bucket, KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{AllRateLimitedError, MultiTokenManager};
@@ -393,6 +393,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                bucket: Bucket::AmazonQ,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -686,6 +687,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                bucket: Bucket::AmazonQ,
             };
 
             let url = endpoint.api_url(&rctx);

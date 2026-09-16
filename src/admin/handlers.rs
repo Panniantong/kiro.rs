@@ -13,7 +13,8 @@ use super::{
         BatchBalanceRequest, BatchCredentialIdsRequest, BatchSetCredentialProxyRequest,
         BatchSetRpmRequest, BatchUpdateCredentialsRequest, CredentialLogQuery, ManualProxyBindRequest,
         ManualProxyUnbindRequest, ProxyPoolTestRequest, RecoverQuotaRetiredRequest,
-        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetCredentialProxyRequest,
+        RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetBucketFailoverConfigRequest,
+        SetCredentialProxyRequest,
         SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetProPlusProxyGateRequest,
         SetRpmRequest, SuccessResponse,
@@ -514,6 +515,24 @@ pub async fn set_max_relay(
     Json(payload): Json<SetMaxRelayRequest>,
 ) -> impl IntoResponse {
     match state.service.set_max_relay(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/bucket-failover
+/// 获取多桶故障转移配置
+pub async fn get_bucket_failover_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_bucket_failover_config())
+}
+
+/// PUT /api/admin/config/bucket-failover
+/// 设置多桶故障转移配置（热生效并持久化）
+pub async fn set_bucket_failover_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetBucketFailoverConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_bucket_failover_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

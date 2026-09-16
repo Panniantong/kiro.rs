@@ -69,6 +69,22 @@ pub struct Config {
     #[serde(default = "default_profile_region_candidates")]
     pub profile_region_candidates: Vec<String>,
 
+    /// 是否启用 AWS 双桶故障转移（默认关闭）。
+    ///
+    /// 开启后：同一个账号在 `q.{region}.amazonaws.com` 遇到限速性失败（429 / 传输错误 /
+    /// 近期被限速过的伪 403 / 5xx）时，改用第二个独立限速桶
+    /// `codewhisperer.{region}.amazonaws.com` 重试，请求体与主桶完全一致、只有 host 不同。
+    /// API Key 凭据不参与（它没有 profileArn，CodeWhisperer 会 400）。
+    #[serde(default = "default_multi_bucket_failover")]
+    pub multi_bucket_failover: bool,
+
+    /// 是否启用 kiro.dev 网关兜底（默认关闭）。
+    ///
+    /// 开启后：主桶与 CodeWhisperer 都被限速时，允许翻到 `runtime.{region}.kiro.dev`。
+    /// 为避免单凭据被两个网关同时烧穿，池内可用凭据少于 2 个且未 pin 在 kiro.dev 时不翻。
+    #[serde(default = "default_kiro_dev_failover")]
+    pub kiro_dev_failover: bool,
+
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
@@ -266,6 +282,16 @@ fn default_profile_region_candidates() -> Vec<String> {
     ]
 }
 
+/// AWS 双桶故障转移默认关闭：保持既有单桶行为，验证后再开。
+fn default_multi_bucket_failover() -> bool {
+    false
+}
+
+/// kiro.dev 网关兜底默认关闭：保持既有单桶行为，验证后再开。
+fn default_kiro_dev_failover() -> bool {
+    false
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -275,6 +301,8 @@ impl Default for Config {
             auth_region: None,
             api_region: None,
             profile_region_candidates: default_profile_region_candidates(),
+            multi_bucket_failover: default_multi_bucket_failover(),
+            kiro_dev_failover: default_kiro_dev_failover(),
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,

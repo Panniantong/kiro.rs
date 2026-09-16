@@ -9,7 +9,7 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::{KiroEndpoint, RequestContext};
+use super::{Bucket, KiroEndpoint, RequestContext};
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
@@ -27,7 +27,7 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        ctx.bucket.host(self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -59,15 +59,18 @@ impl KiroEndpoint for IdeEndpoint {
         IDE_ENDPOINT_NAME
     }
 
+    fn failover_buckets(&self) -> &'static [Bucket] {
+        // 主桶 AmazonQ(`q.`) 之外的两个独立限速桶：第二个 AWS 桶 CodeWhisperer
+        // 与 kiro.dev 网关。请求体与主桶完全一致，只有 host 不同。
+        &[Bucket::CodeWhisperer, Bucket::KiroDev]
+    }
+
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {

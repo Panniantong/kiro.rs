@@ -704,6 +704,28 @@ pub struct SetMaxRelayRequest {
     pub api_key: String,
 }
 
+/// 多桶故障转移配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BucketFailoverConfigResponse {
+    /// 是否启用 AWS 双桶故障转移（q. ↔ codewhisperer.）
+    pub multi_bucket_failover: bool,
+    /// 是否启用 kiro.dev 网关兜底
+    pub kiro_dev_failover: bool,
+}
+
+/// 设置多桶故障转移请求。未提供的字段保持不变。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBucketFailoverConfigRequest {
+    /// 是否启用 AWS 双桶故障转移
+    #[serde(default)]
+    pub multi_bucket_failover: Option<bool>,
+    /// 是否启用 kiro.dev 网关兜底
+    #[serde(default)]
+    pub kiro_dev_failover: Option<bool>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

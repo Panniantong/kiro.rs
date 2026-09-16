@@ -15,6 +15,44 @@ pub mod ide;
 
 pub use ide::IdeEndpoint;
 
+/// 上游限速桶
+///
+/// 同一份请求体、同一个端点，只改 host 就能命中相互独立的上游限速桶。
+/// 三个桶跑字节级一致的 `generateAssistantResponse` 协议，限速相互独立：
+/// - `AmazonQ`：`q.{region}.amazonaws.com`，Kiro IDE 默认主桶。
+/// - `CodeWhisperer`：`codewhisperer.{region}.amazonaws.com`，第二个独立 AWS 桶。
+/// - `KiroDev`：`runtime.{region}.kiro.dev`，kiro.dev 网关，独立桶、429 兜底。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bucket {
+    /// `q.{region}.amazonaws.com`（默认主桶）。
+    #[default]
+    AmazonQ,
+    /// `codewhisperer.{region}.amazonaws.com`（第二个独立 AWS 限速桶）。
+    CodeWhisperer,
+    /// `runtime.{region}.kiro.dev`（kiro.dev 网关，独立限速桶）。
+    KiroDev,
+}
+
+impl Bucket {
+    /// 该桶在指定 region 下的实际 host。
+    pub fn host(&self, region: &str) -> String {
+        match self {
+            Bucket::AmazonQ => format!("q.{}.amazonaws.com", region),
+            Bucket::CodeWhisperer => format!("codewhisperer.{}.amazonaws.com", region),
+            Bucket::KiroDev => format!("runtime.{}.kiro.dev", region),
+        }
+    }
+
+    /// trace / 日志里的端点标签后缀。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Bucket::AmazonQ => "q",
+            Bucket::CodeWhisperer => "codewhisperer",
+            Bucket::KiroDev => "kiro.dev",
+        }
+    }
+}
+
 /// Kiro 端点
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
@@ -27,6 +65,13 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// MCP endpoint URL
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String;
+
+    /// 该端点支持故障转移的额外限速桶（不含主桶 `AmazonQ`）。
+    ///
+    /// 默认空：只在主桶上跑（如 CLI 端点）。返回的桶按建议尝试顺序排列。
+    fn failover_buckets(&self) -> &'static [Bucket] {
+        &[]
+    }
 
     /// 装饰 API 请求的端点特有 header
     ///
@@ -68,6 +113,8 @@ pub struct RequestContext<'a> {
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+    /// 本次尝试使用的限速桶（决定 host）
+    pub bucket: Bucket,
 }
 
 /// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑

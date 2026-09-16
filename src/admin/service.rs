@@ -21,7 +21,8 @@ use super::types::{
     AddCredentialResponse, AddProxyPoolEntriesRequest, ArmorBreakingResponse,
     AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse,
     BalanceProbeResult, BalanceProbeSummary, BalanceResponse, BatchBalanceRequest,
-    BatchBalanceResponse, BatchSetCredentialProxyRequest, CredentialLogQuery,
+    BatchBalanceResponse, BatchSetCredentialProxyRequest, BucketFailoverConfigResponse,
+    CredentialLogQuery,
     CredentialLogsResponse, CredentialProxyTestResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
     ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
@@ -29,6 +30,7 @@ use super::types::{
     ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, ProxyPoolTestRequest,
     ProxyPoolTestResponse, ProxyProbeSummary, RecoverQuotaRetiredRequest,
     RecoverQuotaRetiredResponse, RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
+    SetBucketFailoverConfigRequest,
     SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
     SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
 };
@@ -3036,6 +3038,26 @@ impl AdminService {
             base_url: cfg.base_url,
             api_key: cfg.api_key,
         })
+    }
+
+    /// 获取多桶故障转移配置
+    pub fn get_bucket_failover_config(&self) -> BucketFailoverConfigResponse {
+        BucketFailoverConfigResponse {
+            multi_bucket_failover: self.token_manager.get_multi_bucket_failover(),
+            kiro_dev_failover: self.token_manager.get_kiro_dev_failover(),
+        }
+    }
+
+    /// 设置多桶故障转移配置（热生效并持久化）
+    pub fn set_bucket_failover_config(
+        &self,
+        req: SetBucketFailoverConfigRequest,
+    ) -> Result<BucketFailoverConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_bucket_failover_config(req.multi_bucket_failover, req.kiro_dev_failover)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_bucket_failover_config())
     }
 
     /// 强制刷新指定凭据的 Token

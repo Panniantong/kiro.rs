@@ -1081,6 +1081,12 @@ pub struct MultiTokenManager {
     stable_disabled_tx: broadcast::Sender<u64>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
+    /// AWS 双桶故障转移开关（运行时可修改，默认关闭）：同一账号在 q. 被限速性失败时
+    /// 换用 codewhisperer.{region}.amazonaws.com 重试。
+    multi_bucket_failover: Mutex<bool>,
+    /// kiro.dev 网关兜底开关（运行时可修改，默认关闭）：AWS 桶都被限速时允许翻到
+    /// runtime.{region}.kiro.dev。
+    kiro_dev_failover: Mutex<bool>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1238,6 +1244,8 @@ impl MultiTokenManager {
         let require_pro_plus_credential_proxy = config.require_pro_plus_credential_proxy;
         let max_accounts_per_proxy = config.max_accounts_per_proxy;
         let max_relay = config.max_relay.clone();
+        let multi_bucket_failover = config.multi_bucket_failover;
+        let kiro_dev_failover = config.kiro_dev_failover;
         let (quota_exhausted_tx, _) = broadcast::channel(256);
         let (stable_disabled_tx, _) = broadcast::channel(256);
         let manager = Self {
@@ -1257,6 +1265,8 @@ impl MultiTokenManager {
             quota_exhausted_tx,
             stable_disabled_tx,
             max_relay: Mutex::new(max_relay),
+            multi_bucket_failover: Mutex::new(multi_bucket_failover),
+            kiro_dev_failover: Mutex::new(kiro_dev_failover),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -3694,6 +3704,67 @@ impl MultiTokenManager {
             "CC Test 透传配置已更新: enabled={} base_url={}",
             cfg.enabled,
             cfg.base_url
+        );
+        Ok(())
+    }
+
+    /// 获取多桶故障转移开关（Admin API）。
+    pub fn get_multi_bucket_failover(&self) -> bool {
+        *self.multi_bucket_failover.lock()
+    }
+
+    /// 获取 kiro.dev 网关兜底开关（Admin API）。
+    pub fn get_kiro_dev_failover(&self) -> bool {
+        *self.kiro_dev_failover.lock()
+    }
+
+    fn persist_bucket_failover(&self, multi: bool, kiro_dev: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，多桶开关仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.multi_bucket_failover = multi;
+        config.kiro_dev_failover = kiro_dev;
+        config
+            .save()
+            .with_context(|| format!("持久化多桶开关失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 设置多桶开关（Admin API，热改并持久化，失败回滚）。未给的字段保持不变，
+    /// 因此两个字段都不给等于"不做任何修改"。
+    pub fn set_bucket_failover_config(
+        &self,
+        multi: Option<bool>,
+        kiro_dev: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let previous_multi = self.get_multi_bucket_failover();
+        let previous_kiro_dev = self.get_kiro_dev_failover();
+        let new_multi = multi.unwrap_or(previous_multi);
+        let new_kiro_dev = kiro_dev.unwrap_or(previous_kiro_dev);
+
+        *self.multi_bucket_failover.lock() = new_multi;
+        *self.kiro_dev_failover.lock() = new_kiro_dev;
+
+        if let Err(err) = self.persist_bucket_failover(new_multi, new_kiro_dev) {
+            *self.multi_bucket_failover.lock() = previous_multi;
+            *self.kiro_dev_failover.lock() = previous_kiro_dev;
+            return Err(err);
+        }
+
+        tracing::info!(
+            "多桶开关已更新: multi_bucket_failover={} kiro_dev_failover={}",
+            new_multi,
+            new_kiro_dev
         );
         Ok(())
     }
