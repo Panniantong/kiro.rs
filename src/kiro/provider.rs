@@ -11,7 +11,7 @@ use reqwest::{Client, header::RETRY_AFTER};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -30,6 +30,9 @@ const MAX_TOTAL_RETRIES: usize = 9;
 
 /// 上游失败日志中的 body 摘要最大字符数。
 const BODY_SUMMARY_MAX_CHARS: usize = 512;
+
+/// 伪 403 判定窗口：最近该窗口内被 429 过的凭据，再次收到 403 按"限速升级"处理。
+const RECENT_THROTTLE_WINDOW: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpstreamFailureClass {
@@ -107,6 +110,10 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 凭据当前粘住的桶（仅 kiro.dev 会粘；缺省即主桶 `AmazonQ`）。进程内存，重启即复位。
+    sticky_bucket: Mutex<HashMap<u64, Bucket>>,
+    /// 凭据最近一次被限速（429）的时刻，用于伪 403 判定。进程内存，重启即复位。
+    recently_throttled: Mutex<HashMap<u64, Instant>>,
 }
 
 pub type KiroByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
@@ -234,6 +241,8 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            sticky_bucket: Mutex::new(HashMap::new()),
+            recently_throttled: Mutex::new(HashMap::new()),
         }
     }
 
@@ -279,6 +288,131 @@ impl KiroProvider {
 
     fn credential_import_note(credentials: &KiroCredentials) -> &str {
         credentials.import_note.as_deref().unwrap_or("")
+    }
+
+    // ===== 限速桶（炸弹号在限速类失败时按桶换宿主重试） =====
+
+    /// 读取某凭据当前 sticky 的桶（缺省主桶 `AmazonQ`）。
+    fn sticky_bucket_of(&self, id: u64) -> Bucket {
+        self.sticky_bucket
+            .lock()
+            .get(&id)
+            .copied()
+            .unwrap_or(Bucket::AmazonQ)
+    }
+
+    /// 设置某凭据 sticky 的桶。复位主桶时直接从表里移除（缺省即 `AmazonQ`，保持表精简）。
+    fn set_bucket(&self, id: u64, bucket: Bucket) {
+        match bucket {
+            Bucket::AmazonQ => {
+                self.sticky_bucket.lock().remove(&id);
+            }
+            other => {
+                self.sticky_bucket.lock().insert(id, other);
+            }
+        }
+    }
+
+    /// 成功后固定 sticky 桶：仅 kiro.dev 粘住；两个 AWS 桶都复位为主桶 `AmazonQ`
+    /// （sticky 语义只区分「是否 pin 在 kiro.dev」，CodeWhisperer 只作故障转移、不作主桶）。
+    fn pin_bucket_on_success(&self, id: u64, bucket: Bucket) {
+        let pin = if bucket == Bucket::KiroDev {
+            Bucket::KiroDev
+        } else {
+            Bucket::AmazonQ
+        };
+        self.set_bucket(id, pin);
+    }
+
+    /// 记录某凭据最近一次被限速（429）的时刻。
+    fn record_throttle(&self, id: u64) {
+        self.recently_throttled.lock().insert(id, Instant::now());
+    }
+
+    /// 某凭据是否在 [`RECENT_THROTTLE_WINDOW`] 内被限速过（用于伪 403 判定）。
+    fn recently_throttled(&self, id: u64) -> bool {
+        self.recently_throttled
+            .lock()
+            .get(&id)
+            .map(|t| t.elapsed() < RECENT_THROTTLE_WINDOW)
+            .unwrap_or(false)
+    }
+
+    /// 计算本次请求的限速桶尝试顺序（炸弹号专属；普通号恒为主桶）。
+    fn bucket_order(
+        &self,
+        endpoint: &dyn KiroEndpoint,
+        credentials: &KiroCredentials,
+        id: u64,
+    ) -> Vec<Bucket> {
+        let failover = endpoint.failover_buckets();
+        if failover.is_empty() {
+            return vec![Bucket::AmazonQ];
+        }
+
+        let sticky = self.sticky_bucket_of(id);
+        let mut order = vec![Bucket::AmazonQ];
+
+        if failover.contains(&Bucket::CodeWhisperer)
+            && self.token_manager.get_multi_bucket_failover()
+            && !credentials.is_api_key_credential()
+        {
+            order.push(Bucket::CodeWhisperer);
+        }
+
+        if failover.contains(&Bucket::KiroDev)
+            && self.token_manager.get_kiro_dev_failover()
+            && (sticky == Bucket::KiroDev || self.token_manager.available_count() >= 2)
+        {
+            order.push(Bucket::KiroDev);
+        }
+
+        // 已 pin 在 kiro.dev：排到最前，失败再按 anti-stranding 顺序回落 q. → codewhisperer.
+        if sticky == Bucket::KiroDev {
+            order.sort_by_key(|b| match b {
+                Bucket::KiroDev => 0,
+                Bucket::AmazonQ => 1,
+                Bucket::CodeWhisperer => 2,
+            });
+        }
+        order
+    }
+
+    /// 判断一次"不换账号、只换桶"的重试是否值得做。
+    ///
+    /// - 401：真凭据失效，换桶无意义。
+    /// - 400：多为请求/配置问题；但上游把"模型无效"也放 400 时，换桶可能命中（
+    ///   codewhisperer 对模型白名单更宽）。
+    /// - 403：只在最近被 429 过时视为"限速升级"（伪 403）才换。
+    /// - 429 / 传输错误 / 5xx：换。
+    fn should_switch_bucket(
+        &self,
+        current: Bucket,
+        status: Option<u16>,
+        body: &str,
+        id: u64,
+    ) -> bool {
+        let recently_throttled = self.recently_throttled(id);
+        match current {
+            // kiro.dev 兜底桶任何失败都回落（anti-stranding，避免永久卡死坏网关）
+            Bucket::KiroDev => true,
+            _ => match status {
+                None => true,
+                Some(429) => true,
+                Some(401) => false,
+                Some(403) => recently_throttled,
+                Some(400) => Self::is_invalid_model_error(body),
+                Some(code) if code >= 500 => true,
+                _ => false,
+            },
+        }
+    }
+
+    /// 上游把"模型无效"也归到 400 时的识别。
+    fn is_invalid_model_error(body: &str) -> bool {
+        body.contains("not support the model")
+            || body.contains("modelId")
+            || body.contains("Invalid model")
     }
 
     /// 发送非流式 API 请求
@@ -619,6 +753,8 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 炸弹号本次请求内的换桶进度（凭据 id -> 已试到第几个桶）。新请求都从主桶开始。
+        let mut bucket_hops: HashMap<u64, usize> = HashMap::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -682,12 +818,30 @@ impl KiroProvider {
                 }
             };
 
+            // 炸弹号才按桶换宿主；普通号恒为主桶，保持既有行为。
+            let bucket = if ctx.credentials.boom {
+                let order = self.bucket_order(&*endpoint, &ctx.credentials, ctx.id);
+                let hop = bucket_hops.get(&ctx.id).copied().unwrap_or(0);
+                let bucket = order.get(hop).copied().unwrap_or(Bucket::AmazonQ);
+                if bucket != Bucket::AmazonQ {
+                    tracing::debug!(
+                        credential_id = ctx.id,
+                        bucket = bucket.label(),
+                        hop,
+                        "炸弹号本次尝试使用非主桶"
+                    );
+                }
+                bucket
+            } else {
+                Bucket::AmazonQ
+            };
+
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
-                bucket: Bucket::AmazonQ,
+                bucket,
             };
 
             let url = endpoint.api_url(&rctx);
@@ -733,6 +887,25 @@ impl KiroProvider {
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     self.token_manager
                         .report_attempt_finished_without_success(ctx.id);
+
+                    // 炸弹号：传输错误换桶重试（不换账号、不冷却）
+                    if ctx.credentials.boom {
+                        let order = self.bucket_order(&*endpoint, &ctx.credentials, ctx.id);
+                        let next_hop = bucket_hops.get(&ctx.id).copied().unwrap_or(0) + 1;
+                        if next_hop < order.len() {
+                            bucket_hops.insert(ctx.id, next_hop);
+                            tracing::debug!(
+                                credential_id = ctx.id,
+                                to_bucket = order[next_hop].label(),
+                                "炸弹号传输错误，换桶重试"
+                            );
+                            if attempt_number < max_retries {
+                                sleep(Self::retry_delay(attempt)).await;
+                            }
+                            continue;
+                        }
+                    }
+
                     last_error = Some(e.into());
                     if attempt_number < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -765,6 +938,8 @@ impl KiroProvider {
                 if report_success_on_headers {
                     self.token_manager.report_success(ctx.id);
                 }
+                bucket_hops.remove(&ctx.id);
+                self.pin_bucket_on_success(ctx.id, bucket);
                 return Ok((response, ctx.id));
             }
 
@@ -792,6 +967,33 @@ impl KiroProvider {
                 error_message: None,
             });
             let detail = format!("{} {}", status, body);
+
+            // 炸弹号：限速类失败（429 / 伪 403 / 400-invalid-model / 5xx）优先换桶重试，
+            // 不换账号、不冷却、不计失败。这是 boom 与普通号的唯一行为差异。
+            if ctx.credentials.boom && self.should_switch_bucket(bucket, Some(status.as_u16()), &body, ctx.id)
+            {
+                let order = self.bucket_order(&*endpoint, &ctx.credentials, ctx.id);
+                let next_hop = bucket_hops.get(&ctx.id).copied().unwrap_or(0) + 1;
+                if next_hop < order.len() {
+                    if status.as_u16() == 429 {
+                        self.record_throttle(ctx.id);
+                    }
+                    bucket_hops.insert(ctx.id, next_hop);
+                    tracing::info!(
+                        credential_id = ctx.id,
+                        import_note = %Self::credential_import_note(&ctx.credentials),
+                        upstream_status = status.as_u16(),
+                        to_bucket = order[next_hop].label(),
+                        "炸弹号限速类失败，换桶重试"
+                    );
+                    self.token_manager
+                        .report_attempt_finished_without_success(ctx.id);
+                    if attempt_number < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
+                    continue;
+                }
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if is_quota_exhausted {
@@ -1647,5 +1849,204 @@ mod tests {
 
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.entries[0].current_rpm, 1);
+    }
+
+    // ===== 限速桶 / 炸弹号 =====
+
+    fn oauth_credential(boom: bool) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t".to_string());
+        cred.expires_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        cred.boom = boom;
+        cred
+    }
+
+    /// 声明支持两个独立桶的测试端点（host 用桶区分）。
+    struct FailoverTestEndpoint {
+        base_url: String,
+    }
+
+    impl KiroEndpoint for FailoverTestEndpoint {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn failover_buckets(&self) -> &'static [Bucket] {
+            &[Bucket::CodeWhisperer, Bucket::KiroDev]
+        }
+
+        fn api_url(&self, ctx: &RequestContext<'_>) -> String {
+            format!("{}?bucket={}", self.base_url, ctx.bucket.label())
+        }
+
+        fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
+            self.api_url(ctx)
+        }
+
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("x-test-token", ctx.token)
+        }
+
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("x-test-token", ctx.token)
+        }
+
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    fn failover_provider(manager: Arc<MultiTokenManager>) -> KiroProvider {
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(FailoverTestEndpoint { base_url: "http://x".into() }),
+        );
+        KiroProvider::with_proxy(manager, None, endpoints, "test".into())
+    }
+
+    /// 非炸弹号：即便开关全开，桶序也只有主桶（行为完全不变）。
+    #[tokio::test]
+    async fn test_bucket_order_normal_credential_stays_main_bucket() {
+        let mut config = Config::default();
+        config.multi_bucket_failover = true;
+        config.kiro_dev_failover = true;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![oauth_credential(false)], None, None, false)
+                .unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            Arc::new(TestEndpoint { base_url: "http://x".into() }),
+        );
+        let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
+
+        let ep = provider.endpoint_for(&KiroCredentials::default()).unwrap();
+        let order = provider.bucket_order(&*ep, &KiroCredentials::default(), 1);
+        assert_eq!(order, vec![Bucket::AmazonQ]);
+    }
+
+    /// 炸弹号 + 多桶开关开：桶序含 CodeWhisperer。
+    #[tokio::test]
+    async fn test_bucket_order_boom_with_multi_bucket_enabled_includes_codewhisperer() {
+        let mut config = Config::default();
+        config.multi_bucket_failover = true;
+        config.kiro_dev_failover = false;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![oauth_credential(true)], None, None, false)
+                .unwrap(),
+        );
+        let provider = failover_provider(manager.clone());
+
+        let ep = provider.endpoint_for(&KiroCredentials::default()).unwrap();
+        let order = provider.bucket_order(&*ep, &oauth_credential(true), 1);
+        assert_eq!(order, vec![Bucket::AmazonQ, Bucket::CodeWhisperer]);
+    }
+
+    /// 炸弹号 + 多桶关、kiro.dev 开：桶序含 kiro.dev（需要池内至少 2 个可用号）。
+    #[tokio::test]
+    async fn test_bucket_order_boom_with_kiro_dev_enabled_includes_kiro_dev() {
+        let mut config = Config::default();
+        config.multi_bucket_failover = false;
+        config.kiro_dev_failover = true;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![oauth_credential(true), oauth_credential(true)],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let provider = failover_provider(manager.clone());
+
+        let ep = provider.endpoint_for(&KiroCredentials::default()).unwrap();
+        let order = provider.bucket_order(&*ep, &oauth_credential(true), 1);
+        assert_eq!(order, vec![Bucket::AmazonQ, Bucket::KiroDev]);
+    }
+
+    /// 换桶判定：429 换、401 不换、5xx 换、普通 403 不换（除非近期被限速）。
+    #[test]
+    fn test_should_switch_bucket_semantics() {
+        let config = Config::default();
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+        let provider = failover_provider(manager);
+
+        assert!(provider.should_switch_bucket(Bucket::AmazonQ, Some(429), "", 1));
+        assert!(!provider.should_switch_bucket(Bucket::AmazonQ, Some(401), "", 1));
+        assert!(provider.should_switch_bucket(Bucket::AmazonQ, Some(500), "", 1));
+        assert!(!provider.should_switch_bucket(Bucket::AmazonQ, Some(403), "", 1));
+        assert!(provider.should_switch_bucket(Bucket::AmazonQ, None, "", 1));
+
+        // 近期被 429 过的 403 → 伪 403，换桶
+        provider.record_throttle(1);
+        assert!(provider.should_switch_bucket(Bucket::AmazonQ, Some(403), "", 1));
+    }
+
+    /// 端到端：炸弹号在主桶 429 后换到 codewhisperer 桶成功，且不产生失败计数。
+    #[tokio::test]
+    async fn test_boom_switches_bucket_on_429_and_succeeds() {
+        // 监听 2 个入口：主桶返回 429，第二桶返回 200。
+        let main_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let main_addr = main_listener.local_addr().unwrap();
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second_listener.local_addr().unwrap();
+
+        async fn r429() -> axum::http::StatusCode { axum::http::StatusCode::TOO_MANY_REQUESTS }
+        async fn ok() -> &'static str { "{\"ok\":true}" }
+        tokio::spawn(async move { axum::serve(main_listener, Router::new().route("/api", post(r429))).await.unwrap(); });
+        tokio::spawn(async move { axum::serve(second_listener, Router::new().route("/api", post(ok))).await.unwrap(); });
+
+        // 自定义端点：主桶指向 main，第二桶指向 second（用桶区分 host）
+        struct BucketTestEndpoint { main: String, second: String }
+        impl KiroEndpoint for BucketTestEndpoint {
+            fn name(&self) -> &'static str { "test" }
+            fn failover_buckets(&self) -> &'static [Bucket] { &[Bucket::CodeWhisperer] }
+            fn api_url(&self, ctx: &RequestContext<'_>) -> String {
+                match ctx.bucket {
+                    Bucket::AmazonQ => format!("http://{}/api", self.main),
+                    _ => format!("http://{}/api", self.second),
+                }
+            }
+            fn mcp_url(&self, ctx: &RequestContext<'_>) -> String { self.api_url(ctx) }
+            fn decorate_api(&self, req: reqwest::RequestBuilder, ctx: &RequestContext<'_>) -> reqwest::RequestBuilder {
+                req.header("x-test-token", ctx.token)
+            }
+            fn decorate_mcp(&self, req: reqwest::RequestBuilder, ctx: &RequestContext<'_>) -> reqwest::RequestBuilder {
+                req.header("x-test-token", ctx.token)
+            }
+            fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String { body.to_string() }
+        }
+
+        let mut config = Config::default();
+        config.multi_bucket_failover = true;
+        config.kiro_dev_failover = false;
+
+        let mut cred = oauth_credential(true);
+        cred.priority = 0;
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("test".to_string(), Arc::new(BucketTestEndpoint {
+            main: main_addr.to_string(), second: second_addr.to_string(),
+        }));
+        let provider = KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
+
+        let response = provider.call_api("{}").await.unwrap();
+        assert_eq!(response.status(), 200);
+        // 炸弹号换桶成功不产生失败计数，也没有 429 冷却
+        assert_eq!(manager.snapshot().entries[0].failure_count, 0);
+        assert_eq!(manager.snapshot().entries[0].success_count, 1);
     }
 }

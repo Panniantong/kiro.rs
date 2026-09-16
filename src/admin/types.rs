@@ -491,6 +491,10 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 炸弹号（可选，默认 false）。炸弹号在限速类失败时按桶换宿主重试。
+    #[serde(default)]
+    pub boom: bool,
 }
 
 fn default_auth_method() -> String {
@@ -620,6 +624,9 @@ pub struct BatchUpdateCredentialsRequest {
     /// 新优先级；缺省表示不修改。
     #[serde(default)]
     pub priority: Option<u32>,
+    /// 炸弹号标记；缺省表示不修改。
+    #[serde(default)]
+    pub boom: Option<bool>,
 }
 
 /// 全局默认 RPM 响应

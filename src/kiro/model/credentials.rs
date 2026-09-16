@@ -171,6 +171,13 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm: Option<u32>,
+
+    /// 炸弹号（默认为 false）。
+    ///
+    /// 炸弹号在限速类失败时按桶换宿主重试（q. → codewhisperer. → kiro.dev），
+    /// 其他账号不受影响。只影响调度行为，不影响 Token 刷新与持久化。
+    #[serde(default)]
+    pub boom: bool,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -410,6 +417,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
+            boom: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -544,6 +552,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
+            boom: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -580,6 +589,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
+            boom: false,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -699,6 +709,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             rpm: None,
+            boom: false,
         };
 
         let json = original.to_pretty_json().unwrap();

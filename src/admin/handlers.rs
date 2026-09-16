@@ -414,6 +414,7 @@ pub async fn batch_update_credentials(
         &payload.ids,
         payload.import_note,
         payload.priority,
+        payload.boom,
     ) {
         Ok(count) => Json(SuccessResponse::new(format!("已更新 {} 个凭据", count))).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),

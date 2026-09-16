@@ -2617,6 +2617,7 @@ impl AdminService {
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             rpm: None,
+            boom: req.boom,
         };
 
         let should_check_pool =
@@ -2874,12 +2875,13 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))
     }
 
-    /// 批量更新多个凭据的备注和/或优先级。
+    /// 批量更新多个凭据的备注、优先级和/或炸弹号标记。
     pub fn batch_update_credentials(
         &self,
         ids: &[u64],
         import_note: Option<String>,
         priority: Option<u32>,
+        boom: Option<bool>,
     ) -> Result<usize, AdminServiceError> {
         if ids.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
@@ -2889,13 +2891,13 @@ impl AdminService {
         let import_note = import_note
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        if import_note.is_none() && priority.is_none() {
+        if import_note.is_none() && priority.is_none() && boom.is_none() {
             return Err(AdminServiceError::InvalidCredential(
-                "备注和优先级至少需要提供一项".to_string(),
+                "备注、优先级和炸弹号至少需要提供一项".to_string(),
             ));
         }
         self.token_manager
-            .batch_update_credentials(ids, import_note, priority)
+            .batch_update_credentials(ids, import_note, priority, boom)
             .map_err(|error| {
                 let message = error.to_string();
                 if message.contains("凭据不存在") || message.contains("至少需要") {

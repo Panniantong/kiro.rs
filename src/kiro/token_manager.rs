@@ -1012,6 +1012,9 @@ pub struct CredentialEntrySnapshot {
     pub endpoint: Option<String>,
     /// 凭据级 RPM 配置原值（None 表示跟随全局默认）
     pub rpm: Option<u32>,
+    /// 是否炸弹号（限速类失败时按桶换宿主重试）
+    #[serde(default)]
+    pub boom: bool,
     /// 有效 RPM 上限（凭据级优先，回退全局默认；None 表示不限制）
     pub effective_rpm: Option<u32>,
     /// 是否跟随全局默认（凭据级未单独配置 rpm）
@@ -2621,6 +2624,7 @@ impl MultiTokenManager {
                     disabled_at: e.credentials.disabled_at.clone(),
                     endpoint: e.credentials.endpoint.clone(),
                     rpm: e.credentials.rpm,
+                    boom: e.credentials.boom,
                     effective_rpm,
                     rpm_follows_default,
                     current_rpm,
@@ -2742,18 +2746,19 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 批量更新凭据备注和/或优先级；先校验全部 ID，再一次性持久化。
+    /// 批量更新凭据备注、优先级和/或炸弹号标记；先校验全部 ID，再一次性持久化。
     pub fn batch_update_credentials(
         &self,
         ids: &[u64],
         import_note: Option<String>,
         priority: Option<u32>,
+        boom: Option<bool>,
     ) -> anyhow::Result<usize> {
         if ids.is_empty() {
             bail!("至少需要一个凭据 ID");
         }
-        if import_note.is_none() && priority.is_none() {
-            bail!("备注和优先级至少需要提供一项");
+        if import_note.is_none() && priority.is_none() && boom.is_none() {
+            bail!("备注、优先级和炸弹号至少需要提供一项");
         }
 
         let target_ids: HashSet<u64> = ids.iter().copied().collect();
@@ -2779,6 +2784,9 @@ impl MultiTokenManager {
                 }
                 if let Some(value) = priority {
                     entry.credentials.priority = value;
+                }
+                if let Some(value) = boom {
+                    entry.credentials.boom = value;
                 }
             }
         }
@@ -3217,6 +3225,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.boom = new_cred.boom;
         if initial_disabled {
             validated_cred.disabled_at = Some(chrono::Utc::now().to_rfc3339());
         } else {
@@ -5350,7 +5359,7 @@ mod tests {
 
         assert_eq!(
             manager
-                .batch_update_credentials(&[1, 2], Some("same-group".to_string()), Some(3))
+                .batch_update_credentials(&[1, 2], Some("same-group".to_string()), Some(3), None)
                 .unwrap(),
             2
         );
@@ -5368,7 +5377,7 @@ mod tests {
         // 任一 ID 不存在时整批失败，已有账号不应被部分更新。
         assert!(
             manager
-                .batch_update_credentials(&[1, 999], Some("must-not-apply".to_string()), None)
+                .batch_update_credentials(&[1, 999], Some("must-not-apply".to_string()), None, None)
                 .is_err()
         );
         assert_eq!(
@@ -5382,7 +5391,7 @@ mod tests {
                 .as_deref(),
             Some("same-group")
         );
-        assert!(manager.batch_update_credentials(&[1], None, None).is_err());
+        assert!(manager.batch_update_credentials(&[1], None, None, None).is_err());
 
         std::fs::remove_file(path).unwrap();
     }
