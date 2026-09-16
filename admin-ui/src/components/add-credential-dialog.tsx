@@ -33,6 +33,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [endpoint, setEndpoint] = useState('')
+  const [boom, setBoom] = useState(false)
 
   const { mutate, isPending } = useAddCredential()
 
@@ -50,6 +51,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUsername('')
     setProxyPassword('')
     setEndpoint('')
+    setBoom(false)
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -90,6 +92,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
         endpoint: endpoint.trim() || undefined,
+        boom: boom || undefined,
       },
       {
         onSuccess: (data) => {
@@ -276,6 +279,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
               </p>
             </div>
+
+            {/* 炸弹号 */}
+            <label className="flex items-start gap-3 rounded-md border border-input p-3">
+              <input
+                type="checkbox"
+                checked={boom}
+                onChange={(e) => setBoom(e.target.checked)}
+                disabled={isPending}
+                className="mt-0.5 h-4 w-4 rounded border-input"
+              />
+              <div className="space-y-1">
+                <span className="text-sm font-medium">炸弹号</span>
+                <p className="text-xs text-muted-foreground">
+                  炸弹号被限速时会在多个独立入口间自动重试（换宿主不换账号），
+                  适合用来顶住高频调用；普通号行为不受影响。
+                </p>
+              </div>
+            </label>
 
             {/* 代理配置 */}
             <div className="space-y-2">

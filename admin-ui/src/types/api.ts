@@ -50,6 +50,8 @@ export interface CredentialStatusItem {
   throttled1h: number
   // AWS 侧超额状态（ENABLED / DISABLED；null/缺省 = 未知）
   overageStatus?: string | null
+  /** 炸弹号：限速类失败时按桶换宿主重试。 */
+  boom?: boolean
 }
 
 // 余额响应
@@ -146,6 +148,7 @@ export interface BatchUpdateCredentialsRequest {
   ids: number[]
   importNote?: string
   priority?: number
+  boom?: boolean
 }
 
 // 添加凭据请求
@@ -167,6 +170,8 @@ export interface AddCredentialRequest {
   kiroApiKey?: string
   endpoint?: string
   importNote?: string
+  /** 炸弹号：限速类失败时按桶换宿主重试。 */
+  boom?: boolean
 }
 
 export interface ProxyPoolEligibility {

@@ -27,21 +27,24 @@ export function BatchEditDialog({
 }: BatchEditDialogProps) {
   const [importNote, setImportNote] = useState('')
   const [priority, setPriority] = useState('')
+  const [boom, setBoom] = useState<'unchanged' | 'on' | 'off'>('unchanged')
   const batchUpdate = useBatchUpdateCredentials()
 
   useEffect(() => {
     if (open) {
       setImportNote('')
       setPriority('')
+      setBoom('unchanged')
     }
   }, [open])
 
   const submit = () => {
     const note = importNote.trim()
     const parsedPriority = priority.trim() === '' ? undefined : Number(priority)
+    const boomValue = boom === 'unchanged' ? undefined : boom === 'on'
 
-    if (!note && parsedPriority === undefined) {
-      toast.error('请至少填写备注或优先级')
+    if (!note && parsedPriority === undefined && boomValue === undefined) {
+      toast.error('请至少填写备注、优先级或炸弹号')
       return
     }
     if (parsedPriority !== undefined && (!Number.isInteger(parsedPriority) || parsedPriority < 0)) {
@@ -54,6 +57,7 @@ export function BatchEditDialog({
         ids: credentialIds,
         importNote: note || undefined,
         priority: parsedPriority,
+        boom: boomValue,
       },
       {
         onSuccess: (result) => {
@@ -97,6 +101,19 @@ export function BatchEditDialog({
               placeholder="留空则不修改"
             />
             <span className="text-xs text-muted-foreground">数字越小优先级越高。</span>
+          </label>
+          <label className="block space-y-2">
+            <span className="text-sm font-medium">炸弹号</span>
+            <select
+              value={boom}
+              onChange={event => setBoom(event.target.value as 'unchanged' | 'on' | 'off')}
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <option value="unchanged">不修改</option>
+              <option value="on">设为炸弹号</option>
+              <option value="off">取消炸弹号</option>
+            </select>
+            <span className="text-xs text-muted-foreground">炸弹号被限速时会在多个独立入口间自动重试。</span>
           </label>
         </div>
         <DialogFooter>
