@@ -100,6 +100,9 @@ export function CredentialCompactTable({
                       <Badge variant="outline">{authLabel(credential.authMethod)}</Badge>
                       <Badge variant="outline">{balance?.subscriptionTitle || credential.subscriptionTitle || '订阅未知'}</Badge>
                       {credential.isCurrent && <Badge variant="success">当前</Badge>}
+                      {credential.boom && (
+                        <Badge className="bg-orange-500 text-white hover:bg-orange-500">炸弹号</Badge>
+                      )}
                     </div>
                   </td>
                   <td className="px-3 py-3 align-top">

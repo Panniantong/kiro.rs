@@ -291,6 +291,11 @@ export function CredentialCard({
                      credential.authMethod}
                   </Badge>
                 )}
+                {credential.boom && (
+                  <Badge className="bg-orange-500 text-white hover:bg-orange-500">
+                    炸弹号
+                  </Badge>
+                )}
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
