@@ -335,6 +335,7 @@ impl AdminService {
                     balance_error_class: balance_probe.error_class,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     rpm: entry.rpm,
+                    boom: entry.boom,
                     effective_rpm: entry.effective_rpm,
                     rpm_follows_default: entry.rpm_follows_default,
                     current_rpm: entry.current_rpm,

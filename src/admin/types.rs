@@ -87,6 +87,9 @@ pub struct CredentialStatusItem {
     pub endpoint: String,
     /// 凭据级 RPM 配置原值（None 表示跟随全局默认）
     pub rpm: Option<u32>,
+    /// 是否炸弹号（限速类失败时按桶换宿主重试）
+    #[serde(default)]
+    pub boom: bool,
     /// 有效 RPM 上限（凭据级优先，回退全局默认；None 表示不限制）
     pub effective_rpm: Option<u32>,
     /// 是否跟随全局默认（凭据级未单独配置 rpm）
