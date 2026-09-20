@@ -129,14 +129,19 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        let pin = self.token_manager.get_pin_channel();
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        // pin 时：重试收敛到本凭据（最多 MAX_RETRIES_PER_CREDENTIAL 次）
+        let max_retries = match pin {
+            Some(_) => MAX_RETRIES_PER_CREDENTIAL,
+            None => (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES),
+        };
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self.token_manager.acquire_context(None, pin).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -342,8 +347,13 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
+        let pin = self.token_manager.get_pin_channel();
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        // pin 时：重试收敛到本凭据（最多 MAX_RETRIES_PER_CREDENTIAL 次）
+        let max_retries = match pin {
+            Some(_) => MAX_RETRIES_PER_CREDENTIAL,
+            None => (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES),
+        };
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -353,7 +363,11 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), pin)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     // RPM 全限：立即终止重试，交由 HTTP 层映射为通用上游不可用。

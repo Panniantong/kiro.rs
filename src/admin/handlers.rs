@@ -11,7 +11,8 @@ use super::{
     types::{
         AddCredentialRequest, BatchSetRpmRequest, SetArmorBreakingRequest, SetDefaultRpmRequest,
         SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
-        SetOveragePassthroughRequest, SetPriorityRequest, SetRpmRequest, SuccessResponse,
+        SetOveragePassthroughRequest, SetPinChannelRequest, SetPriorityRequest, SetRpmRequest,
+        SuccessResponse,
     },
 };
 
@@ -241,6 +242,25 @@ pub async fn set_max_relay(
     Json(payload): Json<SetMaxRelayRequest>,
 ) -> impl IntoResponse {
     match state.service.set_max_relay(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/pin-channel
+/// 获取当前固定的凭据 ID
+pub async fn get_pin_channel(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_pin_channel();
+    Json(response)
+}
+
+/// PUT /api/admin/config/pin-channel
+/// 设置固定的凭据 ID（null = 解除固定）
+pub async fn set_pin_channel(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetPinChannelRequest>,
+) -> impl IntoResponse {
+    match state.service.set_pin_channel(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

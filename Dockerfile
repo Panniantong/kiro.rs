@@ -9,8 +9,10 @@ RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
 
-# Limit cargo build parallelism on the production host.
-ENV CARGO_BUILD_JOBS=24
+# Limit cargo build parallelism on the production host (override via
+# --build-arg CARGO_BUILD_JOBS=N to throttle builds on shared hosts).
+ARG CARGO_BUILD_JOBS=24
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 RUN apk add --no-cache musl-dev perl make
 

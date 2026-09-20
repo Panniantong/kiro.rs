@@ -466,6 +466,18 @@ enum SelectOutcome {
     NoneAvailable,
 }
 
+/// Pin 路径选号结果
+enum PinnedAcquire {
+    /// 可用（已预留本次尝试名额）
+    Ready(u64, KiroCredentials),
+    /// 凭据被禁用或不存在（立即报错，不轮询、不跳号）
+    Unavailable,
+    /// 凭据在冷却中（原地轮询等待）
+    CoolingDown,
+    /// 凭据本分钟 RPM 已满
+    AllRateLimited { retry_after_secs: u64 },
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -597,6 +609,10 @@ pub struct MultiTokenManager {
     overage_passthrough: Mutex<bool>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
+    /// 固定凭据 ID（整个服务只用该凭据；None = 正常选号）
+    ///
+    /// 不持久化：热改仅当前进程生效，重启后恢复为启动配置值（缺省 None）。
+    pin_channel: Mutex<Option<u64>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -737,6 +753,7 @@ impl MultiTokenManager {
         let armor_breaking = config.armor_breaking;
         let overage_passthrough = config.overage_passthrough;
         let max_relay = config.max_relay.clone();
+        let pin_channel = config.pin_channel;
         let manager = Self {
             config,
             proxy,
@@ -750,9 +767,19 @@ impl MultiTokenManager {
             armor_breaking: Mutex::new(armor_breaking),
             overage_passthrough: Mutex::new(overage_passthrough),
             max_relay: Mutex::new(max_relay),
+            pin_channel: Mutex::new(pin_channel),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
+
+        if let Some(id) = *manager.pin_channel.lock() {
+            tracing::warn!(
+                "启动时启用 Pin channel：凭据 #{}（仅当前进程生效，重启失效）",
+                id
+            );
+        }
+        // 同步透传判定策略到 handlers（config 加载阶段）
+        crate::anthropic::update_relay_strategy(&manager.get_max_relay());
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
         if has_new_ids || has_new_machine_ids {
@@ -1070,10 +1097,19 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        pin: Option<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        // Pin 冷却等待上限：500ms 轮询，最长 60s。
+        // 必须在 retry loop 外初始化，避免每次 continue 重置 deadline。
+        let pin_deadline =
+            pin.map(|_| std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let mut pin_cooling_waited = std::time::Duration::ZERO;
 
         loop {
             if attempt_count >= max_attempts {
@@ -1084,7 +1120,39 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials) = if let Some(pin_id) = pin {
+                // Pin 路径：固定凭据，不负载均衡、不跳号
+                match self.acquire_pinned(pin_id) {
+                    PinnedAcquire::Ready(id, credentials) => (id, credentials),
+                    PinnedAcquire::Unavailable => {
+                        anyhow::bail!("Pinned 凭据 #{} 不可用（disabled/unknown）", pin_id);
+                    }
+                    PinnedAcquire::CoolingDown => {
+                        if let Some(deadline) = pin_deadline {
+                            if std::time::Instant::now() >= deadline {
+                                anyhow::bail!("Pinned 凭据 #{} 冷却未在 60s 内结束", pin_id);
+                            }
+                            pin_cooling_waited += std::time::Duration::from_millis(500);
+                            tracing::warn!(
+                                "Pinned 凭据 #{} 冷却中，等待恢复（已等 {}ms）",
+                                pin_id,
+                                pin_cooling_waited.as_millis()
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        anyhow::bail!("Pinned 凭据 #{} 冷却中且无法等待", pin_id);
+                    }
+                    PinnedAcquire::AllRateLimited { retry_after_secs } => {
+                        tracing::warn!(
+                            "Pinned 凭据 #{} 已达 RPM 上限，返回限流错误（建议 {}s 后重试）",
+                            pin_id,
+                            retry_after_secs
+                        );
+                        return Err(AllRateLimitedError { retry_after_secs }.into());
+                    }
+                }
+            } else {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
@@ -1191,6 +1259,28 @@ impl MultiTokenManager {
                     }
                 }
             }
+        }
+    }
+
+    /// 选择 Pin 凭据（不 fallback、不跳号）
+    fn acquire_pinned(&self, pin_id: u64) -> PinnedAcquire {
+        let now = Utc::now();
+        let default_rpm = *self.default_rpm.lock();
+        let mut entries = self.entries.lock();
+        Self::recover_due_cooldowns(&mut entries, now);
+        match entries.iter_mut().find(|e| e.id == pin_id) {
+            None => PinnedAcquire::Unavailable,
+            Some(entry) if entry.disabled => PinnedAcquire::Unavailable,
+            Some(entry) if Self::is_cooling_down(entry, now) => PinnedAcquire::CoolingDown,
+            Some(entry) => match Self::rpm_exceeded_until(entry, default_rpm, now) {
+                Some(until) => PinnedAcquire::AllRateLimited {
+                    retry_after_secs: until.signed_duration_since(now).num_seconds().max(1) as u64,
+                },
+                None => {
+                    Self::reserve_attempt_slot(entry, now);
+                    PinnedAcquire::Ready(entry.id, entry.credentials.clone())
+                }
+            },
         }
     }
 
@@ -2609,6 +2699,34 @@ impl MultiTokenManager {
             cfg.enabled,
             cfg.base_url
         );
+        // 同步透传判定策略到 handlers（热改后即时生效）
+        crate::anthropic::update_relay_strategy(&cfg);
+        Ok(())
+    }
+
+    /// 获取当前固定的凭据 ID（None = 未固定）
+    pub fn get_pin_channel(&self) -> Option<u64> {
+        *self.pin_channel.lock()
+    }
+
+    /// 设置固定凭据 ID（Admin API 热改；None = 解除固定）
+    ///
+    /// 不持久化：仅当前进程生效，重启后恢复为启动配置值（缺省 None）。
+    pub fn set_pin_channel(&self, id: Option<u64>) -> anyhow::Result<()> {
+        if let Some(id) = id {
+            let exists = self.entries.lock().iter().any(|e| e.id == id);
+            if !exists {
+                anyhow::bail!("凭据 #{} 不存在", id);
+            }
+        }
+        *self.pin_channel.lock() = id;
+        match id {
+            Some(id) => tracing::warn!(
+                "Pin channel 已设置：凭据 #{}（仅当前进程生效，重启失效）",
+                id
+            ),
+            None => tracing::warn!("Pin channel 已解除：恢复正常凭据选择"),
+        }
         Ok(())
     }
 }
@@ -2702,11 +2820,11 @@ mod tests {
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
 
-        let first = manager.acquire_context(None).await.unwrap();
+        let first = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(first.id, 1);
         assert!(manager.report_failure(first.id));
 
-        let blocked = match manager.acquire_context(None).await {
+        let blocked = match manager.acquire_context(None, None).await {
             Ok(_) => panic!("expected failed upstream attempt to consume RPM capacity"),
             Err(err) => err.to_string(),
         };
@@ -2728,7 +2846,7 @@ mod tests {
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         let before_success = manager.snapshot();
         assert_eq!(before_success.entries[0].current_rpm, 1);
 
@@ -2748,8 +2866,8 @@ mod tests {
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
 
-        let first = manager.acquire_context(None).await.unwrap();
-        let blocked = match manager.acquire_context(None).await {
+        let first = manager.acquire_context(None, None).await.unwrap();
+        let blocked = match manager.acquire_context(None, None).await {
             Ok(_) => panic!("expected in-flight request to reserve RPM capacity"),
             Err(err) => err.to_string(),
         };
@@ -2760,7 +2878,7 @@ mod tests {
         );
 
         manager.report_attempt_finished_without_success(first.id);
-        let blocked_after_failure = match manager.acquire_context(None).await {
+        let blocked_after_failure = match manager.acquire_context(None, None).await {
             Ok(_) => panic!("expected failed upstream attempt to stay in RPM window"),
             Err(err) => err.to_string(),
         };
@@ -3156,7 +3274,7 @@ mod tests {
             entry.cooldown_until = Some(Utc::now() - Duration::seconds(1));
         }
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(matches!(ctx.id, 1 | 2 | 3));
 
         let snapshot = manager.snapshot();
@@ -3184,7 +3302,7 @@ mod tests {
         assert!(manager.report_rate_limited(1, Some(StdDuration::from_secs(30))));
         assert_eq!(manager.available_count(), 1);
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "t2");
 
@@ -3284,7 +3402,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -3307,7 +3425,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -3353,7 +3471,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()
@@ -3520,7 +3638,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()
@@ -3684,5 +3802,121 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    fn pinned_test_credential(token: &str) -> KiroCredentials {
+        let mut credential = KiroCredentials::default();
+        credential.access_token = Some(token.to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credential
+    }
+
+    #[tokio::test]
+    async fn test_pinned_context_uses_selected_credential_in_balanced_mode() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                pinned_test_credential("token-1"),
+                pinned_test_credential("token-2"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let context = manager.acquire_context(None, Some(2)).await.unwrap();
+        assert_eq!(context.id, 2);
+        assert_eq!(context.token, "token-2");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_context_rejects_unknown_or_disabled_without_fallback() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                pinned_test_credential("token-1"),
+                pinned_test_credential("token-2"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let unknown = match manager.acquire_context(None, Some(99)).await {
+            Ok(_) => panic!("unknown pinned credential must not fall back"),
+            Err(error) => error.to_string(),
+        };
+        assert!(unknown.contains("disabled/unknown"));
+
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .disabled = true;
+        }
+        let disabled = match manager.acquire_context(None, Some(1)).await {
+            Ok(_) => panic!("disabled pinned credential must not fall back"),
+            Err(error) => error.to_string(),
+        };
+        assert!(disabled.contains("disabled/unknown"));
+        assert_eq!(manager.snapshot().entries[1].current_rpm, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pinned_context_returns_rpm_limit_without_fallback() {
+        let mut config = Config::default();
+        config.default_rpm = Some(1);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                pinned_test_credential("token-1"),
+                pinned_test_credential("token-2"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.acquire_context(None, Some(1)).await.unwrap().id, 1);
+        let error = match manager.acquire_context(None, Some(1)).await {
+            Ok(_) => panic!("RPM-limited pinned credential must not fall back"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("每分钟请求上限"));
+        assert_eq!(manager.snapshot().entries[1].current_rpm, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pinned_context_waits_for_cooldown_without_fallback() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                pinned_test_credential("token-1"),
+                pinned_test_credential("token-2"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries
+                .iter_mut()
+                .find(|entry| entry.id == 1)
+                .unwrap()
+                .cooldown_until = Some(Utc::now() + Duration::milliseconds(10));
+        }
+
+        let context = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(context.id, 1);
+        assert_eq!(manager.snapshot().entries[1].current_rpm, 0);
     }
 }

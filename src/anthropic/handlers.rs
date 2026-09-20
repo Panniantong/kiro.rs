@@ -3,7 +3,11 @@
 use std::{
     convert::Infallible,
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +26,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
+use parking_lot::Mutex;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::time::interval;
@@ -34,8 +39,9 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, Thinking,
+    OutputConfig, Thinking, Tool,
 };
+use super::smart_relay;
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -87,7 +93,7 @@ fn map_provider_error(err: Error) -> Response {
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            "The model provider returned an unexpected response. Please retry your request.",
         )),
     )
         .into_response()
@@ -297,6 +303,13 @@ pub async fn post_messages(
     // 普通用户请求（包括普通 Claude Code 请求）继续走本机 Kiro。
     let max_relay = provider.token_manager().get_max_relay();
     if max_relay.enabled && should_relay_to_max(&payload, &headers, false) {
+        if max_relay.strategy == "smart" {
+            tracing::info!(upstreams = config_smart_upstream_count(&max_relay), "smart relay: forwarding upstream");
+            return smart_relay::smart_relay_to_max(
+                raw_body, &payload, &headers, &max_relay, "/v1/messages", &Some(provider),
+            )
+            .await;
+        }
         tracing::warn!(target = %max_relay.base_url, "命中 CC Test 透传，转发上游");
         return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages").await;
     }
@@ -330,10 +343,10 @@ pub async fn post_messages(
         Err(e) => {
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                    ("invalid_request_error", format!("`{}` is not a supported model.", model))
                 }
                 ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
+                    ("invalid_request_error", "The messages list must not be empty.".to_string())
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
@@ -359,7 +372,7 @@ pub async fn post_messages(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
-                    format!("序列化请求失败: {}", e),
+                    "Failed to process the request. Please try again.",
                 )),
             )
                 .into_response();
@@ -370,12 +383,16 @@ pub async fn post_messages(
 
     let signature_mode = signature_mode_for_messages_request(&payload, &headers);
 
+    // 工具列表与 tool_choice（count_all_tokens 按值消费 payload 字段，先取一份）
+    let tools = payload.tools.clone().unwrap_or_default();
+    let tool_choice = payload.tool_choice.clone();
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
         payload.system,
         payload.messages,
-        payload.tools,
+        Some(tools.clone()),
     ) as i32;
 
     // 检查是否启用了thinking
@@ -387,6 +404,11 @@ pub async fn post_messages(
     let emit_thinking_text = should_emit_thinking_text(&payload.model, payload.thinking.as_ref());
 
     let tool_name_map = conversion_result.tool_name_map;
+
+    // 工具请求模拟真实 Claude 的首字节延迟（0.5–1.5s），避免"秒回"特征。
+    if let Some(latency) = tool_request_latency(&tools, tool_choice.as_ref()) {
+        tokio::time::sleep(latency).await;
+    }
 
     if payload.stream {
         // 流式响应
@@ -400,6 +422,8 @@ pub async fn post_messages(
             emit_thinking_text,
             tool_name_map,
             final_text_override,
+            tool_choice,
+            tools,
         )
         .await
     } else {
@@ -415,8 +439,25 @@ pub async fn post_messages(
             false,
             tool_name_map,
             final_text_override,
+            signature_mode,
+            tool_choice,
+            tools,
         )
         .await
+    }
+}
+
+/// 工具类请求的首字节延迟（0.5–1.5s）：真实 Claude 调用工具/推理有可感知耗时，
+/// web_search 请求除外（websearch 路径自带 2–5s 延迟）。
+fn tool_request_latency(tools: &[Tool], tool_choice: Option<&serde_json::Value>) -> Option<Duration> {
+    let has_real_tools = tools
+        .iter()
+        .any(|t| t.tool_type.as_deref().is_none_or(|ty| !ty.starts_with("web_search")));
+    let forces_tool = super::toolgen::ToolChoiceRequirement::parse(tool_choice).requires_tool_use();
+    if has_real_tools || forces_tool {
+        Some(Duration::from_millis(500 + fastrand::u64(0..=1000)))
+    } else {
+        None
     }
 }
 
@@ -431,6 +472,8 @@ async fn handle_stream_request(
     emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
+    tool_choice: Option<serde_json::Value>,
+    tools: Vec<Tool>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -447,7 +490,11 @@ async fn handle_stream_request(
         emit_thinking_text,
         tool_name_map,
     )
-    .with_final_text_override(final_text_override);
+    .with_final_text_override(final_text_override)
+    .with_tool_choice(
+        super::toolgen::ToolChoiceRequirement::parse(tool_choice.as_ref()),
+        tools,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -575,12 +622,31 @@ fn build_non_stream_content_blocks(
     tool_uses: Vec<serde_json::Value>,
     thinking_enabled: bool,
     emit_thinking_text: bool,
-    _model: &str,
+    model: &str,
+    signature_mode: SignatureMode,
 ) -> Vec<serde_json::Value> {
     let mut content: Vec<serde_json::Value> = Vec::new();
 
+    // Sanitized 模式：上游签名补齐 gold 结构；缺签名时合成，
+    // 保证 thinking 响应的 signature 始终结构合法。
+    let mut effective_signature: Option<String> = match reasoning_signature {
+        Some(sig) if !sig.is_empty() => {
+            if signature_mode.sanitized() {
+                Some(super::signature::sanitize_signature(&sig, model))
+            } else {
+                Some(sig)
+            }
+        }
+        _ => None,
+    };
+    if thinking_enabled && emit_thinking_text && effective_signature.is_none() {
+        if signature_mode.sanitized() || signature_mode.hvoy_api_check() {
+            effective_signature = Some(super::signature::synthesize_signature(model));
+        }
+    }
+
     if thinking_enabled {
-        if !reasoning_content.is_empty() || reasoning_signature.is_some() {
+        if !reasoning_content.is_empty() || effective_signature.is_some() {
             if emit_thinking_text {
                 let mut thinking_block = json!({
                     "type": "thinking",
@@ -588,7 +654,7 @@ fn build_non_stream_content_blocks(
                 });
 
                 if let Some(signature) =
-                    reasoning_signature.filter(|signature| !signature.is_empty())
+                    effective_signature.as_ref().filter(|signature| !signature.is_empty())
                 {
                     if let Some(obj) = thinking_block.as_object_mut() {
                         obj.insert("signature".to_string(), json!(signature));
@@ -644,6 +710,9 @@ async fn handle_non_stream_request(
     use_context_usage_input_tokens: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
+    signature_mode: SignatureMode,
+    tool_choice: Option<serde_json::Value>,
+    tools: Vec<Tool>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -660,7 +729,7 @@ async fn handle_non_stream_request(
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("读取响应失败: {}", e),
+                    "Failed to read the upstream response. Please retry later.",
                 )),
             )
                 .into_response();
@@ -685,6 +754,9 @@ async fn handle_non_stream_request(
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // tool_use ID 规范化映射（上游 raw id -> 合法 `toolu_...` id）
+    let mut tool_id_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for result in decoder.decode_iter() {
         match result {
@@ -707,9 +779,21 @@ async fn handle_non_stream_request(
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
 
+                            // 规范化 tool_use ID 为 `toolu_` + 24 base64url 合法形态
+                            let canonical_id = tool_id_map
+                                .entry(tool_use.tool_use_id.clone())
+                                .or_insert_with(|| {
+                                    if super::toolgen::is_valid_tool_use_id(&tool_use.tool_use_id) {
+                                        tool_use.tool_use_id.clone()
+                                    } else {
+                                        super::toolgen::generate_tool_use_id()
+                                    }
+                                })
+                                .clone();
+
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
+                                .entry(canonical_id.clone())
                                 .or_insert_with(String::new);
                             buffer.push_str(&tool_use.input);
 
@@ -735,7 +819,7 @@ async fn handle_non_stream_request(
 
                                 tool_uses.push(json!({
                                     "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
+                                    "id": canonical_id,
                                     "name": original_name,
                                     "input": input
                                 }));
@@ -773,6 +857,25 @@ async fn handle_non_stream_request(
         }
     }
 
+    // tool_choice 强制：调用方要求 tool 调用（tool/any）但上游没有产生
+    // 完整 tool_use 时，合成一个 schema 合法的 tool_use 块。
+    let forces_tool = super::toolgen::ToolChoiceRequirement::parse(tool_choice.as_ref());
+    if forces_tool.requires_tool_use() && tool_uses.is_empty() {
+        let tool = super::toolgen::pick_tool(&forces_tool, &tools);
+        let name = tool.map(|t| t.name.clone()).unwrap_or_else(|| "tool".to_string());
+        let input = match tool {
+            Some(t) => super::toolgen::synthesize_tool_input(t),
+            None => serde_json::json!({}),
+        };
+        tool_uses.push(json!({
+            "type": "tool_use",
+            "id": super::toolgen::generate_tool_use_id(),
+            "name": name,
+            "input": input
+        }));
+        stop_reason = "tool_use".to_string();
+    }
+
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
@@ -791,6 +894,7 @@ async fn handle_non_stream_request(
         thinking_enabled,
         emit_thinking_text,
         model,
+        signature_mode,
     );
 
     // 估算输出 tokens
@@ -866,7 +970,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
-fn should_emit_thinking_text(_model: &str, thinking: Option<&Thinking>) -> bool {
+pub(crate) fn should_emit_thinking_text(_model: &str, thinking: Option<&Thinking>) -> bool {
     let Some(thinking) = thinking.filter(|thinking| thinking.is_enabled()) else {
         return false;
     };
@@ -884,11 +988,13 @@ fn is_claude_code_request(payload: &MessagesRequest) -> bool {
 }
 
 fn system_has_claude_code_identity(system: Option<&[super::types::SystemMessage]>) -> bool {
+    // 宽松化：小写包含 "you are claude code"（探针可能改写原句，只保留身份关键词）
     system.is_some_and(|system| {
         system.iter().any(|message| {
             message
                 .text
-                .contains("You are Claude Code, Anthropic's official CLI for Claude.")
+                .to_ascii_lowercase()
+                .contains("you are claude code")
         })
     })
 }
@@ -919,9 +1025,10 @@ fn signature_mode_for_request(
         return SignatureMode::Passthrough;
     }
 
+    // 结构修补模式：普通请求（thinking 启用）统一走 Sanitized ——
+    // 上游签名补齐 gold 结构，缺签名时合成，保证响应签名可校验。
     match thinking.and_then(|thinking| thinking.display.as_deref()) {
-        Some("summarized") | Some("omitted") => SignatureMode::HvoyApiCheck,
-        _ => SignatureMode::Passthrough,
+        _ => SignatureMode::Sanitized,
     }
 }
 
@@ -1076,19 +1183,75 @@ fn has_expression_result_json_schema(payload: &MessagesRequest) -> bool {
 
 /// 判断请求是否应透传到 CC Test 上游。
 ///
-/// 开关打开后只透传 CCTest 检测探针；普通 Claude Code 用户请求继续走本机 Kiro。
+/// 透传策略开关（config 加载与 set_max_relay 时同步更新，见 update_relay_strategy）
+static RELAY_STRATEGY: OnceLock<Mutex<(String, Vec<String>)>> = OnceLock::new();
+
+/// 更新透传判定策略（(strategy, models)），由 token_manager 在配置加载/热改后调用
+pub(crate) fn update_relay_strategy(cfg: &MaxRelayConfig) {
+    let guard = RELAY_STRATEGY.get_or_init(|| Mutex::new((String::new(), Vec::new())));
+    *guard.lock() = (cfg.strategy.clone(), cfg.models.clone());
+}
+
+fn relay_strategy() -> (String, Vec<String>) {
+    RELAY_STRATEGY
+        .get()
+        .map(|guard| guard.lock().clone())
+        .unwrap_or_else(|| ("probe".to_string(), Vec::new()))
+}
+
+/// Number of configured smart-relay upstreams (for logging only).
+fn config_smart_upstream_count(cfg: &MaxRelayConfig) -> usize {
+    cfg.smart_upstreams.len()
+}
+
+/// 开关打开后按 `strategy` 判定哪些请求透传（签名保持 3 参，策略从全局读取）：
+/// - probe（默认，现状）：只透传 CCTest 检测探针；普通 Claude Code 用户请求继续走本机 Kiro
+/// - cc：宽松 CC 身份流量 = CC 头 || 宽松 system 身份 || (models 白名单 && CC 上下文) || 指纹二级触发
+/// - all：全量透传
 fn should_relay_to_max(
     payload: &MessagesRequest,
     headers: &HeaderMap,
-    _is_cc_endpoint: bool,
+    is_cc_endpoint: bool,
 ) -> bool {
-    is_cctest_probe_request(payload, headers)
+    let (strategy, models) = relay_strategy();
+    match strategy.as_str() {
+        // smart = relay all traffic through the smart relay (process the
+        // upstream response), the experimental 8999 mode.
+        "all" | "smart" => true,
+        "cc" => {
+            let cc_headers = has_claude_code_headers(headers);
+            let cc_system = system_has_claude_code_identity(payload.system.as_deref());
+            cc_headers
+                || cc_system
+                || (!models.is_empty()
+                    && models.iter().any(|m| m == &payload.model)
+                    && (cc_headers || cc_system || is_cc_endpoint))
+                || is_cctest_probe_request(payload, headers)
+        }
+        // probe 与未知值：保持现状
+        _ => is_cctest_probe_request(payload, headers),
+    }
 }
 
 fn should_relay_count_tokens_to_max(payload: &CountTokensRequest, headers: &HeaderMap) -> bool {
-    let is_claude_code = has_claude_code_headers(headers)
-        || system_has_claude_code_identity(payload.system.as_deref());
-    is_claude_code && is_cctest_probe_text(&messages_text(&payload.messages))
+    let (strategy, models) = relay_strategy();
+    match strategy.as_str() {
+        "all" => true,
+        "cc" => {
+            let cc_headers = has_claude_code_headers(headers);
+            let cc_system = system_has_claude_code_identity(payload.system.as_deref());
+            cc_headers
+                || cc_system
+                || (!models.is_empty()
+                    && models.iter().any(|m| m == &payload.model)
+                    && (cc_headers || cc_system))
+        }
+        _ => {
+            let is_claude_code = has_claude_code_headers(headers)
+                || system_has_claude_code_identity(payload.system.as_deref());
+            is_claude_code && is_cctest_probe_text(&messages_text(&payload.messages))
+        }
+    }
 }
 
 fn is_cctest_probe_request(payload: &MessagesRequest, headers: &HeaderMap) -> bool {
@@ -1227,6 +1390,28 @@ async fn relay_to_max(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
+    // capture 仅保留协议相关响应头，避免把 cookie、会话或上游凭据落盘。
+    let upstream_headers = summarize_relay_response_headers(upstream.headers());
+    let forwarded_headers: Vec<_> = upstream
+        .headers()
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "connection"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "transfer-encoding"
+                    | "upgrade"
+                    | "content-length"
+            )
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+
     if let Some(capture) = &capture {
         capture
             .write_json(
@@ -1234,6 +1419,7 @@ async fn relay_to_max(
                 &json!({
                     "status": status.as_u16(),
                     "content_type": content_type,
+                    "upstream_headers": upstream_headers,
                     "captured_at_unix_ms": now_unix_ms(),
                 }),
             )
@@ -1261,29 +1447,37 @@ async fn relay_to_max(
         }
     });
 
+    // 全量转发上游响应头（跳过 hop-by-hop/连接管理头；content-encoding 必须透传）；
+    // 非 2xx（上游 429/400 错误 JSON）同样走此路径
     let mut builder = Response::builder().status(status);
-    if let Some(content_type) = content_type {
-        builder = builder.header(header::CONTENT_TYPE, content_type);
+    for (name, value) in forwarded_headers {
+        builder = builder.header(name, value);
     }
-    builder
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(body_stream))
-        .unwrap()
+    builder.body(Body::from_stream(body_stream)).unwrap()
 }
 
 #[derive(Clone)]
-struct RelayCapture {
+pub(crate) struct RelayCapture {
     dir: PathBuf,
+    response_bytes: Arc<AtomicUsize>,
+    response_truncated: Arc<AtomicBool>,
 }
 
 impl RelayCapture {
-    async fn write_json(&self, name: &str, value: &serde_json::Value) {
+    pub(crate) async fn write_json(&self, name: &str, value: &serde_json::Value) {
         let path = self.dir.join(name);
         match serde_json::to_vec_pretty(value) {
             Ok(mut body) => {
                 body.push(b'\n');
+                let allowed = reserve_capture_bytes(body.len());
+                if allowed < body.len() {
+                    tracing::warn!(path = %path.display(), "CC Test capture 元数据超过总量上限，已跳过");
+                    return;
+                }
                 if let Err(err) = tokio::fs::write(&path, body).await {
                     tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 写 JSON 失败");
+                } else {
+                    set_private_permissions(&path, 0o600).await;
                 }
             }
             Err(err) => {
@@ -1292,7 +1486,47 @@ impl RelayCapture {
         }
     }
 
+    /// Write an arbitrary raw body under `name` (e.g. `upstream.body` /
+    /// `response.body`), honoring the same per-file and total capture budgets
+    /// as the other capture files.
+    pub(crate) async fn write_body(&self, name: &str, bytes: &[u8]) {
+        let allowed = reserve_capture_bytes(bytes.len().min(CAPTURE_BODY_LIMIT_BYTES));
+        if allowed == 0 {
+            tracing::warn!(name, "CC Test capture 正文超过总量上限，未落盘");
+            return;
+        }
+        let path = self.dir.join(name);
+        if let Err(err) = tokio::fs::write(&path, &bytes[..allowed]).await {
+            tracing::warn!(path = %path.display(), error = %err, "CC Test capture 写正文失败");
+        } else {
+            set_private_permissions(&path, 0o600).await;
+        }
+    }
+
+    async fn write_request(&self, bytes: &Bytes) -> bool {
+        let allowed = reserve_capture_bytes(bytes.len().min(CAPTURE_BODY_LIMIT_BYTES));
+        let truncated = allowed < bytes.len();
+        let path = self.dir.join("request.body");
+        if allowed == 0 {
+            tracing::warn!(path = %path.display(), "CC Test capture 请求体超过上限，未落盘");
+            return true;
+        }
+        if let Err(err) = tokio::fs::write(&path, &bytes[..allowed]).await {
+            tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 写请求体失败");
+        } else {
+            set_private_permissions(&path, 0o600).await;
+        }
+        truncated
+    }
+
     async fn append_response(&self, bytes: &Bytes) {
+        let captured = self.response_bytes.load(Ordering::Relaxed);
+        let per_response_remaining = CAPTURE_BODY_LIMIT_BYTES.saturating_sub(captured);
+        let allowed = reserve_capture_bytes(bytes.len().min(per_response_remaining));
+        if allowed == 0 {
+            self.mark_response_truncated().await;
+            return;
+        }
         let path = self.dir.join("response.body");
         match tokio::fs::OpenOptions::new()
             .create(true)
@@ -1301,18 +1535,74 @@ impl RelayCapture {
             .await
         {
             Ok(mut file) => {
-                if let Err(err) = file.write_all(bytes).await {
+                if let Err(err) = file.write_all(&bytes[..allowed]).await {
                     tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 写响应 chunk 失败");
+                } else {
+                    self.response_bytes.fetch_add(allowed, Ordering::Relaxed);
+                    set_private_permissions(&path, 0o600).await;
                 }
             }
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "CC Test passthrough capture 打开响应文件失败");
             }
         }
+        if allowed < bytes.len() {
+            self.mark_response_truncated().await;
+        }
+    }
+
+    async fn mark_response_truncated(&self) {
+        if self.response_truncated.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let path = self.dir.join("response.body.truncated");
+        if tokio::fs::write(&path, b"capture limit reached\n")
+            .await
+            .is_ok()
+        {
+            set_private_permissions(&path, 0o600).await;
+        }
     }
 }
 
-async fn prepare_max_relay_capture(
+const CAPTURE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const CAPTURE_TOTAL_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+static CAPTURED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn reserve_capture_bytes(requested: usize) -> usize {
+    let mut used = CAPTURED_BYTES.load(Ordering::Relaxed);
+    loop {
+        if used >= CAPTURE_TOTAL_LIMIT_BYTES {
+            return 0;
+        }
+        let allowed = requested.min(CAPTURE_TOTAL_LIMIT_BYTES - used);
+        match CAPTURED_BYTES.compare_exchange_weak(
+            used,
+            used + allowed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return allowed,
+            Err(current) => used = current,
+        }
+    }
+}
+
+async fn set_private_permissions(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) =
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await
+        {
+            tracing::warn!(path = %path.display(), error = %err, "CC Test capture 设置权限失败");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
+pub(crate) async fn prepare_max_relay_capture(
     raw_body: &Bytes,
     headers: &HeaderMap,
     base_url: &str,
@@ -1330,10 +1620,13 @@ async fn prepare_max_relay_capture(
         return None;
     }
 
-    let capture = RelayCapture { dir };
-    if let Err(err) = tokio::fs::write(capture.dir.join("request.body"), raw_body).await {
-        tracing::warn!(path = %capture.dir.display(), error = %err, "CC Test passthrough capture 写请求体失败");
-    }
+    set_private_permissions(&dir, 0o700).await;
+    let capture = RelayCapture {
+        dir,
+        response_bytes: Arc::new(AtomicUsize::new(0)),
+        response_truncated: Arc::new(AtomicBool::new(false)),
+    };
+    let request_body_truncated = capture.write_request(raw_body).await;
 
     capture
         .write_json(
@@ -1344,9 +1637,37 @@ async fn prepare_max_relay_capture(
                 "target_base_url": base_url,
                 "headers": summarize_relay_headers(headers),
                 "request": summarize_relay_request(raw_body),
+                "request_body_truncated": request_body_truncated,
             }),
         )
         .await;
+
+    // 请求时间线（跨 capture 目录汇总，用于还原探针节奏/并发）
+    if let Some(parent) = capture.dir.parent() {
+        let line = serde_json::json!({
+            "ts_unix_ms": now_unix_ms(),
+            "path": path,
+            "run_dir": capture.dir.file_name().map(|f| f.to_string_lossy().to_string()),
+        });
+        let mut payload = line.to_string();
+        payload.push('\n');
+        let timeline = parent.join("timeline.jsonl");
+        let allowed = reserve_capture_bytes(payload.len());
+        if allowed == payload.len() {
+            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&timeline)
+                .await
+            {
+                if let Err(err) = f.write_all(payload.as_bytes()).await {
+                    tracing::warn!(error = %err, "CC Test capture timeline 写入失败");
+                } else {
+                    set_private_permissions(&timeline, 0o600).await;
+                }
+            }
+        }
+    }
 
     Some(capture)
 }
@@ -1373,6 +1694,23 @@ fn summarize_relay_headers(headers: &HeaderMap) -> serde_json::Value {
         "user-agent": header_value("user-agent"),
         "x-api-key": headers.get("x-api-key").map(|_| "present_redacted"),
         "authorization": headers.get("authorization").map(|_| "present_redacted"),
+    })
+}
+
+fn summarize_relay_response_headers(headers: &reqwest::header::HeaderMap) -> serde_json::Value {
+    let header_value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+
+    json!({
+        "content-type": header_value("content-type"),
+        "content-encoding": header_value("content-encoding"),
+        "anthropic-ratelimit-requests-remaining": header_value("anthropic-ratelimit-requests-remaining"),
+        "retry-after": header_value("retry-after"),
+        "request-id": header_value("request-id"),
     })
 }
 
@@ -1525,6 +1863,13 @@ pub async fn post_messages_cc(
     // 普通用户请求（包括普通 Claude Code 请求）继续走本机 Kiro。
     let max_relay = provider.token_manager().get_max_relay();
     if max_relay.enabled && should_relay_to_max(&payload, &headers, true) {
+        if max_relay.strategy == "smart" {
+            tracing::info!(upstreams = config_smart_upstream_count(&max_relay), "smart relay: forwarding upstream");
+            return smart_relay::smart_relay_to_max(
+                raw_body, &payload, &headers, &max_relay, "/v1/messages", &Some(provider),
+            )
+            .await;
+        }
         tracing::warn!(target = %max_relay.base_url, "命中 CC Test 透传，转发上游");
         return relay_to_max(raw_body, &headers, &max_relay, "/v1/messages").await;
     }
@@ -1556,10 +1901,10 @@ pub async fn post_messages_cc(
         Err(e) => {
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
+                    ("invalid_request_error", format!("`{}` is not a supported model.", model))
                 }
                 ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
+                    ("invalid_request_error", "The messages list must not be empty.".to_string())
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
@@ -1585,7 +1930,7 @@ pub async fn post_messages_cc(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
-                    format!("序列化请求失败: {}", e),
+                    "Failed to process the request. Please try again.",
                 )),
             )
                 .into_response();
@@ -1596,12 +1941,16 @@ pub async fn post_messages_cc(
 
     let signature_mode = signature_mode_for_messages_request_for_endpoint(&payload, &headers, true);
 
+    // 工具列表与 tool_choice（count_all_tokens 按值消费 payload 字段，先取一份）
+    let tools = payload.tools.clone().unwrap_or_default();
+    let tool_choice = payload.tool_choice.clone();
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
         payload.system,
         payload.messages,
-        payload.tools,
+        Some(tools.clone()),
     ) as i32;
 
     // 检查是否启用了thinking
@@ -1614,6 +1963,11 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
 
+    // 工具请求模拟真实 Claude 的首字节延迟（0.5–1.5s），避免"秒回"特征。
+    if let Some(latency) = tool_request_latency(&tools, tool_choice.as_ref()) {
+        tokio::time::sleep(latency).await;
+    }
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -1625,6 +1979,8 @@ pub async fn post_messages_cc(
             signature_mode,
             emit_thinking_text,
             tool_name_map,
+            tool_choice,
+            tools,
         )
         .await
     } else {
@@ -1640,6 +1996,9 @@ pub async fn post_messages_cc(
             true,
             tool_name_map,
             None,
+            signature_mode,
+            tool_choice,
+            tools,
         )
         .await
     }
@@ -1658,6 +2017,8 @@ async fn handle_stream_request_buffered(
     signature_mode: SignatureMode,
     emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    tool_choice: Option<serde_json::Value>,
+    tools: Vec<Tool>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -1673,6 +2034,10 @@ async fn handle_stream_request_buffered(
         signature_mode,
         emit_thinking_text,
         tool_name_map,
+    )
+    .with_tool_choice(
+        super::toolgen::ToolChoiceRequirement::parse(tool_choice.as_ref()),
+        tools,
     );
 
     // 创建缓冲 SSE 流
@@ -1785,6 +2150,17 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
 
+    /// relay strategy 测试串行锁（RELAY_STRATEGY 是进程级全局，避免并行互扰）
+    static STRATEGY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn set_relay_strategy_test(strategy: &str, models: &[&str]) {
+        super::update_relay_strategy(&MaxRelayConfig {
+            strategy: strategy.to_string(),
+            models: models.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        });
+    }
+
     fn thinking(thinking_type: &str, display: Option<&str>) -> Thinking {
         Thinking {
             thinking_type: thinking_type.to_string(),
@@ -1842,6 +2218,7 @@ mod tests {
             true,
             true,
             "claude-opus-4-8",
+            SignatureMode::Disabled,
         );
 
         assert_eq!(content.len(), 2);
@@ -1862,6 +2239,7 @@ mod tests {
             true,
             true,
             "claude-opus-4-8",
+            SignatureMode::Disabled,
         );
 
         assert_eq!(content.len(), 2);
@@ -1879,6 +2257,7 @@ mod tests {
             true,
             false,
             "claude-opus-4-8",
+            SignatureMode::Disabled,
         );
 
         assert_eq!(content.len(), 1);
@@ -1948,11 +2327,11 @@ mod tests {
     }
 
     #[test]
-    fn test_signature_mode_uses_hvoy_api_check_for_summarized_non_claude_code() {
+    fn test_signature_mode_uses_sanitized_for_summarized_non_claude_code() {
         let thinking = thinking("enabled", Some("summarized"));
         assert_eq!(
             signature_mode_for_request(Some(&thinking), false),
-            SignatureMode::HvoyApiCheck
+            SignatureMode::Sanitized
         );
     }
 
@@ -2116,16 +2495,18 @@ mod tests {
     }
 
     #[test]
-    fn test_signature_mode_keeps_normal_enabled_thinking_passthrough() {
+    fn test_signature_mode_uses_sanitized_for_normal_enabled_thinking() {
         let thinking = thinking("enabled", None);
         assert_eq!(
             signature_mode_for_request(Some(&thinking), false),
-            SignatureMode::Passthrough
+            SignatureMode::Sanitized
         );
     }
 
     #[test]
     fn test_should_relay_to_max_detects_cctest_tag_echo_probe() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("probe", &[]);
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2146,6 +2527,8 @@ mod tests {
 
     #[test]
     fn test_should_relay_to_max_detects_cctest_identity_probe() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("probe", &[]);
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2162,6 +2545,8 @@ mod tests {
 
     #[test]
     fn test_should_relay_to_max_leaves_normal_claude_code_requests_on_kiro() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("probe", &[]);
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2182,6 +2567,8 @@ mod tests {
 
     #[test]
     fn test_should_relay_to_max_leaves_normal_cc_endpoint_requests_on_kiro() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("probe", &[]);
         let payload: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 64000,
@@ -2194,5 +2581,123 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert!(!should_relay_to_max(&payload, &headers, true));
+    }
+
+    #[test]
+    fn test_strategy_cc_relays_cc_header_traffic() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("cc", &[]);
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64000,
+            "messages": [{"role": "user", "content": "帮我写一个快速排序。"}]
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("claude-cli/2.1.153 (external, cli)"),
+        );
+
+        // cc：有 CC 头，普通文本也透传
+        assert!(should_relay_to_max(&payload, &headers, false));
+        set_relay_strategy_test("probe", &[]);
+    }
+
+    #[test]
+    fn test_strategy_cc_relays_loose_system_identity() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("cc", &[]);
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64000,
+            "system": [{"type": "text", "text": "you are claude code, a modified test build."}],
+            "messages": [{"role": "user", "content": "随便聊点什么。"}]
+        }))
+        .unwrap();
+        let headers = HeaderMap::new();
+
+        // cc：宽松 system 身份匹配（不再要求完整原句）
+        assert!(should_relay_to_max(&payload, &headers, false));
+        set_relay_strategy_test("probe", &[]);
+    }
+
+    #[test]
+    fn test_strategy_cc_whitelist_model_requires_cc_context() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("cc", &["claude-opus-4-8"]);
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "messages": [{"role": "user", "content": "帮我解释一下这段代码。"}]
+        }))
+        .unwrap();
+        let headers = HeaderMap::new();
+
+        // 白名单模型但无 CC 上下文（无 CC 头 / 无 CC system / 非 /cc 端点）：不透传
+        assert!(!should_relay_to_max(&payload, &headers, false));
+        // 白名单模型 + /cc 端点：透传
+        assert!(should_relay_to_max(&payload, &headers, true));
+        set_relay_strategy_test("probe", &[]);
+    }
+
+    #[test]
+    fn test_strategy_cc_whitelist_model_with_cc_system() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("cc", &["claude-opus-4-8"]);
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": [{"role": "user", "content": "帮我解释一下这段代码。"}]
+        }))
+        .unwrap();
+        let headers = HeaderMap::new();
+
+        // 白名单模型 + CC system：透传
+        assert!(should_relay_to_max(&payload, &headers, false));
+        set_relay_strategy_test("probe", &[]);
+    }
+
+    #[test]
+    fn test_strategy_all_relays_everything() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("all", &[]);
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let headers = HeaderMap::new();
+
+        assert!(should_relay_to_max(&payload, &headers, false));
+        set_relay_strategy_test("probe", &[]);
+    }
+
+    #[test]
+    fn test_strategy_probe_keeps_current_behavior() {
+        let _lock = STRATEGY_TEST_LOCK.lock();
+        set_relay_strategy_test("probe", &["claude-opus-4-8"]);
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64000,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+            ],
+            "messages": [{"role": "user", "content": "帮我解释一下这个 Rust 函数的作用。"}]
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("claude-cli/2.1.153 (external, cli)"),
+        );
+
+        // probe：即使 CC 头 + CC system + 白名单模型，普通文本也不透传（现状保持）
+        assert!(!should_relay_to_max(&payload, &headers, true));
+        set_relay_strategy_test("probe", &[]);
     }
 }

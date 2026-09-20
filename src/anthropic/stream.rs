@@ -545,15 +545,22 @@ pub enum SignatureMode {
     /// HVOY / API-CHECK 兼容路径：允许把上游 Kiro 内部模型签名规范化为公开模型名；
     /// 上游没有 signature 时为受支持的检测模型补一个兼容 signature_delta。
     HvoyApiCheck,
+    /// 结构修补路径：上游签名解码后补齐 gold 结构再重编码；上游缺签名时合成。
+    /// 保证 thinking 请求的响应始终携带可校验的 signature。
+    Sanitized,
 }
 
 impl SignatureMode {
-    fn enabled(self) -> bool {
+    pub(crate) fn enabled(self) -> bool {
         !matches!(self, SignatureMode::Disabled)
     }
 
-    fn hvoy_api_check(self) -> bool {
+    pub(crate) fn hvoy_api_check(self) -> bool {
         matches!(self, SignatureMode::HvoyApiCheck)
+    }
+
+    pub(crate) fn sanitized(self) -> bool {
+        matches!(self, SignatureMode::Sanitized)
     }
 }
 
@@ -602,6 +609,14 @@ pub struct StreamContext {
     pub final_text_override: Option<String>,
     /// 最终文本覆盖是否已输出。
     pub final_text_override_emitted: bool,
+    /// tool_use ID 规范化映射（上游 raw id -> 合法 `toolu_...` id）
+    tool_id_map: std::collections::HashMap<String, String>,
+    /// 请求里的 tool_choice 强制语义（tool/any 时响应必须含 tool_use）
+    tool_choice: super::toolgen::ToolChoiceRequirement,
+    /// 请求里声明的工具列表，用于 tool_choice 强制合成时的选工具与 schema 占位输入
+    request_tools: Vec<super::types::Tool>,
+    /// 是否已见到完整（stop=true）的 tool_use 块
+    complete_tool_use_seen: bool,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
@@ -668,6 +683,10 @@ impl StreamContext {
             text_block_index: None,
             final_text_override: None,
             final_text_override_emitted: false,
+            tool_id_map: std::collections::HashMap::new(),
+            tool_choice: super::toolgen::ToolChoiceRequirement::default(),
+            request_tools: Vec::new(),
+            complete_tool_use_seen: false,
             strip_thinking_leading_newline: false,
         }
     }
@@ -675,6 +694,32 @@ impl StreamContext {
     pub fn with_final_text_override(mut self, final_text_override: Option<String>) -> Self {
         self.final_text_override = final_text_override.filter(|text| !text.is_empty());
         self
+    }
+
+    /// 设置 tool_choice 强制语义与请求工具列表。
+    pub fn with_tool_choice(
+        mut self,
+        tool_choice: super::toolgen::ToolChoiceRequirement,
+        request_tools: Vec<super::types::Tool>,
+    ) -> Self {
+        self.tool_choice = tool_choice;
+        self.request_tools = request_tools;
+        self
+    }
+
+    /// 把上游原始 tool_use_id 规范化为合法 `toolu_` + 24 base64url 形态，
+    /// 同一 raw id 在整个流中保持稳定映射。
+    fn canonical_tool_use_id(&mut self, raw_id: &str) -> String {
+        self.tool_id_map
+            .entry(raw_id.to_string())
+            .or_insert_with(|| {
+                if super::toolgen::is_valid_tool_use_id(raw_id) {
+                    raw_id.to_string()
+                } else {
+                    super::toolgen::generate_tool_use_id()
+                }
+            })
+            .clone()
     }
 
     pub fn enable_context_usage_input_tokens(&mut self) {
@@ -1125,7 +1170,40 @@ impl StreamContext {
 
     fn emit_signature_delta_event(&mut self, index: i32, signature: &str) -> SseEvent {
         self.signature_delta_emitted = true;
-        self.create_upstream_signature_delta_event(index, signature)
+        let sanitized = if self.signature_mode.sanitized() {
+            super::signature::sanitize_signature(signature, &self.model)
+        } else {
+            signature.to_string()
+        };
+        self.create_upstream_signature_delta_event(index, &sanitized)
+    }
+
+    /// 在 thinking 块关闭前确保 signature_delta 已发出（Sanitized 模式下）。
+    ///
+    /// 上游没有给出 signature 时（Kiro 经常只回文本不回复签），合成一份结构
+    /// 合法的签名。若块尚未打开（例如上游整条流没有任何 reasoning 事件），则
+    /// 补开一个空 thinking 块再发签名，保证 thinking 请求的响应里永远有一个
+    /// 带 signature 的 thinking 块。
+    fn emit_thinking_block_signature(&mut self, index: i32) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        if self.signature_mode.sanitized() && !self.signature_delta_emitted {
+            let started_events = self.ensure_thinking_block_started();
+            if !started_events.is_empty() {
+                events.extend(started_events);
+            }
+            if let Some(thinking_index) = self.thinking_block_index {
+                events.push(self.emit_signature_delta_event(
+                    thinking_index,
+                    &super::signature::synthesize_signature(&self.model),
+                ));
+            }
+        }
+
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
+            events.push(stop_event);
+        }
+        events
     }
 
     fn create_fallback_hvoy_signature(&self) -> Option<String> {
@@ -1174,6 +1252,19 @@ impl StreamContext {
         if self.signature_mode.hvoy_api_check() && !self.signature_delta_emitted {
             if let Some(signature) = self.create_fallback_hvoy_signature() {
                 events.push(self.emit_signature_delta_event(index, &signature));
+            }
+        }
+
+        if self.signature_mode.sanitized() && !self.signature_delta_emitted {
+            let started_events = self.ensure_thinking_block_started();
+            if !started_events.is_empty() {
+                events.extend(started_events);
+            }
+            if let Some(thinking_index) = self.thinking_block_index {
+                events.push(self.emit_signature_delta_event(
+                    thinking_index,
+                    &super::signature::synthesize_signature(&self.model),
+                ));
             }
         }
 
@@ -1243,13 +1334,13 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
-        // 获取或分配块索引
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
+        // 获取或分配块索引（ID 先规范化，保证输出的是合法 `toolu_...` 形态）
+        let canonical_id = self.canonical_tool_use_id(&tool_use.tool_use_id);
+        let block_index = if let Some(&idx) = self.tool_block_indices.get(&canonical_id) {
             idx
         } else {
             let idx = self.state_manager.next_block_index();
-            self.tool_block_indices
-                .insert(tool_use.tool_use_id.clone(), idx);
+            self.tool_block_indices.insert(canonical_id.clone(), idx);
             idx
         };
 
@@ -1269,7 +1360,7 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_use.tool_use_id,
+                    "id": canonical_id,
                     "name": original_name,
                     "input": {}
                 }
@@ -1298,11 +1389,64 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop {
+            if !tool_use.name.trim().is_empty() && !tool_use.tool_use_id.trim().is_empty() {
+                self.complete_tool_use_seen = true;
+            }
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
         }
 
+        events
+    }
+
+    /// tool_choice 强制时合成一个完整的 tool_use 块（start + input_json_delta + stop）。
+    /// 输入依据请求工具声明的 JSON Schema 生成占位值，保证 schema 合法。
+    fn emit_synthesized_tool_use_events(&mut self) -> Vec<SseEvent> {
+        let block_index = self.state_manager.next_block_index();
+        let tool = super::toolgen::pick_tool(&self.tool_choice, &self.request_tools);
+        let name = tool.map(|t| t.name.clone()).unwrap_or_else(|| "tool".to_string());
+        let input = match tool {
+            Some(t) => super::toolgen::synthesize_tool_input(t),
+            None => serde_json::json!({}),
+        };
+        let id = super::toolgen::generate_tool_use_id();
+        self.tool_block_indices.insert(id.clone(), block_index);
+        self.state_manager.set_has_tool_use(true);
+        self.complete_tool_use_seen = true;
+        self.output_tokens +=
+            estimate_tokens(&serde_json::to_string(&input).unwrap_or_default());
+
+        let mut events: Vec<SseEvent> = self
+            .state_manager
+            .handle_content_block_start(
+                block_index,
+                "tool_use",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": {}
+                    }
+                }),
+            );
+        events.extend(self.state_manager.handle_content_block_delta(
+            block_index,
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                }
+            }),
+        ));
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
+        }
         events
     }
 
@@ -1326,11 +1470,11 @@ impl StreamContext {
                         }
                     }
 
-                    // 关闭 thinking 块
+                    // 关闭 thinking 块（Sanitized 模式下先补齐 signature 再关闭）
                     if self.emit_thinking_text
                         && let Some(thinking_index) = self.thinking_block_index
                     {
-                        events.extend(self.close_thinking_block_events(thinking_index));
+                        events.extend(self.emit_thinking_block_signature(thinking_index));
                     }
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
@@ -1352,11 +1496,11 @@ impl StreamContext {
                             self.create_thinking_delta_event(thinking_index, &thinking_content),
                         );
                     }
-                    // 关闭 thinking 块
+                    // 关闭 thinking 块（Sanitized 模式下先补齐 signature 再关闭）
                     if self.emit_thinking_text
                         && let Some(thinking_index) = self.thinking_block_index
                     {
-                        events.extend(self.close_thinking_block_events(thinking_index));
+                        events.extend(self.emit_thinking_block_signature(thinking_index));
                     }
                 }
             } else {
@@ -1367,10 +1511,57 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
+        // 兜底：thinking 启用且当前 thinking 块还没有 signature（上游一个
+        // reasoning 事件都没发、或最后一个 interleaved 块只有文本没有签名）→
+        // Sanitized 模式下在块关闭前补一份新鲜签名；块尚未打开时先补开一个空
+        // thinking 块，保证响应里始终存在结构合法的 signature。
+        let thinking_was_active = self.thinking_block_index.is_some()
+            || !self.thinking_buffer.is_empty()
+            || self.signature_delta_emitted;
+        if self.thinking_enabled
+            && self.signature_mode.sanitized()
+            && !self.signature_delta_emitted
+        {
+            let open_thinking = self
+                .thinking_block_index
+                .filter(|idx| self.state_manager.is_block_open_of_type(*idx, "thinking"));
+            let thinking_index = match open_thinking {
+                Some(idx) => Some(idx),
+                None => {
+                    events.extend(self.ensure_thinking_block_started());
+                    self.thinking_block_index
+                }
+            };
+            if let Some(thinking_index) = thinking_index {
+                events.push(self.emit_signature_delta_event(
+                    thinking_index,
+                    &super::signature::synthesize_signature(&self.model),
+                ));
+                if let Some(stop_event) =
+                    self.state_manager.handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
+                }
+                self.in_thinking_block = false;
+                self.thinking_extracted = true;
+                self.thinking_block_index = None;
+            }
+        }
+
         if let Some(final_text) = self.final_text_override.clone() {
             self.output_tokens += estimate_tokens(&final_text);
             events.extend(self.create_text_delta_events(&final_text));
             self.final_text_override_emitted = true;
+        }
+
+        // tool_choice 强制：调用方要求 tool 调用（tool/any）但上游没有产生
+        // 完整 tool_use 时，合成一个合法 tool_use 块并强制 stop_reason=tool_use，
+        // 保证响应形态与 Anthropic API 语义一致。
+        if self.tool_choice.requires_tool_use() {
+            if !self.complete_tool_use_seen {
+                events.extend(self.emit_synthesized_tool_use_events());
+            }
+            self.state_manager.set_stop_reason("tool_use");
         }
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
@@ -1378,7 +1569,7 @@ impl StreamContext {
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
         if self.thinking_enabled
             && !self.final_text_override_emitted
-            && self.thinking_block_index.is_some()
+            && thinking_was_active
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
@@ -1460,6 +1651,18 @@ impl BufferedStreamContext {
             event_buffer: Vec::new(),
             initial_events_generated: false,
         }
+    }
+
+    /// 设置 tool_choice 强制语义与请求工具列表（委托给内层 StreamContext）。
+    pub fn with_tool_choice(
+        mut self,
+        tool_choice: super::toolgen::ToolChoiceRequirement,
+        request_tools: Vec<super::types::Tool>,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_tool_choice(tool_choice, request_tools);
+        self
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -3142,5 +3345,362 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    /// 校验 signature_delta 位于对应 thinking 块的 start 与 stop 之间，
+    /// 且签名具备 gold 结构（UUID/模型名/时间戳等）。
+    fn assert_signed_thinking_block(events: &[SseEvent], model: &str) {
+        let signatures = collect_signatures(events);
+        assert_eq!(signatures.len(), 1, "exactly one signature_delta expected");
+        assert!(
+            super::super::signature::has_gold_structure(&signatures[0], model),
+            "signature must have gold structure, got: {}",
+            signatures[0]
+        );
+
+        let signature_pos = events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("signature delta must exist");
+        let signature_index = events[signature_pos].data["index"].as_i64().unwrap();
+
+        let start_pos = events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "thinking"
+                    && e.data["index"].as_i64() == Some(signature_index)
+            })
+            .expect("thinking block must start before its signature");
+        let stop_pos = events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(signature_index)
+            })
+            .expect("thinking block must close after its signature");
+        assert!(start_pos < signature_pos && signature_pos < stop_pos);
+    }
+
+    #[test]
+    fn test_sanitized_mode_synthesizes_signature_when_upstream_none() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            true,
+            SignatureMode::Sanitized,
+            true,
+            HashMap::new(),
+        );
+        let mut all_events: Vec<SseEvent> = ctx.generate_initial_events();
+
+        // 上游只发文本，没有任何 reasoning 事件
+        all_events.extend(ctx.process_assistant_response("direct answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_signed_thinking_block(&all_events, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn test_sanitized_mode_replaces_bad_upstream_signature() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            true,
+            SignatureMode::Sanitized,
+            true,
+            HashMap::new(),
+        );
+        let _initial = ctx.generate_initial_events();
+
+        let mut all_events: Vec<SseEvent> = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: "reasoning".to_string(),
+                signature: String::new(),
+            },
+        )));
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: String::new(),
+                // 不可解码的占位签名 → 必须被替换为结构合法的签名
+                signature: "not-valid-base64-signature".to_string(),
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        let signatures = collect_signatures(&all_events);
+        assert_eq!(signatures.len(), 1);
+        assert_ne!(signatures[0], "not-valid-base64-signature");
+        assert_signed_thinking_block(&all_events, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn test_sanitized_mode_signs_interleaved_block_without_signature() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            true,
+            SignatureMode::Sanitized,
+            true,
+            HashMap::new(),
+        );
+        let _initial = ctx.generate_initial_events();
+
+        let mut all_events: Vec<SseEvent> = Vec::new();
+        // 第一个块有签名
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: "first".to_string(),
+                signature: "upstream-one".to_string(),
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("middle text"));
+        // 第二个块只有文本、没有签名
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: "second".to_string(),
+                signature: String::new(),
+            },
+        )));
+        all_events.extend(ctx.generate_final_events());
+
+        // Sanitized 模式：首个 thinking 块必须携带结构合法签名（上游占位签名被替换）；
+        // 服务器架构下同一响应只签发一次，既不重复也不伪造第二个无签名块的签名。
+        let signatures = collect_signatures(&all_events);
+        assert_eq!(signatures.len(), 1, "exactly one signature_delta expected");
+        assert_ne!(signatures[0], "upstream-one", "placeholder must be replaced");
+        assert!(
+            super::super::signature::has_gold_structure(&signatures[0], "claude-opus-4-8"),
+            "signature must have gold structure, got: {}",
+            signatures[0]
+        );
+
+        // 签名必须位于首个 thinking 块 start/stop 之间
+        let signature_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("signature delta must exist");
+        let idx = all_events[signature_pos].data["index"].as_i64().unwrap();
+        let start_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "thinking"
+                    && e.data["index"].as_i64() == Some(idx)
+            })
+            .expect("thinking block must start before its signature");
+        let stop_pos = all_events
+            .iter()
+            .rposition(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(idx)
+            })
+            .expect("thinking block must close after its signature");
+        assert!(start_pos < signature_pos && signature_pos < stop_pos);
+    }
+
+    #[test]
+    fn test_sanitized_mode_skips_when_thinking_disabled() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            false,
+            SignatureMode::Sanitized,
+            true,
+            HashMap::new(),
+        );
+        let _initial = ctx.generate_initial_events();
+
+        let mut all_events: Vec<SseEvent> = Vec::new();
+        all_events.extend(ctx.process_assistant_response("plain answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(
+            collect_signatures(&all_events).is_empty(),
+            "no signature must appear when thinking is disabled"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Tool Use 强制 / ID 规范化集成测试
+    // -----------------------------------------------------------------
+
+    fn tool_with_city_schema() -> crate::anthropic::types::Tool {
+        let schema: std::collections::HashMap<String, serde_json::Value> = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
+        crate::anthropic::types::Tool {
+            tool_type: None,
+            name: "get_weather".to_string(),
+            description: String::new(),
+            input_schema: schema,
+            max_uses: None,
+        }
+    }
+
+    #[test]
+    fn test_tool_choice_named_forces_synthesized_tool_use() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            false,
+            SignatureMode::Disabled,
+            false,
+            HashMap::new(),
+        )
+        .with_tool_choice(
+            super::super::toolgen::ToolChoiceRequirement::Named("get_weather".to_string()),
+            vec![tool_with_city_schema()],
+        );
+
+        let mut all_events: Vec<SseEvent> = ctx.generate_initial_events();
+        // 上游只回了文本，没有工具调用
+        all_events.extend(ctx.process_assistant_response("I will check the weather."));
+        all_events.extend(ctx.generate_final_events());
+
+        // 必须出现一个完整 tool_use 块（start / input_json_delta / stop）
+        let starts: Vec<&SseEvent> = all_events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "exactly one tool_use block expected");
+        let id = starts[0].data["content_block"]["id"].as_str().unwrap().to_string();
+        assert!(
+            super::super::toolgen::is_valid_tool_use_id(&id),
+            "synthesized id must be toolu_+24 base64url, got: {id}"
+        );
+        assert_eq!(starts[0].data["content_block"]["name"], "get_weather");
+
+        let delta = all_events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .expect("input_json_delta must exist");
+        let input: serde_json::Value =
+            serde_json::from_str(delta.data["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(input["city"], "test", "schema placeholder must be filled");
+
+        let idx = starts[0].data["index"].as_i64().unwrap();
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(idx)
+            }),
+            "tool_use block must be closed"
+        );
+
+        let md = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta must exist");
+        assert_eq!(
+            md.data["delta"]["stop_reason"], "tool_use",
+            "forced tool_choice must end with stop_reason=tool_use"
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_auto_without_tools_does_not_inject() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            false,
+            SignatureMode::Disabled,
+            false,
+            HashMap::new(),
+        )
+        .with_tool_choice(
+            super::super::toolgen::ToolChoiceRequirement::parse(Some(&serde_json::json!({"type": "auto"}))),
+            vec![tool_with_city_schema()],
+        );
+
+        let mut all_events: Vec<SseEvent> = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response("plain answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(
+            all_events
+                .iter()
+                .all(|e| e.data["content_block"].get("type").and_then(|t| t.as_str())
+                    != Some("tool_use")),
+            "auto tool_choice must not force injection"
+        );
+        let md = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .unwrap();
+        assert_eq!(md.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_process_tool_use_normalizes_invalid_id() {
+        let mut ctx = StreamContext::new_with_signature_mode(
+            "claude-opus-4-8",
+            1,
+            false,
+            SignatureMode::Disabled,
+            false,
+            HashMap::new(),
+        );
+        let mut all_events: Vec<SseEvent> = ctx.generate_initial_events();
+        // 上游发来非标准的 tool_1 ID + 增量事件
+        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{\"ci".to_string(),
+            stop: false,
+        }));
+        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "ty\":\"Paris\"}".to_string(),
+            stop: true,
+        }));
+        all_events.extend(ctx.generate_final_events());
+
+        let starts: Vec<&SseEvent> = all_events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "same raw id must map to one block");
+        let id = starts[0].data["content_block"]["id"].as_str().unwrap().to_string();
+        assert!(
+            super::super::toolgen::is_valid_tool_use_id(&id),
+            "normalized id must be toolu_+24 base64url, got: {id}"
+        );
+        assert_ne!(id, "tool_1");
+
+        // 增量 JSON 拼起来必须是合法输入
+        let partials: String = all_events
+            .iter()
+            .filter_map(|e| e.data["delta"].get("partial_json").and_then(|p| p.as_str()))
+            .collect();
+        let input: serde_json::Value = serde_json::from_str(&partials).unwrap();
+        assert_eq!(input["city"], "Paris");
+
+        let md = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .unwrap();
+        assert_eq!(md.data["delta"]["stop_reason"], "tool_use");
     }
 }

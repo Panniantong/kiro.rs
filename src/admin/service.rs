@@ -15,8 +15,9 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, ArmorBreakingResponse, BalanceResponse,
     CredentialStatusItem, CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
-    MaxRelayResponse, OveragePassthroughResponse, SetArmorBreakingRequest,
+    MaxRelayResponse, OveragePassthroughResponse, PinChannelResponse, SetArmorBreakingRequest,
     SetLoadBalancingModeRequest, SetMaxRelayRequest, SetOveragePassthroughRequest,
+    SetPinChannelRequest,
 };
 use crate::model::config::MaxRelayConfig;
 
@@ -452,6 +453,8 @@ impl AdminService {
             enabled: cfg.enabled,
             base_url: cfg.base_url,
             api_key: cfg.api_key,
+            strategy: cfg.strategy,
+            models: cfg.models,
         }
     }
 
@@ -460,10 +463,26 @@ impl AdminService {
         &self,
         req: SetMaxRelayRequest,
     ) -> Result<MaxRelayResponse, AdminServiceError> {
+        let strategy = req.strategy.trim().to_ascii_lowercase();
+        if !matches!(strategy.as_str(), "probe" | "cc" | "all" | "smart") {
+            return Err(AdminServiceError::InvalidCredential(
+                "maxRelay.strategy 必须为 probe、cc、all 或 smart".to_string(),
+            ));
+        }
         let cfg = MaxRelayConfig {
             enabled: req.enabled,
             base_url: req.base_url.trim().to_string(),
             api_key: req.api_key.trim().to_string(),
+            strategy,
+            models: req
+                .models
+                .into_iter()
+                .map(|model| model.trim().to_string())
+                .filter(|model| !model.is_empty())
+                .collect(),
+            // smart_upstreams is managed via config.json; the admin API does not
+            // touch it, so preserve the empty default here.
+            smart_upstreams: Vec::new(),
         };
 
         self.token_manager
@@ -474,6 +493,33 @@ impl AdminService {
             enabled: cfg.enabled,
             base_url: cfg.base_url,
             api_key: cfg.api_key,
+            strategy: cfg.strategy,
+            models: cfg.models,
+        })
+    }
+
+    /// 获取当前固定的凭据 ID
+    pub fn get_pin_channel(&self) -> PinChannelResponse {
+        PinChannelResponse {
+            pin_channel: self.token_manager.get_pin_channel(),
+        }
+    }
+
+    /// 设置固定的凭据 ID（null = 解除固定；不持久化，重启失效）
+    pub fn set_pin_channel(
+        &self,
+        req: SetPinChannelRequest,
+    ) -> Result<PinChannelResponse, AdminServiceError> {
+        if let Err(e) = self.token_manager.set_pin_channel(req.pin_channel) {
+            // 凭据不存在 → 404
+            if let Some(id) = req.pin_channel {
+                return Err(self.classify_error(e, id));
+            }
+            return Err(AdminServiceError::InternalError(e.to_string()));
+        }
+
+        Ok(PinChannelResponse {
+            pin_channel: self.token_manager.get_pin_channel(),
         })
     }
 

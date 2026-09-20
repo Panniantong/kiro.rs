@@ -22,12 +22,17 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
+mod clean;
 mod converter;
 mod handlers;
 mod middleware;
 mod router;
+mod signature;
+pub(crate) mod smart_relay;
 mod stream;
+pub(crate) mod toolgen;
 pub mod types;
 mod websearch;
 
+pub(crate) use handlers::update_relay_strategy;
 pub use router::create_router_with_provider;

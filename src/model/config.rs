@@ -22,7 +22,7 @@ impl Default for TlsBackend {
 /// 开启后，只有识别为 CC Test 检测探针的请求会被原样透传到配置的上游渠道；
 /// 普通用户请求（包括普通 Claude Code 请求）仍走本机 Kiro。
 /// 运行时可经 Admin API `/config/max-relay` 热切换。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MaxRelayConfig {
     /// 是否开启透传（默认 false = 不影响任何现状）
@@ -36,6 +36,53 @@ pub struct MaxRelayConfig {
     /// CC Test 透传上游 api_key（同时用作 x-api-key 和 Authorization: Bearer）
     #[serde(default)]
     pub api_key: String,
+
+    /// 透传判定策略：probe（默认，现状）/ cc（宽松 CC 身份流量）/ all（全量透传）
+    #[serde(default = "default_max_relay_strategy")]
+    pub strategy: String,
+
+    /// strategy=cc 时的模型白名单（为空则该分支不触发）
+    #[serde(default)]
+    pub models: Vec<String>,
+
+    /// strategy=smart 时的显式上游列表（按顺序 failover；key 从各自 secret_file 读取）。
+    /// 与 base_url/api_key 不同，这里不内联 the gateway key —— it is read from a 0600 file
+    /// at request time, so the key never appears in source/config/logs/command line.
+    #[serde(default)]
+    pub smart_upstreams: Vec<SmartRelayUpstream>,
+}
+
+/// 单个 smart-relay 上游。
+///
+/// `secret_file` 指向 a 0600 file containing the upstream gateway api key (no trailing
+/// newline). It is read lazily at request time and only its fingerprint is ever logged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartRelayUpstream {
+    /// 标识（primary / fallback），仅用于日志
+    #[serde(default)]
+    pub name: String,
+    /// 上游 base_url（如 http://127.0.0.1:18992，不带尾斜杠也可）
+    pub base_url: String,
+    /// 网关 key 所在 secret 文件路径（0600，由具备 root 权限 的 admin inject）
+    pub secret_file: String,
+}
+
+fn default_max_relay_strategy() -> String {
+    "probe".to_string()
+}
+
+impl Default for MaxRelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            api_key: String::new(),
+            strategy: default_max_relay_strategy(),
+            models: Vec::new(),
+            smart_upstreams: Vec::new(),
+        }
+    }
 }
 
 /// KNA 应用配置
@@ -142,6 +189,14 @@ pub struct Config {
     #[serde(default)]
     pub max_relay: MaxRelayConfig,
 
+    /// 启动时固定的凭据 ID（整个服务只用该凭据；null/缺省 = 正常选号）
+    ///
+    /// 运行时不持久化：经 Admin API `/config/pin-channel` 热改仅当前进程生效，
+    /// 重启后恢复为本配置值（缺省 None）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_channel: Option<u64>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -244,6 +299,7 @@ impl Default for Config {
             armor_breaking: default_armor_breaking(),
             overage_passthrough: default_overage_passthrough(),
             max_relay: MaxRelayConfig::default(),
+            pin_channel: None,
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

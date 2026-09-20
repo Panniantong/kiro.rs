@@ -311,6 +311,14 @@ pub struct MaxRelayResponse {
     pub base_url: String,
     /// CC Test 透传上游 api_key（整串返回）
     pub api_key: String,
+    /// 透传判定策略
+    pub strategy: String,
+    /// strategy=cc 时的模型白名单
+    pub models: Vec<String>,
+}
+
+fn default_relay_strategy() -> String {
+    "probe".to_string()
 }
 
 /// 设置 CC Test 透传请求
@@ -326,6 +334,30 @@ pub struct SetMaxRelayRequest {
     /// CC Test 透传上游 api_key
     #[serde(default)]
     pub api_key: String,
+    /// 透传判定策略：probe / cc / all
+    #[serde(default = "default_relay_strategy")]
+    pub strategy: String,
+    /// strategy=cc 时的模型白名单
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+// ============ Pin Channel 配置 ============
+
+/// Pin channel 响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinChannelResponse {
+    /// 当前固定的凭据 ID（null = 未固定）
+    pub pin_channel: Option<u64>,
+}
+
+/// 设置 pin channel 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPinChannelRequest {
+    /// 要固定的凭据 ID（null = 解除固定）
+    pub pin_channel: Option<u64>,
 }
 
 // ============ 通用响应 ============
