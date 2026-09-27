@@ -189,6 +189,24 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 128_000,
         },
         Model {
+            id: "claude-opus-5.5".to_string(),
+            object: "model".to_string(),
+            created: 1790294400, // First verified by FluxNode on Sep 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-5.5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1790294400, // First verified by FluxNode on Sep 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-opus-5".to_string(),
             object: "model".to_string(),
             created: 1784937600, // First verified by FluxNode on Jul 25, 2026
@@ -2399,7 +2417,12 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        for model_id in ["claude-opus-5", "claude-opus-5-thinking"] {
+        for model_id in [
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "claude-opus-5.5",
+            "claude-opus-5.5-thinking",
+        ] {
             let model = payload["data"]
                 .as_array()
                 .unwrap()

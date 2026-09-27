@@ -394,7 +394,10 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("opus-5")
+        // 5.5 必须先于 opus-5 判断："claude-opus-5.5" 本身包含 "opus-5" 子串。
+        if model_lower.contains("5-5") || model_lower.contains("5.5") {
+            Some("claude-opus-5.5".to_string())
+        } else if model_lower.contains("opus-5")
             || model_lower.contains("opus5")
             || model_lower.contains("5-opus")
         {
@@ -431,7 +434,7 @@ fn uses_claude_public_identity(model: &str) -> bool {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5、Opus 4.7 / 4.8 / 5 同 1M
+/// Sonnet 5、Opus 4.7 / 4.8 / 5 / 5.5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped) if mapped.starts_with("gpt-5.6-") => 272_000,
@@ -441,7 +444,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
-                || mapped == "claude-opus-5" =>
+                || mapped == "claude-opus-5"
+                || mapped == "claude-opus-5.5" =>
         {
             1_000_000
         }
@@ -3329,6 +3333,29 @@ mod tests {
             assert_eq!(get_context_window_size(requested_model), 1_000_000);
         }
 
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_keeps_opus55_native() {
+        for requested_model in [
+            "claude-opus-5.5",
+            "claude-opus-5.5-thinking",
+            "claude-opus-5-5",
+            "claude-opus-5-5-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested_model),
+                Some("claude-opus-5.5".to_string())
+            );
+            assert_eq!(get_context_window_size(requested_model), 1_000_000);
+        }
+
+        // 5.5 不能被吞进 opus-5；opus-5 / 4.5 也不能误匹配成 5.5
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
         assert_eq!(
             map_model("claude-opus-4-5-20251101"),
             Some("claude-opus-4.5".to_string())
