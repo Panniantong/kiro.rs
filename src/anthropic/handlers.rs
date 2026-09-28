@@ -1120,6 +1120,13 @@ fn build_non_stream_content_blocks(
     content
 }
 
+fn has_deliverable_non_stream_output(
+    text_content: &str,
+    tool_uses: &[serde_json::Value],
+) -> bool {
+    !text_content.trim().is_empty() || !tool_uses.is_empty()
+}
+
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1289,6 +1296,20 @@ async fn handle_non_stream_request(
             tracing::info!(stream = false, "默认身份响应护栏替换了 Kiro 开头身份句");
         }
     }
+    if !has_deliverable_non_stream_output(&text_content, &tool_uses) {
+        tracing::warn!(
+            model = %model,
+            "上游响应没有可交付正文或完整工具调用"
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                "上游响应没有可交付内容，请稍后重试",
+            )),
+        )
+            .into_response();
+    }
 
     let content = build_non_stream_content_blocks(
         text_content,
@@ -1443,6 +1464,25 @@ fn should_guard_empty_stream_success(payload: &MessagesRequest, headers: &Header
         || model.contains("claude-opus-5")
         || model.contains("opus5")
         || model.contains("5-opus");
+    let is_guarded_sonnet = model.contains("sonnet-5")
+        || model.contains("sonnet5")
+        || model.contains("5-sonnet")
+        || model.contains("sonnet-4-6")
+        || model.contains("sonnet-4.6");
+    if !is_guarded_opus && !is_guarded_sonnet {
+        return false;
+    }
+
+    // Thinking-only streams are not complete responses. Once the request has
+    // thinking enabled (including the forced modern-model policy), buffer the
+    // stream until text or a complete tool call proves that delivery succeeded.
+    if payload
+        .thinking
+        .as_ref()
+        .is_some_and(Thinking::is_enabled)
+    {
+        return true;
+    }
     if !is_guarded_opus {
         return false;
     }
@@ -2568,6 +2608,25 @@ mod tests {
         headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.195"));
 
         assert!(should_guard_empty_stream_success(&payload, &headers));
+    }
+
+    #[test]
+    fn empty_stream_guard_accepts_thinking_without_claude_code_headers() {
+        let headers = HeaderMap::new();
+        let mut payload = guard_test_payload("claude-opus-5", true, 1, 0, 12_000, false);
+        payload.thinking = Some(thinking("adaptive", Some("summarized")));
+
+        assert!(should_guard_empty_stream_success(&payload, &headers));
+    }
+
+    #[test]
+    fn non_stream_thinking_only_is_not_deliverable() {
+        assert!(!has_deliverable_non_stream_output("", &[]));
+        assert!(!has_deliverable_non_stream_output(" \n\t", &[]));
+        assert!(has_deliverable_non_stream_output("final answer", &[]));
+        assert!(has_deliverable_non_stream_output("", &[json!({
+            "type": "tool_use"
+        })]));
     }
 
     #[test]
