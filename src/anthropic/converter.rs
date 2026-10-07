@@ -373,7 +373,10 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5")
+        // 5.5 必须先于 sonnet-5 判断："claude-sonnet-5.5" 本身包含 "sonnet-5" 子串。
+        if model_lower.contains("5-5") || model_lower.contains("5.5") {
+            Some("claude-sonnet-5.5".to_string())
+        } else if model_lower.contains("sonnet-5")
             || model_lower.contains("sonnet5")
             || model_lower.contains("5-sonnet")
         {
@@ -434,12 +437,13 @@ fn uses_claude_public_identity(model: &str) -> bool {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5、Opus 4.7 / 4.8 / 5 / 5.5 同 1M
+/// Sonnet 5 / 5.5、Opus 4.7 / 4.8 / 5 / 5.5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped) if mapped.starts_with("gpt-5.6-") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-5.5"
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
@@ -3312,6 +3316,32 @@ mod tests {
         }
 
         // sonnet-4-5 不应误匹配为 sonnet-5
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_keeps_sonnet55_native() {
+        for requested_model in [
+            "claude-sonnet-5.5",
+            "claude-sonnet-5.5-thinking",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested_model),
+                Some("claude-sonnet-5.5".to_string())
+            );
+            assert_eq!(get_context_window_size(requested_model), 1_000_000);
+        }
+
+        // 5.5 不能被吞进 sonnet-5；sonnet-5 / 4.5 也不能误匹配成 5.5
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
         assert_eq!(
             map_model("claude-sonnet-4-5-20250929"),
             Some("claude-sonnet-4.5".to_string())

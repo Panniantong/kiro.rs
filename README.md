@@ -437,6 +437,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
+| `*sonnet5.5*` / `*sonnet-5.5*` / `*sonnet-5-5*` | `claude-sonnet-5.5` |
 | `*sonnet5*` / `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
