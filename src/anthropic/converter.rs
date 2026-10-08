@@ -419,12 +419,8 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("haiku") {
-        // 5.5 必须先于通用 Haiku 规则判断，避免降级到 Haiku 4.5。
-        if model_lower.contains("5-5") || model_lower.contains("5.5") {
-            Some("claude-haiku-5.5".to_string())
-        } else {
-            Some("claude-haiku-4.5".to_string())
-        }
+        // Kiro 当前上游不接受 Haiku 5.5 原生模型 ID；保留公开别名并兼容到已验证的 Haiku 4.5。
+        Some("claude-haiku-4.5".to_string())
     } else {
         None
     }
@@ -3405,7 +3401,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_keeps_haiku55_native() {
+    fn test_map_model_haiku55_compatibility_alias() {
         for requested_model in [
             "claude-haiku-5.5",
             "claude-haiku-5.5-thinking",
@@ -3414,7 +3410,7 @@ mod tests {
         ] {
             assert_eq!(
                 map_model(requested_model),
-                Some("claude-haiku-5.5".to_string())
+                Some("claude-haiku-4.5".to_string())
             );
         }
 
