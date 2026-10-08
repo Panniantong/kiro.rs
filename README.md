@@ -447,7 +447,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*haiku5.5*` / `*haiku-5.5*` / `*haiku-5-5*` | `claude-haiku-5.5` |
+| `*haiku5.5*` / `*haiku-5.5*` / `*haiku-5-5*` | 对外模型 ID：`claude-haiku-5-5`；当前 Kiro 上游兼容到 `claude-haiku-4.5` |
 | `*haiku*`（其他版本） | `claude-haiku-4.5` |
 
 Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。

@@ -351,7 +351,7 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
-            id: "claude-haiku-5.5".to_string(),
+            id: "claude-haiku-5-5".to_string(),
             object: "model".to_string(),
             created: 1791417600, // First verified by FluxNode on Oct 8, 2026
             owned_by: "anthropic".to_string(),
@@ -360,7 +360,7 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
-            id: "claude-haiku-5.5-thinking".to_string(),
+            id: "claude-haiku-5-5-thinking".to_string(),
             object: "model".to_string(),
             created: 1791417600, // First verified by FluxNode on Oct 8, 2026
             owned_by: "anthropic".to_string(),
@@ -2507,6 +2507,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing model {model_id}"));
             assert_eq!(model["owned_by"], "anthropic");
             assert_eq!(model["max_tokens"], 128_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_lists_haiku_5_5_dash_models() {
+        let response = get_models().await.into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for model_id in ["claude-haiku-5-5", "claude-haiku-5-5-thinking"] {
+            let model = payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == model_id)
+                .unwrap_or_else(|| panic!("missing model {model_id}"));
+            assert_eq!(model["owned_by"], "anthropic");
+            assert_eq!(model["max_tokens"], 64000);
         }
     }
 
