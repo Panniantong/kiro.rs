@@ -351,6 +351,24 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
+            id: "claude-haiku-5.5".to_string(),
+            object: "model".to_string(),
+            created: 1791417600, // First verified by FluxNode on Oct 8, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-5.5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1791417600, // First verified by FluxNode on Oct 8, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-haiku-4-5-20251001".to_string(),
             object: "model".to_string(),
             created: 1760486400, // Oct 15, 2025

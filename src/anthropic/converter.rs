@@ -419,7 +419,12 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
+        // 5.5 必须先于通用 Haiku 规则判断，避免降级到 Haiku 4.5。
+        if model_lower.contains("5-5") || model_lower.contains("5.5") {
+            Some("claude-haiku-5.5".to_string())
+        } else {
+            Some("claude-haiku-4.5".to_string())
+        }
     } else {
         None
     }
@@ -3397,6 +3402,26 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_keeps_haiku55_native() {
+        for requested_model in [
+            "claude-haiku-5.5",
+            "claude-haiku-5.5-thinking",
+            "claude-haiku-5-5",
+            "claude-haiku-5-5-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested_model),
+                Some("claude-haiku-5.5".to_string())
+            );
+        }
+
+        assert_eq!(
+            map_model("claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4.5".to_string())
+        );
     }
 
     #[test]
