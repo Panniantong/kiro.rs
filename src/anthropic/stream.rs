@@ -574,6 +574,9 @@ pub struct StreamContext {
     deliverable_text_seen: bool,
     /// 是否已经完整结束过一个有效的 tool_use 块。
     complete_tool_use_seen: bool,
+    /// 是否已经向客户端输出过非空白的 thinking_delta（整条流内不复位）。
+    /// 用于语义前缀门：可见思考出现即开门，让客户端尽早看到进展。
+    visible_thinking_seen: bool,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -659,6 +662,7 @@ impl StreamContext {
             output_tokens: 0,
             deliverable_text_seen: false,
             complete_tool_use_seen: false,
+            visible_thinking_seen: false,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -1149,6 +1153,9 @@ impl StreamContext {
         if !thinking.is_empty() {
             self.thinking_delta_emitted = true;
         }
+        if !thinking.trim().is_empty() {
+            self.visible_thinking_seen = true;
+        }
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1329,6 +1336,11 @@ impl StreamContext {
                 .final_text_override
                 .as_deref()
                 .is_some_and(|text| !text.trim().is_empty())
+    }
+
+    /// 已经产生客户端可见的进展：可交付正文 / 完整工具调用，或非空白 thinking。
+    fn has_visible_progress(&self) -> bool {
+        self.has_deliverable_output() || self.visible_thinking_seen
     }
 
     /// 生成最终事件序列
@@ -1520,6 +1532,10 @@ impl BufferedStreamContext {
 
     pub fn has_deliverable_output(&self) -> bool {
         self.inner.has_deliverable_output()
+    }
+
+    pub fn has_visible_progress(&self) -> bool {
+        self.inner.has_visible_progress()
     }
 
     /// 取走当前已转换的事件，但不结束流。

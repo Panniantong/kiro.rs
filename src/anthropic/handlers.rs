@@ -759,6 +759,31 @@ fn reading_state_for_response(
     }
 }
 
+/// 已开门（客户端已收到可见内容）的保护流结束。
+///
+/// 有可交付正文 / 完整工具调用：正常收尾并记成功。
+/// 只有 thinking：客户端已收到部分事件，无法再透明重试；改发错误事件，
+/// 不把 thinking-only 伪装成正常结束，并按空流给凭据短冷却。
+fn finish_open_guarded_stream(
+    ctx: &mut BufferedStreamContext,
+    attempt: &mut crate::kiro::provider::DeferredStreamAttempt,
+) -> Vec<Result<Bytes, Infallible>> {
+    let all_events = ctx.finish_and_get_all_events();
+    if ctx.has_deliverable_output() {
+        attempt.confirm_success();
+        return all_events
+            .into_iter()
+            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+            .collect();
+    }
+    tracing::warn!(
+        credential_id = attempt.credential_id(),
+        "保护流已输出思考但没有可交付正文，返回上游不可用"
+    );
+    attempt.report_empty_retry();
+    vec![Ok(create_upstream_unavailable_sse())]
+}
+
 fn create_retrying_buffered_sse_stream(
     provider: std::sync::Arc<KiroProvider>,
     request_body: String,
@@ -871,10 +896,13 @@ fn create_retrying_buffered_sse_stream(
                                     }
 
                                     let mut gate_open = gate_open;
+                                    // 成功只认可交付正文 / 完整工具调用；可见思考只负责尽早开门。
+                                    if ctx.has_deliverable_output() {
+                                        attempt.confirm_success();
+                                    }
                                     let events = if gate_open {
                                         ctx.take_buffered_events()
-                                    } else if ctx.has_deliverable_output() {
-                                        attempt.confirm_success();
+                                    } else if ctx.has_visible_progress() {
                                         gate_open = true;
                                         ctx.take_buffered_events()
                                     } else {
@@ -902,15 +930,8 @@ fn create_retrying_buffered_sse_stream(
                                     let credential_id = attempt.credential_id();
                                     tracing::warn!(credential_id, error = %e, "读取保护流失败，准备重试");
                                     if gate_open {
-                                        let bytes = ctx
-                                            .finish_and_get_all_events()
-                                            .into_iter()
-                                            .map(|event| Ok(Bytes::from(event.to_sse_string())))
-                                            .collect();
-                                        Some((
-                                            bytes,
-                                            EmptyStreamRetryState::Done,
-                                        ))
+                                        let bytes = finish_open_guarded_stream(&mut ctx, &mut attempt);
+                                        Some((bytes, EmptyStreamRetryState::Done))
                                     } else {
                                         attempt.report_empty_retry();
                                         let remaining_attempts = remaining_attempts.saturating_sub(1);
@@ -929,11 +950,7 @@ fn create_retrying_buffered_sse_stream(
                                 }
                                 None => {
                                     if gate_open {
-                                        let all_events = ctx.finish_and_get_all_events();
-                                        let bytes = all_events
-                                            .into_iter()
-                                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                            .collect();
+                                        let bytes = finish_open_guarded_stream(&mut ctx, &mut attempt);
                                         Some((bytes, EmptyStreamRetryState::Done))
                                     } else {
                                         // EOF 时先冲刷身份护栏与 thinking 标签缓冲区：短答案（如 "OK"）
@@ -2532,6 +2549,153 @@ mod tests {
         assert!(!body.contains("Upstream service temporarily unavailable"));
         assert!(body.contains("message_stop"));
         assert_eq!(manager.snapshot().entries[0].success_count, 1);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+    }
+
+    async fn guarded_stream_for(
+        app: Router,
+        model: &str,
+    ) -> (
+        impl Stream<Item = Result<Bytes, Infallible>>,
+        Arc<MultiTokenManager>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let credential = KiroCredentials {
+            access_token: Some("test-token".to_string()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "delayed-test".to_string(),
+            Arc::new(DelayedTestEndpoint {
+                base_url: format!("http://{addr}"),
+            }),
+        );
+        let provider = Arc::new(KiroProvider::with_proxy(
+            manager.clone(),
+            None,
+            endpoints,
+            "delayed-test".to_string(),
+        ));
+        let response = provider.call_api_stream_deferred("{}").await.unwrap();
+        let guarded = create_retrying_buffered_sse_stream(
+            provider,
+            "{}".to_string(),
+            model.to_string(),
+            12,
+            true,
+            SignatureMode::Disabled,
+            true,
+            HashMap::new(),
+            None,
+            response,
+        );
+        (guarded, manager)
+    }
+
+    async fn thinking_then_delayed_text_stream() -> Response {
+        let chunks = stream::unfold(0, |state| async move {
+            match state {
+                0 => Some((
+                    Ok::<Bytes, Infallible>(assistant_response_frame(
+                        "<thinking>\nLet me work through this carefully, step by step.\n",
+                    )),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Some((
+                        Ok::<Bytes, Infallible>(assistant_response_frame(
+                            "</thinking>\n\nFinal answer here.",
+                        )),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    /// 长思考期间客户端必须持续看到思考进展，而不是在第一段正文前只收到心跳。
+    #[tokio::test]
+    async fn guarded_stream_emits_visible_thinking_before_delayed_text() {
+        let app = Router::new().route("/api", post(thinking_then_delayed_text_stream));
+        let (guarded, manager) = guarded_stream_for(app, "claude-sonnet-5-5").await;
+        tokio::pin!(guarded);
+
+        let first_thinking = timeout(Duration::from_millis(800), async {
+            loop {
+                let item = guarded.next().await.unwrap().unwrap();
+                let text = String::from_utf8(item.to_vec()).unwrap();
+                if text.contains("thinking_delta") {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("visible thinking must reach the client before the delayed text");
+        assert!(first_thinking.contains("Let me work through"));
+        // 只看到思考时不能提前记成功
+        assert_eq!(manager.snapshot().entries[0].success_count, 0);
+
+        let rest = timeout(Duration::from_secs(5), async {
+            guarded
+                .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .await
+                .concat()
+        })
+        .await
+        .expect("guarded stream must finish");
+        assert!(rest.contains("Final answer here."), "got: {rest}");
+        assert!(rest.contains("message_stop"));
+        assert!(!rest.contains("Upstream service temporarily unavailable"));
+        assert_eq!(manager.snapshot().entries[0].success_count, 1);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+    }
+
+    async fn thinking_only_stream() -> Response {
+        let chunks = stream::iter(vec![Ok::<Bytes, Infallible>(assistant_response_frame(
+            "<thinking>\nReasoning that never reaches a final answer.",
+        ))]);
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    /// 已向客户端输出思考后上游结束且没有正文：必须返回错误，不能伪装成正常结束。
+    #[tokio::test]
+    async fn guarded_stream_reports_error_when_opened_stream_ends_thinking_only() {
+        let app = Router::new().route("/api", post(thinking_only_stream));
+        let (guarded, manager) = guarded_stream_for(app, "claude-sonnet-5-5").await;
+
+        let body = timeout(Duration::from_secs(5), async {
+            guarded
+                .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .await
+                .concat()
+        })
+        .await
+        .expect("guarded stream must finish");
+
+        assert!(body.contains("thinking_delta"), "thinking should stream: {body}");
+        assert!(body.contains("Upstream service temporarily unavailable"), "got: {body}");
+        assert!(!body.contains("message_stop"), "must not fake a normal end: {body}");
+        assert_eq!(manager.snapshot().entries[0].success_count, 0);
         assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
     }
 
