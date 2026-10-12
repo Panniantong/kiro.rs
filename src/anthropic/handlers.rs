@@ -936,6 +936,17 @@ fn create_retrying_buffered_sse_stream(
                                             .collect();
                                         Some((bytes, EmptyStreamRetryState::Done))
                                     } else {
+                                        // EOF 时先冲刷身份护栏与 thinking 标签缓冲区：短答案（如 "OK"）
+                                        // 在流结束前一直被暂存，只有冲刷后才能判断是否真的没有可交付内容。
+                                        let all_events = ctx.finish_and_get_all_events();
+                                        if ctx.has_deliverable_output() {
+                                            attempt.confirm_success();
+                                            let bytes = all_events
+                                                .into_iter()
+                                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                                .collect();
+                                            return Some((bytes, EmptyStreamRetryState::Done));
+                                        }
                                         let credential_id = attempt.credential_id();
                                         tracing::warn!(credential_id, "上游 2xx 流结束但没有可交付内容，准备重试");
                                         attempt.report_empty_retry();
@@ -2448,6 +2459,80 @@ mod tests {
         assert!(first_content.contains("content_block_delta"));
         assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
         assert_eq!(manager.snapshot().entries[0].success_count, 1);
+    }
+
+    async fn short_answer_stream() -> Response {
+        let chunks = stream::iter(vec![Ok::<Bytes, Infallible>(assistant_response_frame("OK"))]);
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    /// 短答案（如 "OK"）在流结束前会被 thinking 标签缓冲区 / 身份护栏暂存。
+    /// EOF 时必须先冲刷这些缓冲再判断是否可交付，否则会被误判为空流并重试到 502。
+    #[tokio::test]
+    async fn guarded_stream_delivers_short_answer_held_in_buffers_until_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api", post(short_answer_stream));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credential = KiroCredentials {
+            access_token: Some("test-token".to_string()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "delayed-test".to_string(),
+            Arc::new(DelayedTestEndpoint {
+                base_url: format!("http://{addr}"),
+            }),
+        );
+        let provider = Arc::new(KiroProvider::with_proxy(
+            manager.clone(),
+            None,
+            endpoints,
+            "delayed-test".to_string(),
+        ));
+        let response = provider.call_api_stream_deferred("{}").await.unwrap();
+        let guarded = create_retrying_buffered_sse_stream(
+            provider,
+            "{}".to_string(),
+            "claude-sonnet-4-6".to_string(),
+            12,
+            true,
+            SignatureMode::Disabled,
+            true,
+            HashMap::new(),
+            None,
+            response,
+        );
+
+        let body = timeout(Duration::from_secs(5), async {
+            guarded
+                .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+                .collect::<Vec<_>>()
+                .await
+                .concat()
+        })
+        .await
+        .expect("guarded stream must finish");
+
+        assert!(
+            body.contains("\"text\":\"OK\""),
+            "short answer must be delivered, got: {body}"
+        );
+        assert!(!body.contains("Upstream service temporarily unavailable"));
+        assert!(body.contains("message_stop"));
+        assert_eq!(manager.snapshot().entries[0].success_count, 1);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
     }
 
     #[test]
