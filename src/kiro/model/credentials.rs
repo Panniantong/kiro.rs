@@ -178,6 +178,43 @@ pub struct KiroCredentials {
     /// 其他账号不受影响。只影响调度行为，不影响 Token 刷新与持久化。
     #[serde(default)]
     pub boom: bool,
+
+    /// 导入时提交的 refreshToken 后 5 位（入库时写入一次，之后不随 Token 刷新改变）。
+    /// 用于和号商交付文件核对账号身份；早于该字段上线的账号为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_refresh_token_tail: Option<String>,
+
+    /// 导入时的余额快照（首次成功查询额度时写入一次，之后不再修改）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_balance: Option<ImportBalanceSnapshot>,
+}
+
+/// 导入时的余额快照。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportBalanceSnapshot {
+    /// 导入时剩余积分
+    pub remaining: f64,
+    /// 导入时额度上限
+    pub usage_limit: f64,
+    /// 导入时官方订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    /// 记录时间（RFC3339）
+    pub captured_at: String,
+}
+
+/// refreshToken 的后 5 个字符；空 token 返回 None。
+pub fn refresh_token_tail(refresh_token: &str) -> Option<String> {
+    let tail: String = refresh_token
+        .chars()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    (!tail.is_empty()).then_some(tail)
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -418,6 +455,8 @@ mod tests {
             endpoint: None,
             rpm: None,
             boom: false,
+            import_refresh_token_tail: None,
+            import_balance: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -553,6 +592,8 @@ mod tests {
             endpoint: None,
             rpm: None,
             boom: false,
+            import_refresh_token_tail: None,
+            import_balance: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -590,6 +631,8 @@ mod tests {
             endpoint: None,
             rpm: None,
             boom: false,
+            import_refresh_token_tail: None,
+            import_balance: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -710,6 +753,8 @@ mod tests {
             endpoint: None,
             rpm: None,
             boom: false,
+            import_refresh_token_tail: None,
+            import_balance: None,
         };
 
         let json = original.to_pretty_json().unwrap();

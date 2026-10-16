@@ -104,6 +104,12 @@ pub struct CredentialStatusItem {
     pub throttled_1h: u32,
     /// AWS 侧超额（overage）状态（ENABLED / DISABLED；None 表示未知/未同步）
     pub overage_status: Option<String>,
+    /// 导入时 refreshToken 后 5 位（None = 未记录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_refresh_token_tail: Option<String>,
+    /// 导入时余额快照（None = 未记录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_balance: Option<crate::kiro::model::credentials::ImportBalanceSnapshot>,
 }
 /// 账号日志搜索参数。
 #[derive(Debug, Deserialize, Default)]

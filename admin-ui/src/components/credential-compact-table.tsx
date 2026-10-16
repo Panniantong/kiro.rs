@@ -154,6 +154,11 @@ export function CredentialCompactTable({
                     ) : (
                       <span className="text-muted-foreground">未查询</span>
                     )}
+                    <div className="mt-1 text-[11px] text-muted-foreground" title={credential.importBalance ? `记录于 ${new Date(credential.importBalance.capturedAt).toLocaleString()}` : ''}>
+                      导入 {credential.importBalance
+                        ? `${credential.importBalance.remaining.toFixed(0)} / ${credential.importBalance.usageLimit.toFixed(0)}${credential.importBalance.subscriptionTitle ? ` · ${credential.importBalance.subscriptionTitle}` : ''}`
+                        : '未记录'}
+                    </div>
                   </td>
                   <td className="max-w-[260px] px-3 py-3 align-top">
                     <div className="truncate font-medium text-foreground" title={credential.importNote || ''}>
@@ -161,6 +166,9 @@ export function CredentialCompactTable({
                     </div>
                     <div className="mt-1 truncate text-xs text-muted-foreground" title={credential.maskedApiKey || credential.endpoint}>
                       {credential.maskedApiKey || credential.endpoint || '—'}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      导入 RT 尾 <span className="font-mono">{credential.importRefreshTokenTail ?? '未记录'}</span>
                     </div>
                   </td>
                   <td className="px-3 py-3 align-top font-mono tabular-nums">

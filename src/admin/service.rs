@@ -11,7 +11,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use crate::account_logs::{AccountLogEvent, AccountLogFilters, AccountLogStore};
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, refresh_token_tail};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
 
@@ -343,6 +343,8 @@ impl AdminService {
                     peak_rpm_1h: entry.peak_rpm_1h,
                     throttled_1h: entry.throttled_1h,
                     overage_status: entry.overage_status,
+                    import_refresh_token_tail: entry.import_refresh_token_tail,
+                    import_balance: entry.import_balance,
                 }
             })
             .collect();
@@ -2590,6 +2592,8 @@ impl AdminService {
             .import_note
             .map(|note| note.trim().to_string())
             .filter(|note| !note.is_empty());
+        // 刷新前记下导入时 refreshToken 后 5 位：候选校验的刷新可能轮换 token。
+        let import_rt_tail = req.refresh_token.as_deref().and_then(refresh_token_tail);
         let mut new_cred = KiroCredentials {
             id: None,
             access_token: None,
@@ -2619,6 +2623,8 @@ impl AdminService {
             endpoint: req.endpoint,
             rpm: None,
             boom: req.boom,
+            import_refresh_token_tail: import_rt_tail.clone(),
+            import_balance: None,
         };
 
         let should_check_pool =
@@ -2633,6 +2639,7 @@ impl AdminService {
                 Ok(candidate) => {
                     prevalidated_credential = Some(candidate.credentials.clone());
                     new_cred = candidate.credentials;
+                    new_cred.import_refresh_token_tail = import_rt_tail.clone();
                     (
                         Some(Self::proxy_pool_eligibility(&candidate.usage_limits)),
                         Some(candidate.usage_limits),
@@ -2708,9 +2715,11 @@ impl AdminService {
         if let Some(usage) = inspected_usage.as_ref() {
             self.token_manager
                 .store_usage_metadata(credential_id, usage);
+            self.token_manager.record_import_balance(credential_id, usage);
         } else {
             match self.token_manager.get_usage_limits_for(credential_id).await {
-                Ok(_) => {
+                Ok(usage) => {
+                    self.token_manager.record_import_balance(credential_id, &usage);
                     subscription_inspected = true;
                     // 候选查询偶发失败、但添加后的官方查询成功时，也不能让刚识别
                     // 为 PRO+ 的无代理账号继续处于启用状态。

@@ -410,6 +410,23 @@ export function CredentialCard({
               </div>
             )}
             <div className="col-span-2">
+              <span className="text-muted-foreground">导入 RT 后 5 位：</span>
+              <span className="font-mono font-medium">{credential.importRefreshTokenTail ?? '未记录'}</span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">导入时余额：</span>
+              {credential.importBalance ? (
+                <span className="font-medium" title={`记录于 ${new Date(credential.importBalance.capturedAt).toLocaleString()}`}>
+                  {credential.importBalance.remaining.toFixed(0)} / {credential.importBalance.usageLimit.toFixed(0)}
+                  {credential.importBalance.subscriptionTitle && (
+                    <span className="text-xs text-muted-foreground ml-1">({credential.importBalance.subscriptionTitle})</span>
+                  )}
+                </span>
+              ) : (
+                <span className="font-medium text-muted-foreground">未记录</span>
+              )}
+            </div>
+            <div className="col-span-2">
               <span className="text-muted-foreground">基础用量：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">

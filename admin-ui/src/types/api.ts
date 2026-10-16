@@ -52,6 +52,17 @@ export interface CredentialStatusItem {
   overageStatus?: string | null
   /** 炸弹号：限速类失败时按桶换宿主重试。 */
   boom?: boolean
+  /** 导入时 refreshToken 后 5 位；缺省 = 该功能上线前导入，未记录 */
+  importRefreshTokenTail?: string
+  /** 导入时余额快照；缺省 = 未记录 */
+  importBalance?: ImportBalanceSnapshot
+}
+
+export interface ImportBalanceSnapshot {
+  remaining: number
+  usageLimit: number
+  subscriptionTitle?: string
+  capturedAt: string
 }
 
 // 余额响应

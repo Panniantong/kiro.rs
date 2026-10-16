@@ -19,7 +19,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{ImportBalanceSnapshot, KiroCredentials, refresh_token_tail};
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
@@ -1030,6 +1030,12 @@ pub struct CredentialEntrySnapshot {
     /// AWS 侧超额（overage）状态（ENABLED / DISABLED；None 表示未知/未同步）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage_status: Option<String>,
+    /// 导入时 refreshToken 后 5 位（None = 该字段上线前导入，未记录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_refresh_token_tail: Option<String>,
+    /// 导入时余额快照（None = 未记录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_balance: Option<ImportBalanceSnapshot>,
 }
 
 /// 凭据管理器状态快照
@@ -2632,6 +2638,8 @@ impl MultiTokenManager {
                     peak_rpm_1h,
                     throttled_1h,
                     overage_status: e.credentials.overage_status.clone(),
+                    import_refresh_token_tail: e.credentials.import_refresh_token_tail.clone(),
+                    import_balance: e.credentials.import_balance.clone(),
                 }
             })
             .collect();
@@ -3088,6 +3096,32 @@ impl MultiTokenManager {
         }
     }
 
+    /// 记录导入时余额快照。只写一次：已有快照时不覆盖。返回是否写入。
+    pub fn record_import_balance(&self, id: u64, usage_limits: &UsageLimitsResponse) -> bool {
+        let written = {
+            let mut entries = self.entries.lock();
+            match entries.iter_mut().find(|e| e.id == id) {
+                Some(entry) if entry.credentials.import_balance.is_none() => {
+                    let usage_limit = usage_limits.usage_limit();
+                    entry.credentials.import_balance = Some(ImportBalanceSnapshot {
+                        remaining: (usage_limit - usage_limits.current_usage()).max(0.0),
+                        usage_limit,
+                        subscription_title: usage_limits.subscription_title().map(str::to_owned),
+                        captured_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                    true
+                }
+                _ => false,
+            }
+        };
+        if written {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!(credential_id = id, "导入余额快照持久化失败: {}", e);
+            }
+        }
+        written
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程
@@ -3226,6 +3260,12 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
         validated_cred.boom = new_cred.boom;
+        // 导入时 RT 后 5 位：优先用调用方在刷新前记下的值，否则取本次提交的 refreshToken。
+        // 刷新可能已轮换 validated_cred 的 refreshToken，所以不能从它取。
+        validated_cred.import_refresh_token_tail = new_cred
+            .import_refresh_token_tail
+            .or_else(|| new_cred.refresh_token.as_deref().and_then(refresh_token_tail));
+        validated_cred.import_balance = None;
         if initial_disabled {
             validated_cred.disabled_at = Some(chrono::Utc::now().to_rfc3339());
         } else {
@@ -4222,6 +4262,57 @@ mod tests {
             entries[0].credentials.access_token.as_deref(),
             Some("access-token-from-candidate")
         );
+    }
+
+    /// 导入时刷新轮换了 refreshToken：记录的后 5 位必须是提交时的 token，而不是轮换后的。
+    #[tokio::test]
+    async fn test_import_rt_tail_survives_token_rotation_on_import() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.auth_method = Some("social".to_string());
+        new_cred.refresh_token = Some(format!("{}SUBMT", "s".repeat(145)));
+        let mut rotated = new_cred.clone();
+        rotated.refresh_token = Some(format!("{}ROTAT", "t".repeat(145)));
+
+        let id = manager
+            .add_credential_with_validated_token(new_cred, rotated)
+            .await
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(entry.import_refresh_token_tail.as_deref(), Some("SUBMT"));
+        let entries = manager.entries.lock();
+        assert!(entries[0].credentials.refresh_token.as_deref().unwrap().ends_with("ROTAT"));
+    }
+
+    /// 导入余额只记一次：后续额度变化（比如被降级）不能改写导入快照。
+    #[tokio::test]
+    async fn test_import_balance_is_recorded_once() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("a".repeat(150));
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let id = manager.snapshot().entries[0].id;
+
+        let usage = |title: &str, limit: f64, used: f64| -> UsageLimitsResponse {
+            serde_json::from_value(serde_json::json!({
+                "subscriptionInfo": {"subscriptionTitle": title},
+                "usageBreakdownList": [{"usageLimitWithPrecision": limit, "currentUsageWithPrecision": used}]
+            }))
+            .unwrap()
+        };
+
+        assert!(manager.record_import_balance(id, &usage("KIRO PRO+", 2000.0, 150.0)));
+        assert!(!manager.record_import_balance(id, &usage("KIRO FREE", 50.0, 50.0)));
+
+        let snapshot = manager.snapshot();
+        let balance = snapshot.entries[0].import_balance.clone().unwrap();
+        assert_eq!(balance.remaining, 1850.0);
+        assert_eq!(balance.usage_limit, 2000.0);
+        assert_eq!(balance.subscription_title.as_deref(), Some("KIRO PRO+"));
     }
 
     #[tokio::test]
