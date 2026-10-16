@@ -39,6 +39,12 @@ import { Switch } from '@/components/ui/switch'
 import { getCredentialBalance, batchGetCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+import {
+  EMPTY_CREDENTIAL_FILTERS,
+  filterCredentials,
+  type CredentialFilters,
+  type CredentialStatusFilter,
+} from '@/lib/credential-filters'
 
 interface DashboardProps {
   onLogout: () => void
@@ -86,6 +92,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [currentPage, setCurrentPage] = useState(1)
   const [viewMode, setViewMode] = useState<CredentialViewMode>(getInitialCredentialView)
   const itemsPerPage = 12
+  const [filters, setFilters] = useState<CredentialFilters>(EMPTY_CREDENTIAL_FILTERS)
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
       return document.documentElement.classList.contains('dark')
@@ -128,12 +135,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }, [data?.credentials])
 
   const enabledCredentials = sortedCredentials.filter(credential => !credential.disabled)
-  const viewCredentials = viewMode === 'available-compact' ? enabledCredentials : sortedCredentials
-  const totalPages = viewMode === 'cards' ? Math.ceil(sortedCredentials.length / itemsPerPage) : 1
+  // 筛选只作用于列表展示与批量选择；全局 RPM 等统计仍按全部可用凭据计算。
+  const filterResult = useMemo(
+    () => filterCredentials(sortedCredentials, filters, balanceMap),
+    [sortedCredentials, filters, balanceMap]
+  )
+  const filteredCredentials = filterResult.credentials
+  const isFiltering = filters.status !== 'all' || filterResult.balanceActive
+  const viewCredentials = viewMode === 'available-compact'
+    ? filteredCredentials.filter(credential => !credential.disabled)
+    : filteredCredentials
+  const totalPages = viewMode === 'cards' ? Math.ceil(filteredCredentials.length / itemsPerPage) : 1
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = viewMode === 'cards'
-    ? sortedCredentials.slice(startIndex, endIndex)
+    ? filteredCredentials.slice(startIndex, endIndex)
     : viewCredentials
   const disabledCredentialCount = sortedCredentials.filter(credential => credential.disabled).length
   const globalCurrentRpm = enabledCredentials.reduce((sum, credential) => sum + credential.currentRpm, 0)
@@ -154,6 +170,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setCurrentPage(1)
     setSelectedIds(new Set())
   }, [viewMode])
+
+  // 筛选条件变化：回到第一页并清空选择，避免批量操作作用到已被筛掉的账号
+  useEffect(() => {
+    setCurrentPage(1)
+    setSelectedIds(new Set())
+  }, [filters])
 
   // CC Test 透传配置加载后回填到本地表单
   useEffect(() => {
@@ -1305,10 +1327,69 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
+          <div className="flex flex-wrap items-end gap-3 rounded-lg border bg-muted/25 px-3 py-2.5">
+            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+              启用状态
+              <select
+                value={filters.status}
+                onChange={event => setFilters(previous => ({ ...previous, status: event.target.value as CredentialStatusFilter }))}
+                className="h-9 w-32 rounded-md border border-input bg-background px-2 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="all">全部状态</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">已禁用</option>
+              </select>
+            </label>
+            <div className="flex flex-col gap-1 text-xs text-muted-foreground">
+              剩余积分
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="最低"
+                  aria-label="剩余积分最低值"
+                  value={filters.balanceMin}
+                  onChange={event => setFilters(previous => ({ ...previous, balanceMin: event.target.value }))}
+                  className="h-9 w-28"
+                />
+                <span className="text-muted-foreground">~</span>
+                <Input
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="最高"
+                  aria-label="剩余积分最高值"
+                  value={filters.balanceMax}
+                  onChange={event => setFilters(previous => ({ ...previous, balanceMax: event.target.value }))}
+                  className="h-9 w-28"
+                />
+              </div>
+            </div>
+            {isFiltering && (
+              <>
+                <Button size="sm" variant="ghost" className="h-9" onClick={() => setFilters(EMPTY_CREDENTIAL_FILTERS)}>
+                  清除筛选
+                </Button>
+                <span className="pb-2 text-sm text-muted-foreground">
+                  筛选结果 {filteredCredentials.length} / {sortedCredentials.length}
+                  {filterResult.unknownBalanceExcluded > 0 && (
+                    <span className="ml-2 text-amber-600">
+                      另有 {filterResult.unknownBalanceExcluded} 个账号余额未知，未计入（先查询余额后再筛）
+                    </span>
+                  )}
+                </span>
+              </>
+            )}
+          </div>
           {data?.credentials.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
                 暂无凭据
+              </CardContent>
+            </Card>
+          ) : isFiltering && viewCredentials.length === 0 ? (
+            <Card>
+              <CardContent className="py-8 text-center text-muted-foreground">
+                没有符合筛选条件的凭据
               </CardContent>
             </Card>
           ) : viewMode === 'cards' ? (
@@ -1339,7 +1420,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {sortedCredentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页（共 {filteredCredentials.length} 个凭据）
                   </span>
                   <Button
                     variant="outline"
