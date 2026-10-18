@@ -844,6 +844,9 @@ fn process_message_content(
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(&block.content);
+                                // Kiro toolResult 只承载文本；工具结果里的图片（Read 图片、
+                                // 截图类 MCP）必须提升到同一条 user 消息的 images，否则模型看不到。
+                                images.extend(extract_tool_result_images(&block.content));
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mapped_tool_use_id = map_tool_use_id(&tool_use_id);
@@ -1487,6 +1490,23 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
+}
+
+/// 提取工具结果里的图片块（Anthropic `source` 或 OpenAI-compat `image_url`）
+fn extract_tool_result_images(content: &Option<serde_json::Value>) -> Vec<KiroImage> {
+    let Some(serde_json::Value::Array(arr)) = content else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(|v| v.as_str()),
+                Some("image" | "input_image" | "image_url")
+            )
+        })
+        .filter_map(extract_image_from_freeform_block)
+        .map(|(format, data)| KiroImage::from_base64(format, data))
+        .collect()
 }
 
 /// Kiro API 对 toolUseId 字符集更严格；将历史中的非安全字符映射掉并保留可追踪 hash。
@@ -3187,6 +3207,35 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
         assert!(tool_results.is_empty());
+    }
+
+    #[test]
+    fn test_process_message_content_lifts_tool_result_images() {
+        let content = serde_json::json!([
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_img",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgo="
+                        }
+                    },
+                    { "type": "text", "text": "screenshot taken" }
+                ]
+            }
+        ]);
+
+        let (text, images, tool_results) = process_message_content(&content).unwrap();
+
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].tool_use_id, "toolu_img");
     }
 
     #[test]
