@@ -226,6 +226,7 @@ export interface ProxyPoolEntryStatus {
   abnormalCount: number
   unknownCount: number
   lastTest?: ProxyProbeSummary | null
+  importNote?: string | null
 }
 
 export interface ProxyPoolResponse {
@@ -263,6 +264,7 @@ export interface ManualProxyUnbindRequest {
 
 export interface AddProxyPoolEntriesRequest {
   proxies: SetCredentialProxyRequest[]
+  importNote?: string
 }
 
 export interface RemoveProxyPoolEntriesRequest {

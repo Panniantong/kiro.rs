@@ -109,6 +109,9 @@ struct ProxyPoolEntry {
     proxy_password: Option<String>,
     #[serde(default)]
     last_test: Option<ProxyProbeSummary>,
+    /// 导入备注；旧代理池文件没有该字段时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_note: Option<String>,
 }
 
 /// Admin 服务
@@ -789,6 +792,7 @@ impl AdminService {
                         proxy_username: credentials.proxy_username.clone(),
                         proxy_password: credentials.proxy_password.clone(),
                         last_test: None,
+                        import_note: None,
                     },
                     true,
                 )
@@ -1091,6 +1095,7 @@ impl AdminService {
                     abnormal_count,
                     unknown_count,
                     last_test: entry.last_test.clone(),
+                    import_note: entry.import_note.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1399,6 +1404,10 @@ impl AdminService {
             ));
         }
 
+        let import_note = req
+            .import_note
+            .map(|note| note.trim().chars().take(200).collect::<String>())
+            .filter(|note| !note.is_empty());
         let mut candidates = Vec::with_capacity(req.proxies.len());
         for proxy in req.proxies {
             let (proxy_url, proxy_username, proxy_password) = Self::validate_proxy_binding(
@@ -1419,6 +1428,7 @@ impl AdminService {
                 proxy_username,
                 proxy_password,
                 last_test: None,
+                import_note: import_note.clone(),
             });
         }
 
@@ -4115,20 +4125,18 @@ mod tests {
         let service = AdminService::new(manager.clone(), Vec::<String>::new());
 
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![
-                    SetCredentialProxyRequest {
-                        proxy_url: Some("http://proxy-one.example:443".to_string()),
-                        proxy_username: Some("user-one".to_string()),
-                        proxy_password: Some("pass-one".to_string()),
-                    },
-                    SetCredentialProxyRequest {
-                        proxy_url: Some("http://proxy-two.example:443".to_string()),
-                        proxy_username: Some("user-two".to_string()),
-                        proxy_password: Some("pass-two".to_string()),
-                    },
-                ],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![
+                SetCredentialProxyRequest {
+                    proxy_url: Some("http://proxy-one.example:443".to_string()),
+                    proxy_username: Some("user-one".to_string()),
+                    proxy_password: Some("pass-one".to_string()),
+                },
+                SetCredentialProxyRequest {
+                    proxy_url: Some("http://proxy-two.example:443".to_string()),
+                    proxy_username: Some("user-two".to_string()),
+                    proxy_password: Some("pass-two".to_string()),
+                },
+            ], import_note: None })
             .unwrap();
 
         for (index, proxy_url) in [
@@ -4184,6 +4192,80 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_pool_import_note_is_trimmed_shown_and_persisted() {
+        let test_dir =
+            std::env::temp_dir().join(format!("kiro-admin-proxy-note-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let credentials_path = test_dir.join("credentials.json");
+        let proxy_pool_path = test_dir.join("kiro_proxy_pool.json");
+        std::fs::write(&credentials_path, "[]").unwrap();
+        // 旧版代理池文件没有 importNote 字段，必须照常加载。
+        std::fs::write(
+            &proxy_pool_path,
+            r#"{"proxies":[{"proxyUrl":"http://legacy.example:443"}]}"#,
+        )
+        .unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::<String>::new());
+        let one = |url: &str| SetCredentialProxyRequest {
+            proxy_url: Some(url.to_string()),
+            proxy_username: None,
+            proxy_password: None,
+        };
+
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![one("http://new.example:443")],
+                import_note: Some("  proxies-a.txt · 2026-10-21 15:00  ".to_string()),
+            })
+            .unwrap();
+        let pool = service.get_proxy_pool();
+        let note_of = |url: &str| {
+            pool.proxies
+                .iter()
+                .find(|entry| entry.proxy_url.starts_with(url))
+                .unwrap()
+                .import_note
+                .clone()
+        };
+        assert_eq!(note_of("http://legacy.example"), None);
+        assert_eq!(
+            note_of("http://new.example").as_deref(),
+            Some("proxies-a.txt · 2026-10-21 15:00")
+        );
+
+        // 同一代理再次导入时备注随最新一批覆盖。
+        service
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
+                proxies: vec![one("http://new.example:443")],
+                import_note: Some("proxies-b.txt · 2026-10-21 16:00".to_string()),
+            })
+            .unwrap();
+        let reloaded = AdminService::load_proxy_pool_from(&Some(proxy_pool_path.clone()));
+        let new_entry = reloaded
+            .proxies
+            .iter()
+            .find(|entry| entry.proxy_url == "http://new.example:443")
+            .unwrap();
+        assert_eq!(
+            new_entry.import_note.as_deref(),
+            Some("proxies-b.txt · 2026-10-21 16:00")
+        );
+        assert_eq!(reloaded.proxies.len(), 2);
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
     fn test_proxy_pool_refuses_a_third_account_when_all_slots_are_full() {
         let test_dir = std::env::temp_dir().join(format!(
             "kiro-admin-proxy-pool-full-{}",
@@ -4216,13 +4298,11 @@ mod tests {
         );
         let service = AdminService::new(manager, Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://full.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://full.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
 
         let result = service.next_proxy_pool_entry();
@@ -4273,13 +4353,11 @@ mod tests {
         );
         let service = AdminService::new(manager, Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://shared.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://shared.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
 
         let pool = service.get_proxy_pool();
@@ -4326,13 +4404,11 @@ mod tests {
         );
         let service = AdminService::new(manager, Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://shared.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://shared.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
 
         let error = service
@@ -4461,13 +4537,11 @@ mod tests {
         );
         let service = AdminService::new(manager.clone(), Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://retired.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://retired.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
         service.mark_proxy_pending(1).unwrap();
 
@@ -4542,13 +4616,11 @@ mod tests {
         );
         let service = AdminService::new(manager.clone(), Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://downgraded.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://downgraded.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
 
         assert!(service.retire_quota_exhausted_pool_credential(1).unwrap());
@@ -4644,13 +4716,11 @@ mod tests {
         );
         let service = AdminService::new(manager.clone(), Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://downgraded-manual.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://downgraded-manual.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
 
         service.set_disabled_and_reconcile(1, true).await.unwrap();
@@ -4805,13 +4875,11 @@ mod tests {
         let events = manager.subscribe_stable_disabled();
         let service = Arc::new(AdminService::new(manager.clone(), Vec::<String>::new()));
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://suspended-downgraded.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://suspended-downgraded.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
         let worker = tokio::spawn(
             service
@@ -4926,13 +4994,11 @@ mod tests {
         let events = manager.subscribe_quota_exhausted();
         let service = Arc::new(AdminService::new(manager.clone(), Vec::<String>::new()));
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://event.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://event.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
         let worker = tokio::spawn(service.clone().run_quota_rotation_worker(events));
 
@@ -5009,20 +5075,18 @@ mod tests {
         );
         let service = AdminService::new(manager.clone(), Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![
-                    SetCredentialProxyRequest {
-                        proxy_url: Some("http://startup-1.example:443".to_string()),
-                        proxy_username: None,
-                        proxy_password: None,
-                    },
-                    SetCredentialProxyRequest {
-                        proxy_url: Some("http://startup-2.example:443".to_string()),
-                        proxy_username: None,
-                        proxy_password: None,
-                    },
-                ],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![
+                SetCredentialProxyRequest {
+                    proxy_url: Some("http://startup-1.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                },
+                SetCredentialProxyRequest {
+                    proxy_url: Some("http://startup-2.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                },
+            ], import_note: None })
             .unwrap();
         service.balance_cache.lock().insert(
             1,
@@ -5101,13 +5165,11 @@ mod tests {
         );
         let service = AdminService::new(manager.clone(), Vec::<String>::new());
         service
-            .add_proxy_pool_entries(AddProxyPoolEntriesRequest {
-                proxies: vec![SetCredentialProxyRequest {
-                    proxy_url: Some("http://startup-downgraded.example:443".to_string()),
-                    proxy_username: None,
-                    proxy_password: None,
-                }],
-            })
+            .add_proxy_pool_entries(AddProxyPoolEntriesRequest { proxies: vec![SetCredentialProxyRequest {
+                proxy_url: Some("http://startup-downgraded.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            }], import_note: None })
             .unwrap();
         service.mark_proxy_pending(1).unwrap();
         service.balance_cache.lock().insert(

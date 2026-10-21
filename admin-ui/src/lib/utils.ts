@@ -196,3 +196,13 @@ function sha256Pure(data: Uint8Array): string {
     .map(v => (v >>> 0).toString(16).padStart(8, '0'))
     .join('')
 }
+
+/**
+ * 导入默认备注：“文件名 · YYYY-MM-DD HH:mm”；没有文件（手动粘贴）时只用导入时间。
+ */
+export function defaultImportNote(fileName?: string | null, now: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const time = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`
+  const name = fileName?.trim()
+  return (name ? `${name} · ${time}` : time).slice(0, 200)
+}

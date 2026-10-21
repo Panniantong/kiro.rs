@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, setCredentialRpm } from '@/api/credentials'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { defaultImportNote, extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -51,6 +51,8 @@ interface VerificationResult {
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [batchNote, setBatchNote] = useState('')
+  // 从文件读入时记下文件名，用作默认导入备注
+  const [sourceFileName, setSourceFileName] = useState('')
   const [batchPriority, setBatchPriority] = useState('')
   const [batchRpm, setBatchRpm] = useState('')
   const [importing, setImporting] = useState(false)
@@ -85,6 +87,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   const resetForm = () => {
     setJsonInput('')
+    setSourceFileName('')
     setBatchNote('')
     setBatchPriority('')
     setBatchRpm('')
@@ -151,11 +154,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       let rollbackSkippedCount = 0
 
       // 4. 导入并验活
+      // 备注优先级：手填统一备注 > JSON 里单条备注 > 默认“文件名 · 导入时间”
       const sharedImportNote = batchNote.trim()
+      const fallbackImportNote = defaultImportNote(sourceFileName)
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
-        const importNote = sharedImportNote || cred.importNote?.trim() || undefined
+        const importNote = sharedImportNote || cred.importNote?.trim() || fallbackImportNote
 
         // 更新状态为检查中
         setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
@@ -452,18 +457,46 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">
-              JSON 格式凭据
-            </label>
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-sm font-medium">
+                JSON 格式凭据
+              </label>
+              <input
+                id="batch-import-file"
+                type="file"
+                accept=".json,.txt,application/json,text/plain"
+                className="hidden"
+                disabled={importing}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0]
+                  e.target.value = ''
+                  if (!file) return
+                  setJsonInput(await file.text())
+                  setSourceFileName(file.name)
+                }}
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={importing}
+                onClick={() => document.getElementById('batch-import-file')?.click()}
+              >
+                从文件读取
+              </Button>
+            </div>
             <textarea
               placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
-              onChange={(e) => setJsonInput(e.target.value)}
+              onChange={(e) => {
+                setJsonInput(e.target.value)
+                if (!e.target.value.trim()) setSourceFileName('')
+              }}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              💡 导入时自动验活，失败的凭据会被排除{sourceFileName && ` · 已读取文件：${sourceFileName}`}
             </p>
           </div>
 
@@ -499,7 +532,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               导入备注
             </label>
             <Input
-              placeholder="例如：Batch 001 - 20 accounts - 20260705 / test 1P"
+              placeholder={`留空默认：${defaultImportNote(sourceFileName)}`}
               value={batchNote}
               onChange={(e) => setBatchNote(e.target.value)}
               disabled={importing}

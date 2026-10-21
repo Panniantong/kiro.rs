@@ -268,6 +268,9 @@ pub struct ProxyPoolAssignmentSkip {
 #[serde(rename_all = "camelCase")]
 pub struct AddProxyPoolEntriesRequest {
     pub proxies: Vec<SetCredentialProxyRequest>,
+    /// 导入备注（可选），写到本批所有代理上；前端默认填“文件名 + 导入时间”。
+    #[serde(default)]
+    pub import_note: Option<String>,
 }
 
 /// 从自动分配代理池移除代理。
@@ -357,6 +360,7 @@ pub struct ProxyPoolEntryStatus {
     pub abnormal_count: usize,
     pub unknown_count: usize,
     pub last_test: Option<ProxyProbeSummary>,
+    pub import_note: Option<String>,
 }
 
 /// 代理下绑定账号的健康摘要。

@@ -11,7 +11,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, setCredentialRpm } from '@/api/credentials'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { defaultImportNote, extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
   open: boolean
@@ -149,6 +149,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
   const [batchNote, setBatchNote] = useState('')
+  // 从文件读入时记下文件名，用作默认导入备注
+  const [sourceFileName, setSourceFileName] = useState('')
   const [batchPriority, setBatchPriority] = useState('')
   const [batchRpm, setBatchRpm] = useState('')
 
@@ -172,6 +174,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
   const resetForm = () => {
     setJsonInput('')
+    setSourceFileName('')
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
@@ -237,7 +240,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       let duplicateCount = 0
       let failCount = 0
       let skippedCount = 0
-      const sharedImportNote = batchNote.trim()
+      // 备注优先级：手填统一备注 > 默认“文件名 · 导入时间”
+      const sharedImportNote = batchNote.trim() || defaultImportNote(sourceFileName)
 
       for (let i = 0; i < validAccounts.length; i++) {
         const account = validAccounts[i]
@@ -301,7 +305,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
             priority: sharedPriority ?? 0,
-            importNote: sharedImportNote || undefined,
+            importNote: sharedImportNote,
           })
 
           addedCredId = addedCred.credentialId
@@ -439,21 +443,50 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-sm font-medium">KAM 导出 JSON</label>
+              <input
+                id="kam-import-file"
+                type="file"
+                accept=".json,.txt,application/json,text/plain"
+                className="hidden"
+                disabled={importing}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0]
+                  e.target.value = ''
+                  if (!file) return
+                  setJsonInput(await file.text())
+                  setSourceFileName(file.name)
+                }}
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={importing}
+                onClick={() => document.getElementById('kam-import-file')?.click()}
+              >
+                从文件读取
+              </Button>
+            </div>
             <textarea
               placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
-              onChange={(e) => setJsonInput(e.target.value)}
+              onChange={(e) => {
+                setJsonInput(e.target.value)
+                if (!e.target.value.trim()) setSourceFileName('')
+              }}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
+            {sourceFileName && <p className="text-xs text-muted-foreground">已读取文件：{sourceFileName}</p>}
           </div>
 
           <div className="space-y-2">
             <label className="text-sm font-medium">导入备注</label>
             <input
               type="text"
-              placeholder="例如：7.7 9:51 / 号商 A / 230 质保12h"
+              placeholder={`留空默认：${defaultImportNote(sourceFileName)}`}
               value={batchNote}
               onChange={(e) => setBatchNote(e.target.value)}
               disabled={importing}

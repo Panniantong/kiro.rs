@@ -23,6 +23,7 @@ import {
   testProxyPoolEntry,
 } from '@/api/credentials'
 import type { CredentialStatusItem, ProxyPoolEntryStatus, ProxyPoolResponse } from '@/types/api'
+import { defaultImportNote } from '@/lib/utils'
 
 interface ProxyPoolStatusCardProps {
   data?: ProxyPoolResponse
@@ -153,7 +154,10 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
     }
     setWorking(true)
     try {
-      const result = await addProxyPoolEntries({ proxies: proxies.map(proxyUrl => ({ proxyUrl })) })
+      const result = await addProxyPoolEntries({
+        proxies: proxies.map(proxyUrl => ({ proxyUrl })),
+        importNote: defaultImportNote(file.name),
+      })
       toast.success(`${result.message}，识别 ${proxies.length} 条`)
       onChanged()
     } catch (error) {
@@ -385,6 +389,9 @@ function ProxyEntry({
           {proxy.assignedCount}/{proxy.assignedCount + proxy.remainingSlots}
         </Badge>
       </div>
+      {proxy.importNote && (
+        <div className="mt-1 truncate text-[11px] text-muted-foreground" title={proxy.importNote}>备注：{proxy.importNote}</div>
+      )}
       <div className="mt-2 flex flex-wrap gap-1">
         <Badge variant="success">正常 {proxy.healthyCount}</Badge>
         <Badge variant={proxy.abnormalCount > 0 ? 'destructive' : 'outline'}>异常 {proxy.abnormalCount}</Badge>
