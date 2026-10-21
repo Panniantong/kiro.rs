@@ -607,14 +607,13 @@ impl AdminService {
         self.set_credentials_proxy_batch(req)
     }
 
+    /// 单个代理的账号上限是硬规则：不论代理门禁开关是否开启，所有写入绑定的入口都要校验。
     fn ensure_proxy_binding_capacity(
         &self,
         proxy_url: &str,
         target_ids: &[u64],
     ) -> Result<(), AdminServiceError> {
-        if !self.token_manager.get_require_pro_plus_credential_proxy()
-            || proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT)
-        {
+        if proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
             return Ok(());
         }
 
@@ -2660,6 +2659,26 @@ impl AdminService {
 
         // 序列化分配到实际写入，防止两个并发导入拿到同一个最后的空槽。
         let _allocation_guard = self.allocation_lock.lock().await;
+        // 显式指定代理同样受单代理账号上限约束；新凭据尚无 ID，按“已绑定数 + 1”判断。
+        if let Some(url) = new_cred.proxy_url.as_deref() {
+            if !url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                let limit = self.token_manager.get_max_accounts_per_proxy();
+                let assigned = self
+                    .token_manager
+                    .snapshot()
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.proxy_url.as_deref() == Some(url))
+                    .count();
+                if assigned + 1 > limit {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "该代理最多允许绑定 {} 个账号，绑定后将达到 {} 个",
+                        limit,
+                        assigned + 1
+                    )));
+                }
+            }
+        }
         let mut assigned_proxy = if proxy_pool_eligibility
             .as_ref()
             .map(|eligibility| eligibility.eligible)
@@ -3413,6 +3432,103 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("最多允许绑定 2 个账号"));
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    fn gate_off_service_with_shared_proxy(
+        tag: &str,
+        bound: u64,
+        unbound: u64,
+    ) -> (AdminService, std::path::PathBuf) {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-admin-{tag}-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut credentials = Vec::new();
+        for id in 1..=(bound + unbound) {
+            let mut credential = KiroCredentials::default();
+            credential.id = Some(id);
+            credential.machine_id = Some(format!("machine-{id}"));
+            if id <= bound {
+                credential.proxy_url = Some("http://shared.example:443".to_string());
+            }
+            credentials.push(credential);
+        }
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&credentials).unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.require_pro_plus_credential_proxy = false;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                credentials,
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        (
+            AdminService::new(manager, Vec::<String>::new()),
+            credentials_path,
+        )
+    }
+
+    #[test]
+    fn test_proxy_capacity_enforced_when_gate_disabled() {
+        let (service, credentials_path) = gate_off_service_with_shared_proxy("gate-off-cap", 2, 1);
+
+        let single = service
+            .set_credential_proxy(
+                3,
+                SetCredentialProxyRequest {
+                    proxy_url: Some("http://shared.example:443".to_string()),
+                    proxy_username: None,
+                    proxy_password: None,
+                },
+            )
+            .unwrap_err();
+        assert!(single.to_string().contains("最多允许绑定 2 个账号"));
+
+        let batch = service
+            .set_credentials_proxy_batch(BatchSetCredentialProxyRequest {
+                ids: vec![3],
+                proxy_url: Some("http://shared.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            })
+            .unwrap_err();
+        assert!(batch.to_string().contains("最多允许绑定 2 个账号"));
+
+        // 已绑定的账号重复写同一代理不算新增占用。
+        service
+            .set_credentials_proxy_batch(BatchSetCredentialProxyRequest {
+                ids: vec![1, 2],
+                proxy_url: Some("http://shared.example:443".to_string()),
+                proxy_username: None,
+                proxy_password: None,
+            })
+            .unwrap();
+
+        std::fs::remove_file(&credentials_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_with_explicit_full_proxy_is_rejected() {
+        let (service, credentials_path) = gate_off_service_with_shared_proxy("explicit-full", 2, 0);
+        let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "rt-explicit-full",
+            "proxyUrl": "http://shared.example:443"
+        }))
+        .unwrap();
+
+        let error = service.add_credential(req).await.unwrap_err();
+        assert!(error.to_string().contains("最多允许绑定 2 个账号"));
+        assert_eq!(service.token_manager.snapshot().entries.len(), 2);
 
         std::fs::remove_file(&credentials_path).unwrap();
     }
