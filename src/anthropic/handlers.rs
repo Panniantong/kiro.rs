@@ -68,6 +68,36 @@ fn reject_if_input_too_large(endpoint: &str, model: &str, input_tokens: u64) -> 
     )
 }
 
+/// Kiro 上游单次请求最多接受的图片数（实测 100 通过、101 返回 IMAGE_COUNT_EXCEEDED）
+const MAX_KIRO_IMAGES_PER_REQUEST: usize = 100;
+
+const TOO_MANY_IMAGES_MESSAGE: &str = "Too many images in this request (max 100 per request). Remove older images from the conversation or start a new conversation.";
+
+/// 图片超限是确定性失败：在发往上游前直接回 400，避免下游按 5xx 反复重试、空等计费
+fn reject_if_too_many_images(endpoint: &str, model: &str, image_count: usize) -> Option<Response> {
+    if image_count <= MAX_KIRO_IMAGES_PER_REQUEST {
+        return None;
+    }
+
+    tracing::warn!(
+        endpoint = endpoint,
+        model = model,
+        image_count = image_count,
+        max_images = MAX_KIRO_IMAGES_PER_REQUEST,
+        "拒绝图片数超限请求，避免进入上游和重试链路"
+    );
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                TOO_MANY_IMAGES_MESSAGE,
+            )),
+        )
+            .into_response(),
+    )
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -108,6 +138,19 @@ fn map_provider_error(err: Error) -> Response {
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 "Input is too long. Reduce the size of your messages.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 图片数超限（预检漏掉时的兜底，例如上游计数口径变化）
+    if err_str.contains("IMAGE_COUNT_EXCEEDED") {
+        tracing::warn!(error = %err, "上游拒绝请求：图片数超限（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                TOO_MANY_IMAGES_MESSAGE,
             )),
         )
             .into_response();
@@ -503,6 +546,14 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    if let Some(resp) = reject_if_too_many_images(
+        "/v1/messages",
+        &payload.model,
+        conversion_result.conversation_state.image_count(),
+    ) {
+        return resp;
+    }
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -2098,6 +2149,14 @@ pub async fn post_messages_cc(
         }
     };
 
+    if let Some(resp) = reject_if_too_many_images(
+        "/cc/v1/messages",
+        &payload.model,
+        conversion_result.conversation_state.image_count(),
+    ) {
+        return resp;
+    }
+
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
@@ -2864,6 +2923,61 @@ mod tests {
         let body_text = body.to_string();
         assert!(!body_text.contains("12/12"));
         assert!(!body_text.contains("凭据"));
+    }
+
+    #[tokio::test]
+    async fn upstream_image_count_exceeded_is_reported_as_non_retryable_400() {
+        let response = map_provider_error(anyhow::anyhow!(
+            "流式 API 请求失败: 400 Bad Request {{\"message\":\"Too many images\",\"reason\":\"IMAGE_COUNT_EXCEEDED\"}}"
+        ));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], TOO_MANY_IMAGES_MESSAGE);
+    }
+
+    fn image_request(user_images: usize, tool_result_images: usize) -> MessagesRequest {
+        let image = serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}
+        });
+        let mut first_turn: Vec<serde_json::Value> = vec![image.clone(); user_images];
+        first_turn.push(serde_json::json!({"type": "text", "text": "look"}));
+        let mut tool_content: Vec<serde_json::Value> = vec![image; tool_result_images];
+        tool_content.push(serde_json::json!({"type": "text", "text": "screenshot"}));
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16,
+            "tools": [{"name": "shot", "description": "take screenshot", "input_schema": {"type": "object", "properties": {}}}],
+            "messages": [
+                {"role": "user", "content": first_turn},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "shot", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": tool_content},
+                    {"type": "text", "text": "how many?"}
+                ]}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn image_guard_counts_history_and_tool_result_images_at_limit_boundary() {
+        let at_limit = convert_request_with_armor(&image_request(60, 40), false).unwrap();
+        assert_eq!(at_limit.conversation_state.image_count(), 100);
+        assert!(
+            reject_if_too_many_images("/v1/messages", "m", at_limit.conversation_state.image_count())
+                .is_none()
+        );
+
+        let over_limit = convert_request_with_armor(&image_request(60, 41), false).unwrap();
+        assert_eq!(over_limit.conversation_state.image_count(), 101);
+        let response =
+            reject_if_too_many_images("/v1/messages", "m", over_limit.conversation_state.image_count())
+                .expect("101 images should be rejected before reaching upstream");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

@@ -72,6 +72,19 @@ impl ConversationState {
         self.history = history;
         self
     }
+
+    /// 整个请求（当前消息 + 全部历史）发给 Kiro 的图片总数
+    pub fn image_count(&self) -> usize {
+        let history_images: usize = self
+            .history
+            .iter()
+            .map(|message| match message {
+                Message::User(user) => user.user_input_message.images.len(),
+                Message::Assistant(_) => 0,
+            })
+            .sum();
+        self.current_message.user_input_message.images.len() + history_images
+    }
 }
 
 /// 当前消息容器
