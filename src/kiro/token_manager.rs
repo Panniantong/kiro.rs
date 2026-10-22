@@ -197,6 +197,7 @@ fn log_token_refresh_failure(
     let upstream_status = status.map(|status| status.as_u16());
 
     tracing::warn!(
+        event_type = "token_refresh",
         request_outcome = "token_refresh_failure_attempt",
         credential_id = credentials.id.unwrap_or_default(),
         credential_id_present = credentials.id.is_some(),
@@ -218,6 +219,7 @@ fn log_token_acquire_failure(id: u64, error: &anyhow::Error, permanently_invalid
         safe_log_text(&error_message, TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS);
 
     tracing::warn!(
+        event_type = "token_refresh",
         request_outcome = "token_acquire_failure",
         credential_id = id,
         permanently_invalid = permanently_invalid,
