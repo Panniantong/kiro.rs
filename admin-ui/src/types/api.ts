@@ -357,6 +357,38 @@ export interface CredentialLogsResponse {
   hasMore: boolean
 }
 
+export interface RecentModelError {
+  errorClass: string | null
+  upstreamStatus: number | null
+  count: number
+  lastMessage: string
+  lastAt: string
+}
+
+export interface RecentModelStatus {
+  model: string
+  success: number
+  failure: number
+  inProgress: number
+  lastRequestAt: string
+  lastSuccessAt: string | null
+  errors: RecentModelError[]
+}
+
+export interface RecentAccountModelStatus {
+  id: number
+  email: string | null
+  importNote: string | null
+  disabled: boolean
+  models: RecentModelStatus[]
+}
+
+export interface RecentModelStatusResponse {
+  minutes: number
+  generatedAt: string
+  accounts: RecentAccountModelStatus[]
+}
+
 export interface CredentialLogQuery {
   severity?: AccountLogSeverity
   eventType?: AccountLogEventType

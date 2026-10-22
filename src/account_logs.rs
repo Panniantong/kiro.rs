@@ -175,6 +175,19 @@ impl AccountLogStore {
             .await
             .map_err(|error| anyhow::anyhow!("账号日志查询任务失败: {error}"))?
     }
+
+    /// 汇总 `since_ms` 之后所有账号的请求日志：账号 → 各模型的成功 / 失败 / 进行中与报错。
+    pub async fn recent_model_summary(
+        &self,
+        since_ms: i64,
+    ) -> anyhow::Result<HashMap<u64, Vec<RecentModelStatus>>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            query_recent_requests(&path, since_ms).map(summarize_recent)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("近期模型状态查询任务失败: {error}"))?
+    }
 }
 
 fn open_connection(path: &PathBuf, flags: OpenFlags) -> rusqlite::Result<Connection> {
@@ -407,6 +420,224 @@ fn query_from_path(
     })
 }
 
+/// 近期汇总只取请求事件的这些列。
+#[derive(Debug, Clone)]
+struct RecentRequestRow {
+    created_at_ms: i64,
+    credential_id: u64,
+    outcome: String,
+    model: Option<String>,
+    error_class: Option<String>,
+    upstream_status: Option<u16>,
+    request_id: Option<String>,
+    message: String,
+    details_json: Option<String>,
+}
+
+/// 某账号某模型下的一类报错。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentModelError {
+    pub error_class: Option<String>,
+    pub upstream_status: Option<u16>,
+    pub count: u64,
+    /// 最近一次的上游原文（已脱敏、截断）。
+    pub last_message: String,
+    pub last_at: String,
+}
+
+/// 某账号某模型在窗口内的请求情况。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentModelStatus {
+    pub model: String,
+    pub success: u64,
+    pub failure: u64,
+    /// 流已开始但还没有收口记录（仍在输出，或旧版本写入的记录）。
+    pub in_progress: u64,
+    pub last_request_at: String,
+    pub last_success_at: Option<String>,
+    /// 按次数降序，最多 3 类。
+    pub errors: Vec<RecentModelError>,
+}
+
+const RECENT_SUMMARY_MAX_ROWS: i64 = 50_000;
+const RECENT_ERROR_TEXT_CHARS: usize = 200;
+const RECENT_ERROR_KINDS: usize = 3;
+
+fn ms_to_rfc3339(ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms)
+        .map(|date| date.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn query_recent_requests(path: &PathBuf, since_ms: i64) -> anyhow::Result<Vec<RecentRequestRow>> {
+    let connection = open_connection(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT created_at, credential_id, outcome, model, error_class, upstream_status,
+                request_id, message, details_json
+         FROM account_logs
+         WHERE event_type = 'request' AND created_at >= ?1
+         ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map((since_ms, RECENT_SUMMARY_MAX_ROWS), |row| {
+            Ok(RecentRequestRow {
+                created_at_ms: row.get(0)?,
+                credential_id: row.get::<_, i64>(1)? as u64,
+                outcome: row.get(2)?,
+                model: row.get(3)?,
+                error_class: row.get(4)?,
+                upstream_status: row.get::<_, Option<i64>>(5)?.map(|value| value as u16),
+                request_id: row.get(6)?,
+                message: row.get(7)?,
+                details_json: row.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 报错展示文本：优先上游响应体，其次传输错误，最后是日志消息本身。
+fn recent_error_text(row: &RecentRequestRow) -> String {
+    let details = row
+        .details_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<JsonValue>(value).ok());
+    let from_details = |key: &str| {
+        details
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let text = from_details("body_summary")
+        .or_else(|| from_details("error_message"))
+        .unwrap_or_else(|| row.message.clone());
+    truncate(&text, RECENT_ERROR_TEXT_CHARS)
+}
+
+/// 行按时间倒序输入。流式请求先写一条 `pending`（request_id = attempt_id），结束时再写
+/// 一条同 request_id 的成功 / 失败；有收口记录的 pending 不重复计数，没有的算“进行中”。
+fn summarize_recent(rows: Vec<RecentRequestRow>) -> HashMap<u64, Vec<RecentModelStatus>> {
+    let resolved: std::collections::HashSet<(u64, String)> = rows
+        .iter()
+        .filter(|row| row.outcome != "pending")
+        .filter_map(|row| {
+            row.request_id
+                .clone()
+                .map(|request_id| (row.credential_id, request_id))
+        })
+        .collect();
+
+    #[derive(Default)]
+    struct ErrorAcc {
+        count: u64,
+        last_message: String,
+        last_at_ms: i64,
+    }
+    #[derive(Default)]
+    struct ModelAcc {
+        success: u64,
+        failure: u64,
+        in_progress: u64,
+        last_request_ms: i64,
+        last_success_ms: Option<i64>,
+        errors: HashMap<(Option<String>, Option<u16>), ErrorAcc>,
+    }
+
+    let mut accounts: HashMap<u64, HashMap<String, ModelAcc>> = HashMap::new();
+    for row in &rows {
+        let model = row
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty() && *model != "?")
+            .unwrap_or("未知")
+            .to_string();
+        let acc = accounts
+            .entry(row.credential_id)
+            .or_default()
+            .entry(model)
+            .or_default();
+        acc.last_request_ms = acc.last_request_ms.max(row.created_at_ms);
+        match row.outcome.as_str() {
+            "success" => {
+                acc.success += 1;
+                if acc.last_success_ms.is_none_or(|ms| ms < row.created_at_ms) {
+                    acc.last_success_ms = Some(row.created_at_ms);
+                }
+            }
+            "pending" => {
+                let is_resolved = row
+                    .request_id
+                    .as_ref()
+                    .is_some_and(|id| resolved.contains(&(row.credential_id, id.clone())));
+                if !is_resolved {
+                    acc.in_progress += 1;
+                }
+            }
+            _ => {
+                acc.failure += 1;
+                let error = acc
+                    .errors
+                    .entry((row.error_class.clone(), row.upstream_status))
+                    .or_default();
+                error.count += 1;
+                // 行是倒序的，第一次见到的就是最近一次。
+                if error.last_message.is_empty() {
+                    error.last_message = recent_error_text(row);
+                    error.last_at_ms = row.created_at_ms;
+                }
+            }
+        }
+    }
+
+    accounts
+        .into_iter()
+        .map(|(credential_id, models)| {
+            let mut statuses: Vec<RecentModelStatus> = models
+                .into_iter()
+                .map(|(model, acc)| {
+                    let mut errors: Vec<RecentModelError> = acc
+                        .errors
+                        .into_iter()
+                        .map(|((error_class, upstream_status), error)| RecentModelError {
+                            error_class,
+                            upstream_status,
+                            count: error.count,
+                            last_message: error.last_message,
+                            last_at: ms_to_rfc3339(error.last_at_ms),
+                        })
+                        .collect();
+                    errors.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_at.cmp(&a.last_at)));
+                    errors.truncate(RECENT_ERROR_KINDS);
+                    RecentModelStatus {
+                        model,
+                        success: acc.success,
+                        failure: acc.failure,
+                        in_progress: acc.in_progress,
+                        last_request_at: ms_to_rfc3339(acc.last_request_ms),
+                        last_success_at: acc.last_success_ms.map(ms_to_rfc3339),
+                        errors,
+                    }
+                })
+                .collect();
+            statuses.sort_by(|a, b| {
+                b.failure
+                    .cmp(&a.failure)
+                    .then((b.success + b.in_progress).cmp(&(a.success + a.in_progress)))
+                    .then(a.model.cmp(&b.model))
+            });
+            (credential_id, statuses)
+        })
+        .collect()
+}
+
 fn encode_cursor(created_at_ms: i64, id: i64) -> String {
     URL_SAFE_NO_PAD.encode(format!("{created_at_ms}:{id}"))
 }
@@ -507,6 +738,9 @@ impl EventVisitor {
             "retry_after_present",
             "permanently_invalid",
             "auth_method",
+            // 上游失败原文（provider 已脱敏并截到 512 字），用于展示具体报错。
+            "body_summary",
+            "error_message",
         ];
         let details: serde_json::Map<String, JsonValue> = detail_keys
             .into_iter()
@@ -704,6 +938,75 @@ mod tests {
     fn cursor_round_trip_is_stable() {
         let encoded = encode_cursor(123456789, 42);
         assert_eq!(decode_cursor(&encoded), Some((123456789, 42)));
+    }
+
+    fn recent_row(
+        at: i64,
+        credential_id: u64,
+        outcome: &str,
+        model: Option<&str>,
+        request_id: Option<&str>,
+    ) -> RecentRequestRow {
+        RecentRequestRow {
+            created_at_ms: at,
+            credential_id,
+            outcome: outcome.to_string(),
+            model: model.map(str::to_string),
+            error_class: None,
+            upstream_status: None,
+            request_id: request_id.map(str::to_string),
+            message: "上游失败尝试".to_string(),
+            details_json: None,
+        }
+    }
+
+    #[test]
+    fn recent_summary_resolves_pending_streams_and_groups_errors() {
+        let capacity = RecentRequestRow {
+            error_class: Some("upstream_400".to_string()),
+            upstream_status: Some(400),
+            details_json: Some(r#"{"body_summary":"INSUFFICIENT_MODEL_CAPACITY newer"}"#.to_string()),
+            ..recent_row(900, 1, "failure", Some("claude-opus-5.5"), None)
+        };
+        let older_capacity = RecentRequestRow {
+            details_json: Some(r#"{"body_summary":"INSUFFICIENT_MODEL_CAPACITY older"}"#.to_string()),
+            created_at_ms: 800,
+            ..capacity.clone()
+        };
+        // 倒序输入，和 SQL 一致。
+        let rows = vec![
+            capacity,
+            recent_row(850, 1, "failure", Some("claude-opus-5.5"), Some("a2")),
+            older_capacity,
+            recent_row(700, 1, "success", Some("claude-sonnet-5"), Some("a1")),
+            recent_row(650, 1, "pending", Some("claude-opus-5.5"), Some("a2")),
+            recent_row(600, 1, "pending", Some("claude-sonnet-5"), Some("a1")),
+            recent_row(500, 1, "pending", Some("claude-sonnet-5"), Some("a3")),
+            recent_row(400, 2, "pending", Some("?"), None),
+        ];
+
+        let summary = summarize_recent(rows);
+        let account = &summary[&1];
+        let opus = account.iter().find(|m| m.model == "claude-opus-5.5").unwrap();
+        assert_eq!((opus.success, opus.failure, opus.in_progress), (0, 3, 0));
+        assert_eq!(opus.last_success_at, None);
+        let capacity_error = opus
+            .errors
+            .iter()
+            .find(|e| e.upstream_status == Some(400))
+            .unwrap();
+        assert_eq!(capacity_error.count, 2);
+        assert_eq!(capacity_error.last_message, "INSUFFICIENT_MODEL_CAPACITY newer");
+
+        // a1 已收口为成功，a3 还没有收口 → 仍算进行中。
+        let sonnet = account.iter().find(|m| m.model == "claude-sonnet-5").unwrap();
+        assert_eq!((sonnet.success, sonnet.failure, sonnet.in_progress), (1, 0, 1));
+        // 有报错的模型排在前面。
+        assert_eq!(account[0].model, "claude-opus-5.5");
+
+        // 旧记录无 request_id、模型未知。
+        assert_eq!(summary[&2][0].model, "未知");
+        assert_eq!(summary[&2][0].in_progress, 1);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use super::{
         batch_set_credential_proxy, batch_set_credential_rpm, batch_test_credential_proxy,
         batch_update_credentials, delete_credential, force_refresh_token, get_all_credentials,
         get_armor_breaking, get_bucket_failover_config, get_credential_balance, get_credential_logs,
-        get_default_rpm,
+        get_default_rpm, get_recent_model_status,
         get_load_balancing_mode,
         get_max_relay, get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool,
         manual_bind_proxy, manual_unbind_proxy, recover_quota_retired, remove_proxy_pool_entries,
@@ -42,6 +42,7 @@ use super::{
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
 /// - `GET /logs/accounts` - 搜索日志账号
+/// - `GET /logs/recent-models` - 近 N 分钟各账号按模型的请求情况（只读）
 /// - `GET /credentials/:id/logs` - 查询账号日志（最多 100 条/页）
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
@@ -53,6 +54,7 @@ use super::{
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
         .route("/logs/accounts", get(search_log_accounts))
+        .route("/logs/recent-models", get(get_recent_model_status))
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),

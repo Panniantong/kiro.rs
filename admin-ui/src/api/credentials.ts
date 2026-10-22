@@ -31,6 +31,7 @@ import type {
   AccountLogAccountSearchResponse,
   CredentialLogQuery,
   CredentialLogsResponse,
+  RecentModelStatusResponse,
 } from '@/types/api'
 // 创建 axios 实例
 const api = axios.create({
@@ -296,6 +297,14 @@ export async function getCredentialLogs(
 ): Promise<CredentialLogsResponse> {
   const { data } = await api.get<CredentialLogsResponse>(`/credentials/${id}/logs`, {
     params: { ...params, limit: 100 },
+  })
+  return data
+}
+
+// 近 N 分钟各账号按模型的请求情况（只读）
+export async function getRecentModelStatus(minutes = 10): Promise<RecentModelStatusResponse> {
+  const { data } = await api.get<RecentModelStatusResponse>('/logs/recent-models', {
+    params: { minutes },
   })
   return data
 }

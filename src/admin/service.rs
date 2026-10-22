@@ -22,7 +22,8 @@ use super::types::{
     AssignCredentialProxyFromPoolRequest, AssignCredentialProxyFromPoolResponse,
     BalanceProbeResult, BalanceProbeSummary, BalanceResponse, BatchBalanceRequest,
     BatchBalanceResponse, BatchSetCredentialProxyRequest, BucketFailoverConfigResponse,
-    CredentialLogQuery,
+    CredentialLogQuery, RecentAccountModelStatus, RecentModelStatusQuery,
+    RecentModelStatusResponse,
     CredentialLogsResponse, CredentialProxyTestResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
     ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
@@ -480,6 +481,54 @@ impl AdminService {
             items: page.items,
             next_cursor: page.next_cursor,
             has_more: page.has_more,
+        })
+    }
+
+    /// 近 N 分钟（默认 10）每个账号按模型的请求情况：成功 / 失败 / 进行中与报错原文。
+    ///
+    /// 只读展示，不参与调度。没有请求的账号也列出，`models` 为空。
+    pub async fn get_recent_model_status(
+        &self,
+        query: RecentModelStatusQuery,
+    ) -> Result<RecentModelStatusResponse, AdminServiceError> {
+        let store = self
+            .account_log_store
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("账号日志存储未启用".to_string()))?;
+        let minutes = query.minutes.unwrap_or(10).clamp(1, 60);
+        let now = Utc::now();
+        let mut by_account = store
+            .recent_model_summary(now.timestamp_millis() - minutes * 60_000)
+            .await
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        let mut accounts: Vec<RecentAccountModelStatus> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .map(|entry| RecentAccountModelStatus {
+                models: by_account.remove(&entry.id).unwrap_or_default(),
+                id: entry.id,
+                email: entry.email,
+                import_note: entry.import_note,
+                disabled: entry.disabled,
+            })
+            .collect();
+        // 有报错的在前，其次有请求的，最后没请求的；同档按请求量降序。
+        accounts.sort_by_key(|account| {
+            let failure: u64 = account.models.iter().map(|m| m.failure).sum();
+            let total: u64 = account
+                .models
+                .iter()
+                .map(|m| m.success + m.failure + m.in_progress)
+                .sum();
+            (failure == 0, total == 0, std::cmp::Reverse(total), account.id)
+        });
+        Ok(RecentModelStatusResponse {
+            minutes,
+            generated_at: now.to_rfc3339(),
+            accounts,
         })
     }
 

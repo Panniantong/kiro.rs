@@ -16,6 +16,7 @@ import { BatchEditDialog } from '@/components/batch-edit-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ProxyPoolStatusCard } from '@/components/proxy-pool-status-card'
+import { RecentModelStatusCard } from '@/components/recent-model-status-card'
 import {
   useCredentials,
   useDeleteCredential,
@@ -1051,6 +1052,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </CardContent>
         </Card>
+
+        <RecentModelStatusCard onViewLogs={handleViewLogs} />
 
         <ProxyPoolStatusCard
           data={proxyPoolData}

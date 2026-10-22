@@ -12,7 +12,7 @@ use super::{
         AccountLogSearchQuery, AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
         BatchBalanceRequest, BatchCredentialIdsRequest, BatchSetCredentialProxyRequest,
         BatchSetRpmRequest, BatchUpdateCredentialsRequest, CredentialLogQuery, ManualProxyBindRequest,
-        ManualProxyUnbindRequest, ProxyPoolTestRequest, RecoverQuotaRetiredRequest,
+        ManualProxyUnbindRequest, ProxyPoolTestRequest, RecentModelStatusQuery, RecoverQuotaRetiredRequest,
         RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetBucketFailoverConfigRequest,
         SetCredentialProxyRequest,
         SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
@@ -35,6 +35,18 @@ pub async fn search_log_accounts(
     Query(query): Query<AccountLogSearchQuery>,
 ) -> impl IntoResponse {
     match state.service.search_log_accounts(query) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/logs/recent-models?minutes=10
+/// 近 N 分钟每个账号按模型的请求情况（只读）。
+pub async fn get_recent_model_status(
+    State(state): State<AdminState>,
+    Query(query): Query<RecentModelStatusQuery>,
+) -> impl IntoResponse {
+    match state.service.get_recent_model_status(query).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }

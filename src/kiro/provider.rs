@@ -122,17 +122,29 @@ pub type KiroByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error
 ///
 /// 未显式确认成功或空流时，析构会按“请求未完成”释放 in-flight，覆盖下游取消、
 /// Body 被丢弃等无法走到 EOF 的路径。`active` 保证每个预留最多结算一次。
+///
+/// 每次结算都写一条带同一 `request_id`（attempt_id）的账号日志，把先前
+/// “进行中”的那条记录收口为成功 / 空流 / 未完成，供“近 10 分钟模型状态”展示。
 pub struct DeferredStreamAttempt {
     token_manager: Arc<MultiTokenManager>,
     credential_id: u64,
+    attempt_id: String,
+    model: Option<String>,
     active: bool,
 }
 
 impl DeferredStreamAttempt {
-    fn new(token_manager: Arc<MultiTokenManager>, credential_id: u64) -> Self {
+    fn new(
+        token_manager: Arc<MultiTokenManager>,
+        credential_id: u64,
+        attempt_id: String,
+        model: Option<String>,
+    ) -> Self {
         Self {
             token_manager,
             credential_id,
+            attempt_id,
+            model,
             active: true,
         }
     }
@@ -145,6 +157,13 @@ impl DeferredStreamAttempt {
         if self.active {
             self.token_manager.report_success(self.credential_id);
             self.active = false;
+            tracing::info!(
+                request_outcome = "success",
+                credential_id = self.credential_id,
+                request_id = %self.attempt_id,
+                model = self.model.as_deref().unwrap_or("?"),
+                "流式响应已确认有可交付内容"
+            );
         }
     }
 
@@ -158,6 +177,14 @@ impl DeferredStreamAttempt {
             "上游 2xx 空流",
         );
         self.active = false;
+        tracing::warn!(
+            request_outcome = "failure_empty_stream",
+            credential_id = self.credential_id,
+            request_id = %self.attempt_id,
+            model = self.model.as_deref().unwrap_or("?"),
+            error_class = "empty_stream",
+            "上游 2xx 但流里没有可交付内容"
+        );
         available
     }
 }
@@ -168,6 +195,14 @@ impl Drop for DeferredStreamAttempt {
             self.token_manager
                 .report_attempt_finished_without_success(self.credential_id);
             self.active = false;
+            tracing::warn!(
+                request_outcome = "failure_stream_incomplete",
+                credential_id = self.credential_id,
+                request_id = %self.attempt_id,
+                model = self.model.as_deref().unwrap_or("?"),
+                error_class = "stream_incomplete",
+                "流式响应未完成（读取中断或客户端断开）"
+            );
         }
     }
 }
@@ -177,22 +212,31 @@ pub struct KiroStreamResponse {
     deferred_attempt: Option<DeferredStreamAttempt>,
 }
 
+/// 一次成功的上游尝试：响应本体，以及给账号日志收口用的凭据、尝试 ID 和模型。
+struct UpstreamSuccess {
+    response: reqwest::Response,
+    credential_id: u64,
+    attempt_id: String,
+    model: Option<String>,
+}
+
 impl KiroStreamResponse {
-    fn new(response: reqwest::Response, _credential_id: u64) -> Self {
+    fn new(response: reqwest::Response) -> Self {
         Self {
             response,
             deferred_attempt: None,
         }
     }
 
-    fn new_deferred(
-        response: reqwest::Response,
-        credential_id: u64,
-        token_manager: Arc<MultiTokenManager>,
-    ) -> Self {
+    fn new_deferred(success: UpstreamSuccess, token_manager: Arc<MultiTokenManager>) -> Self {
         Self {
-            response,
-            deferred_attempt: Some(DeferredStreamAttempt::new(token_manager, credential_id)),
+            response: success.response,
+            deferred_attempt: Some(DeferredStreamAttempt::new(
+                token_manager,
+                success.credential_id,
+                success.attempt_id,
+                success.model,
+            )),
         }
     }
 
@@ -421,14 +465,14 @@ impl KiroProvider {
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         self.call_api_with_retry(request_body, false, true)
             .await
-            .map(|(response, _)| response)
+            .map(|success| success.response)
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
         self.call_api_with_retry(request_body, true, true)
             .await
-            .map(|(response, credential_id)| KiroStreamResponse::new(response, credential_id))
+            .map(|success| KiroStreamResponse::new(success.response))
     }
 
     /// 发送需要在流结束后确认语义成功的流式请求。
@@ -443,13 +487,7 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroStreamResponse> {
         self.call_api_with_retry(request_body, true, false)
             .await
-            .map(|(response, credential_id)| {
-                KiroStreamResponse::new_deferred(
-                    response,
-                    credential_id,
-                    self.token_manager.clone(),
-                )
-            })
+            .map(|success| KiroStreamResponse::new_deferred(success, self.token_manager.clone()))
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -748,7 +786,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         report_success_on_headers: bool,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<UpstreamSuccess> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -922,9 +960,12 @@ impl KiroProvider {
                 } else {
                     "pending_stream_validation"
                 };
+                // 待语义确认的流用 attempt_id 作为 request_id，收口日志据此匹配这条“进行中”。
+                let attempt_id = uuid::Uuid::new_v4().to_string();
                 tracing::info!(
                     request_outcome = request_outcome,
                     credential_id = ctx.id,
+                    request_id = %attempt_id,
                     import_note = %Self::credential_import_note(&ctx.credentials),
                     upstream_status = status.as_u16(),
                     ttfb_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
@@ -940,7 +981,12 @@ impl KiroProvider {
                 }
                 bucket_hops.remove(&ctx.id);
                 self.pin_bucket_on_success(ctx.id, bucket);
-                return Ok((response, ctx.id));
+                return Ok(UpstreamSuccess {
+                    response,
+                    credential_id: ctx.id,
+                    attempt_id,
+                    model,
+                });
             }
 
             let retry_after = Self::retry_after_delay(response.headers());

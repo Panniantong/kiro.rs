@@ -160,6 +160,34 @@ pub struct CredentialLogsResponse {
     pub has_more: bool,
 }
 
+/// 近期模型状态查询参数。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentModelStatusQuery {
+    /// 时间窗口（分钟），默认 10，范围 1–60。
+    pub minutes: Option<i64>,
+}
+
+/// 单个账号在窗口内的各模型请求情况；没有请求时 `models` 为空。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentAccountModelStatus {
+    pub id: u64,
+    pub email: Option<String>,
+    pub import_note: Option<String>,
+    pub disabled: bool,
+    pub models: Vec<crate::account_logs::RecentModelStatus>,
+}
+
+/// 近期模型状态响应（只读展示，不影响调度）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentModelStatusResponse {
+    pub minutes: i64,
+    pub generated_at: String,
+    pub accounts: Vec<RecentAccountModelStatus>,
+}
+
 /// 账号余额缓存/探针状态摘要。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
