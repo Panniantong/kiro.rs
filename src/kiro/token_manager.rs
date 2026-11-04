@@ -1503,16 +1503,20 @@ impl MultiTokenManager {
     /// - balanced 模式：均衡选择可用凭据
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（Opus 5.5 不限制订阅）
     fn select_next_credential(&self, model: Option<&str>) -> SelectOutcome {
         let now = Utc::now();
         let default_rpm = *self.default_rpm.lock();
         let mut entries = self.entries.lock();
         Self::recover_due_cooldowns(&mut entries, now);
 
-        // 检查是否是 opus 模型
+        // 与模型转换保持一致：Opus 5.5（含 thinking 别名）不限制订阅，
+        // 其它 Opus 版本仍使用原有的订阅过滤。
         let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
+            .map(|m| {
+                let lower = m.to_lowercase();
+                lower.contains("opus") && !(lower.contains("5-5") || lower.contains("5.5"))
+            })
             .unwrap_or(false);
 
         // 优先过滤出未冷却的可用凭据；如果全部都在 429 冷却中，则退回到
@@ -1618,7 +1622,7 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（Opus 5.5 不限制订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -3900,6 +3904,114 @@ mod tests {
             in_flight_requests: 0,
             minute_buckets: VecDeque::new(),
         }
+    }
+
+    #[test]
+    fn test_opus55_selection_all_subscriptions_and_aliases() {
+        for mode in ["priority", "balanced"] {
+            for subscription in [
+                Some("KIRO FREE"),
+                Some("kiro free"),
+                Some("KIRO PRO"),
+                Some("KIRO PRO+"),
+                Some("KIRO POWER"),
+                None,
+            ] {
+                for cooling in [false, true] {
+                    for model in [
+                        "claude-opus-5.5",
+                        "claude-opus-5.5-thinking",
+                        "claude-opus-5-5",
+                        "claude-opus-5-5-thinking",
+                    ] {
+                        let mut config = Config::default();
+                        config.load_balancing_mode = mode.to_string();
+                        let mut credential = KiroCredentials::default();
+                        credential.subscription_title = subscription.map(str::to_string);
+                        let manager = MultiTokenManager::new(
+                            config, vec![credential], None, None, false,
+                        )
+                        .unwrap();
+                        if cooling {
+                            manager.entries.lock()[0].cooldown_until =
+                                Some(Utc::now() + Duration::minutes(5));
+                        }
+
+                        assert!(
+                            matches!(
+                                manager.select_next_credential(Some(model)),
+                                SelectOutcome::Selected(1, _)
+                            ),
+                            "mode={mode}, subscription={subscription:?}, cooling={cooling}, model={model}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_opus55_selection_preserves_older_opus_subscription_filter() {
+        for cooling in [false, true] {
+            for model in ["claude-opus-4-5", "claude-opus-4-6", "claude-opus-5"] {
+                let mut credential = KiroCredentials::default();
+                credential.subscription_title = Some("KIRO FREE".to_string());
+                let manager = MultiTokenManager::new(
+                    Config::default(), vec![credential], None, None, false,
+                )
+                .unwrap();
+                if cooling {
+                    manager.entries.lock()[0].cooldown_until =
+                        Some(Utc::now() + Duration::minutes(5));
+                }
+                assert!(matches!(
+                    manager.select_next_credential(Some(model)),
+                    SelectOutcome::NoneAvailable
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn test_opus55_selection_preserves_disabled_cooldown_and_rpm_gates() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let credentials = (0..3)
+            .map(|_| {
+                let mut credential = KiroCredentials::default();
+                credential.subscription_title = Some("KIRO FREE".to_string());
+                credential.rpm = Some(1);
+                credential
+            })
+            .collect();
+        let manager =
+            MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].disabled = true;
+            entries[1].cooldown_until = Some(Utc::now() + Duration::minutes(5));
+        }
+        // A healthy FREE account wins over the cooling account; disabled stays excluded.
+        assert!(matches!(
+            manager.select_next_credential(Some("claude-opus-5.5")),
+            SelectOutcome::Selected(3, _)
+        ));
+        assert!(matches!(
+            manager.select_next_credential(Some("claude-opus-5.5")),
+            SelectOutcome::AllRateLimited { .. }
+        ));
+        // When all enabled accounts cool, relaxation still enforces disabled and RPM.
+        manager.entries.lock()[2].cooldown_until =
+            Some(Utc::now() + Duration::minutes(5));
+        assert!(matches!(
+            manager.select_next_credential(Some("claude-opus-5.5")),
+            SelectOutcome::Selected(2, _)
+        ));
+        assert!(matches!(
+            manager.select_next_credential(Some("claude-opus-5.5")),
+            SelectOutcome::AllRateLimited { .. }
+        ));
+        assert!(manager.entries.lock()[0].success_window.is_empty());
     }
 
     #[test]

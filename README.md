@@ -452,6 +452,13 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
 
+### Opus 5.5 账号资格
+
+Opus 5.5（含点号、横杠和 thinking 别名）不按订阅等级过滤账号，FREE、PRO、PRO+、POWER 和订阅未知账号均可参与调度，最终调用权限由上游决定。普通选号与全池冷却时的放宽选号遵循同一规则。
+
+此规则不自动启用账号，也不绕过额度、代理、禁用状态或每分钟请求上限；其他 Opus 版本的订阅规则保持不变。
+
+
 ## Admin（可选）
 
 当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
