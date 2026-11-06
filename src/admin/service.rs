@@ -13,7 +13,7 @@ use crate::account_logs::{AccountLogEvent, AccountLogFilters, AccountLogStore};
 
 use crate::kiro::model::credentials::{KiroCredentials, refresh_token_tail};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
+use crate::kiro::token_manager::{DisabledReason, MultiTokenManager, RefreshTokenInvalidError};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -2528,8 +2528,7 @@ impl AdminService {
         let usage = match self.token_manager.get_usage_limits_for(id).await {
             Ok(usage) => usage,
             Err(error) => {
-                let message = error.to_string();
-                if Self::is_token_dead_balance_error(&message) {
+                if Self::is_refresh_token_invalid_balance_error(&error) {
                     if let Err(reason_error) = self
                         .token_manager
                         .set_disabled_reason(id, DisabledReason::InvalidRefreshToken)
@@ -2567,12 +2566,9 @@ impl AdminService {
         Ok(response)
     }
 
-    /// 余额查询错误中表示"上游 token 已失效/无权限"的特征。
-    fn is_token_dead_balance_error(message: &str) -> bool {
-        message.contains("权限不足")
-            || message.contains("凭证已过期或无效")
-            || message.contains("403")
-            || message.contains("Forbidden")
+    /// 只有刷新接口明确确认 refreshToken 失效，才覆盖账号的禁用原因。
+    fn is_refresh_token_invalid_balance_error(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<RefreshTokenInvalidError>().is_some()
     }
 
     /// 给"已禁用但无原因"的账号补记原因：额度用尽 / 手动禁用。
@@ -3334,6 +3330,25 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_probe_does_not_mark_network_denial_as_invalid_refresh_token() {
+        for message in [
+            "403 Forbidden: <html>403 ERROR Request blocked</html>",
+            "权限不足，无法获取额度",
+            "OAuth 凭证已过期或无效，需要重新认证",
+            "error sending request for url",
+        ] {
+            assert!(!AdminService::is_refresh_token_invalid_balance_error(
+                &anyhow::anyhow!(message.to_string())
+            ));
+        }
+        let error = anyhow::Error::new(RefreshTokenInvalidError {
+            message: "Social refreshToken 已失效 (invalid_grant): Invalid refresh token provided"
+                .to_string(),
+        }).context("余额查询失败");
+        assert!(AdminService::is_refresh_token_invalid_balance_error(&error));
+    }
     use crate::model::config::Config;
 
     fn balance_response(id: u64, usage_limit: f64, remaining: f64) -> BalanceResponse {
