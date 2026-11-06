@@ -1340,7 +1340,7 @@ impl MultiTokenManager {
         if entry.disabled || Self::is_cooling_down(entry, now) {
             return false;
         }
-        if is_opus && !entry.credentials.supports_opus() {
+        if entry.credentials.available_models.is_none() && is_opus && !entry.credentials.supports_opus() {
             return false;
         }
         true
@@ -1524,7 +1524,7 @@ impl MultiTokenManager {
         let mut candidates: Vec<usize> = entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| Self::is_selectable(e, is_opus, now))
+            .filter(|(_, e)| Self::is_selectable(e, is_opus, now) && e.credentials.allows_model(model))
             .map(|(i, _)| i)
             .collect();
 
@@ -1541,7 +1541,10 @@ impl MultiTokenManager {
                     if e.disabled {
                         return false;
                     }
-                    if is_opus && !e.credentials.supports_opus() {
+                    if !e.credentials.allows_model(model) {
+                        return false;
+                    }
+                    if e.credentials.available_models.is_none() && is_opus && !e.credentials.supports_opus() {
                         return false;
                     }
                     true
@@ -1652,6 +1655,7 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     match entries.iter().position(|e| {
                         e.id == current_id && !e.disabled && !Self::is_cooling_down(e, now)
+                            && e.credentials.allows_model(model)
                     }) {
                         Some(idx)
                             if Self::rpm_exceeded_until(&mut entries[idx], default_rpm, now)
@@ -1677,7 +1681,7 @@ impl MultiTokenManager {
                     let mut outcome = self.select_next_credential(model);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if matches!(outcome, SelectOutcome::NoneAvailable) {
+                    if matches!(outcome, SelectOutcome::NoneAvailable) && self.available_count() == 0 {
                         let mut entries = self.entries.lock();
                         if entries.iter().any(|e| {
                             e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
@@ -3904,6 +3908,54 @@ mod tests {
             in_flight_requests: 0,
             minute_buckets: VecDeque::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn available_models_filter_balanced_priority_and_cooldown_paths() {
+        for mode in ["balanced", "priority"] {
+            let mut config = Config::default();
+            config.load_balancing_mode = mode.to_string();
+            let mut haiku = KiroCredentials::default();
+            haiku.id = Some(1);
+            haiku.access_token = Some("test-a".to_string());
+            haiku.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            haiku.available_models = Some(vec!["claude-haiku-4.5".to_string()]);
+            let mut opus = haiku.clone();
+            opus.id = Some(2);
+            opus.subscription_title = Some("KIRO FREE".to_string());
+            opus.available_models = Some(vec!["claude-opus-5.5".to_string(), "claude-opus-4.6".to_string()]);
+            let manager = MultiTokenManager::new(config, vec![haiku, opus], None, None, false).unwrap();
+            *manager.current_id.lock() = 1;
+            let selected = manager.acquire_context(Some("claude-opus-5.5")).await.unwrap();
+            assert_eq!(selected.id, 2);
+            manager.report_success(2);
+            assert_eq!(manager.acquire_context(Some("claude-opus-4.6")).await.unwrap().id, 2);
+            manager.report_success(2);
+            {
+                let mut entries = manager.entries.lock();
+                entries.iter_mut().find(|e| e.id == 2).unwrap().cooldown_until =
+                    Some(Utc::now() + Duration::minutes(1));
+            }
+            *manager.current_id.lock() = 1;
+            assert_eq!(manager.acquire_context(Some("claude-opus-5.5")).await.unwrap().id, 2);
+            manager.report_success(2);
+            assert_eq!(manager.acquire_context(Some("claude-haiku-4.5")).await.unwrap().id, 1);
+            manager.report_success(1);
+            assert!(matches!(manager.select_next_credential(Some("unsupported-model")), SelectOutcome::NoneAvailable));
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_model_does_not_reenable_unrelated_failed_accounts() {
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.available_models = Some(vec!["claude-haiku-4.5".to_string()]);
+        let mut second = first.clone();
+        second.id = Some(2);
+        let manager = MultiTokenManager::new(Config::default(), vec![first, second], None, None, false).unwrap();
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL { manager.report_failure(2); }
+        assert!(manager.acquire_context(Some("claude-opus-5.5")).await.is_err());
+        assert!(manager.snapshot().entries.iter().find(|e| e.id == 2).unwrap().disabled);
     }
 
     #[test]

@@ -2670,7 +2670,8 @@ impl AdminService {
             email: req.email,
             import_note,
             subscription_title: None, // 将在首次获取使用额度时自动更新
-            overage_status: None,     // 将在首次获取使用额度时自动同步
+            overage_status: None, // 将在首次获取使用额度时自动同步
+            available_models: None,
             proxy_url,
             proxy_username,
             proxy_password,

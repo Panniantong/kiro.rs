@@ -115,6 +115,10 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub subscription_title: Option<String>,
 
+    /// 上游确认的可用模型 ID；未采集清单的旧账号保留原有选号规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_models: Option<Vec<String>>,
+
     /// AWS 侧超额（overage）状态（ENABLED / DISABLED 等）
     ///
     /// 由 getUsageLimits 的 `overageConfiguration.overageStatus` 同步而来。
@@ -296,6 +300,12 @@ impl CredentialsConfig {
 }
 
 impl KiroCredentials {
+    pub fn allows_model(&self, model: Option<&str>) -> bool {
+        match (model, &self.available_models) {
+            (Some(model), Some(models)) => models.iter().any(|id| id.eq_ignore_ascii_case(model)),
+            _ => true,
+        }
+    }
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
 
@@ -394,6 +404,21 @@ impl KiroCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn available_models_round_trip_and_unspecified_model() {
+        let mut credential: KiroCredentials = serde_json::from_str("{}").unwrap();
+        assert!(credential.allows_model(Some("claude-opus-5.5")));
+        credential.available_models = Some(vec!["claude-haiku-4.5".to_string()]);
+        let decoded: KiroCredentials = serde_json::from_str(
+            &serde_json::to_string(&credential).unwrap()
+        ).unwrap();
+        assert!(decoded.allows_model(Some("claude-haiku-4.5")));
+        assert!(!decoded.allows_model(Some("claude-opus-5.5")));
+        assert!(decoded.allows_model(None));
+        credential.available_models = Some(vec![]);
+        assert!(!credential.allows_model(Some("claude-haiku-4.5")));
+    }
     use crate::model::config::Config;
 
     #[test]
@@ -445,6 +470,7 @@ mod tests {
             import_note: None,
             subscription_title: None,
             overage_status: None,
+            available_models: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -582,6 +608,7 @@ mod tests {
             import_note: None,
             subscription_title: None,
             overage_status: None,
+            available_models: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -621,6 +648,7 @@ mod tests {
             import_note: None,
             subscription_title: None,
             overage_status: None,
+            available_models: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -743,6 +771,7 @@ mod tests {
             import_note: None,
             subscription_title: None,
             overage_status: None,
+            available_models: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
