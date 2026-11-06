@@ -1233,7 +1233,8 @@ impl KiroProvider {
     }
 
     fn is_upstream_security_suspension(body: &str) -> bool {
-        body.contains("temporarily is suspended") && body.contains("security precaution")
+        (body.contains("temporarily is suspended") && body.contains("security precaution"))
+            || (body.contains("is temporarily suspended") && body.contains("unusual user activity"))
     }
 
     fn safe_body_summary(body: &str) -> SafeBodySummary {
@@ -1495,6 +1496,12 @@ mod tests {
 
     #[test]
     fn test_detects_only_explicit_kiro_security_suspension() {
+        assert!(KiroProvider::is_upstream_security_suspension(
+            "Your User ID is temporarily suspended. We detected unusual user activity. To restore access, please contact our support team to verify your identity."
+        ));
+        assert!(!KiroProvider::is_upstream_security_suspension(
+            "Too many requests, please wait before trying again."
+        ));
         assert!(KiroProvider::is_upstream_security_suspension(
             "Your User ID (example) temporarily is suspended. We've locked your account as a security precaution."
         ));
