@@ -1329,7 +1329,7 @@ impl StreamContext {
         events
     }
 
-    fn has_deliverable_output(&self) -> bool {
+    pub(crate) fn has_deliverable_output(&self) -> bool {
         self.deliverable_text_seen
             || self.complete_tool_use_seen
             || self

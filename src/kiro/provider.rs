@@ -187,6 +187,22 @@ impl DeferredStreamAttempt {
         );
         available
     }
+
+    pub fn report_refusal(&mut self, message: &str) {
+        if self.active {
+            self.token_manager.report_attempt_finished_without_success(self.credential_id);
+            self.active = false;
+        }
+        tracing::warn!(
+                request_outcome = "failure_upstream_refusal",
+                credential_id = self.credential_id,
+                request_id = %self.attempt_id,
+                model = self.model.as_deref().unwrap_or("?"),
+                error_class = "upstream_refusal",
+                error_message = %KiroProvider::redact_sensitive_text(message),
+                "上游拒绝本次模型请求"
+            );
+    }
 }
 
 impl Drop for DeferredStreamAttempt {
@@ -466,6 +482,12 @@ impl KiroProvider {
         self.call_api_with_retry(request_body, false, true)
             .await
             .map(|success| success.response)
+    }
+
+    pub async fn call_api_deferred(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, DeferredStreamAttempt)> {
+        let success = self.call_api_with_retry(request_body, false, false).await?;
+        let attempt = DeferredStreamAttempt::new(self.token_manager.clone(), success.credential_id, success.attempt_id, success.model);
+        Ok((success.response, attempt))
     }
 
     /// 发送流式 API 请求

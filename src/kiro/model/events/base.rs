@@ -18,6 +18,7 @@ pub enum EventType {
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    Metadata,
     /// 未知事件类型
     Unknown,
 }
@@ -31,6 +32,7 @@ impl EventType {
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "metadataEvent" => Self::Metadata,
             _ => Self::Unknown,
         }
     }
@@ -43,6 +45,7 @@ impl EventType {
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::Metadata => "metadataEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -96,6 +99,12 @@ pub enum Event {
 }
 
 impl Event {
+    pub fn refusal_message(&self) -> Option<&str> {
+        match self {
+            Self::Error { error_code, error_message } if error_code == "CONTENT_FILTERED" => Some(error_message),
+            _ => None,
+        }
+    }
     /// 从帧解析事件
     pub fn from_frame(frame: Frame) -> ParseResult<Self> {
         let message_type = frame.message_type().unwrap_or("event");
@@ -133,6 +142,17 @@ impl Event {
                 Ok(Self::ContextUsage(payload))
             }
             EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Metadata => {
+                let payload: serde_json::Value = frame.payload_as_json()?;
+                if payload.get("stopReason").and_then(|v| v.as_str()) == Some("CONTENT_FILTERED") {
+                    let message = payload.pointer("/stopDetails/refusal/explanation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Upstream refused this request (CONTENT_FILTERED).");
+                    Ok(Self::Error { error_code: "CONTENT_FILTERED".to_string(), error_message: message.to_string() })
+                } else {
+                    Ok(Self::Unknown {})
+                }
+            }
         }
     }
 

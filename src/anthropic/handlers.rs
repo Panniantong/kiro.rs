@@ -667,7 +667,7 @@ async fn handle_stream_request(
     }
 
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream_deferred(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -706,6 +706,11 @@ const EMPTY_STREAM_MAX_ATTEMPTS: usize = 3;
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+fn create_upstream_refusal_sse(message: &str) -> Bytes {
+    let data = json!({"type":"error", "error":{"type":"api_error", "message":format!("Upstream refused request (CONTENT_FILTERED): {}", message)}});
+    Bytes::from(format!("event: error\ndata: {}\n\n", data))
 }
 
 fn create_upstream_unavailable_sse() -> Bytes {
@@ -937,6 +942,10 @@ fn create_retrying_buffered_sse_stream(
                                         match result {
                                             Ok(frame) => {
                                                 if let Ok(event) = Event::from_frame(frame) {
+                                                    if let Some(message) = event.refusal_message() {
+                                                        attempt.report_refusal(message);
+                                                        return Some((vec![Ok(create_upstream_refusal_sse(message))], EmptyStreamRetryState::Done));
+                                                    }
                                                     ctx.process_and_buffer(&event);
                                                 }
                                             }
@@ -1056,11 +1065,11 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
+    let (body_stream, attempt) = response.into_deferred_parts();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, attempt, interval(Duration::from_secs(PING_INTERVAL_SECS))),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut attempt, mut ping_interval)| async move {
             if finished {
                 return None;
             }
@@ -1077,10 +1086,15 @@ fn create_sse_stream(
                             }
 
                             let mut events = Vec::new();
+                            let mut refusal = None;
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            if let Some(message) = event.refusal_message() {
+                                                refusal = Some(message.to_string());
+                                                break;
+                                            }
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
@@ -1091,13 +1105,18 @@ fn create_sse_stream(
                                 }
                             }
 
+                            if let Some(message) = refusal {
+                                attempt.report_refusal(&message);
+                                return Some((stream::iter(vec![Ok(create_upstream_refusal_sse(&message))]), (body_stream, ctx, decoder, true, attempt, ping_interval)));
+                            }
+                            if ctx.has_deliverable_output() { attempt.confirm_success(); }
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, attempt, ping_interval)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1108,16 +1127,17 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, attempt, ping_interval)))
                         }
                         None => {
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
+                            if ctx.has_deliverable_output() { attempt.confirm_success(); }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, attempt, ping_interval)))
                         }
                     }
                 }
@@ -1125,7 +1145,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, attempt, ping_interval)))
                 }
             }
         },
@@ -1254,7 +1274,7 @@ async fn handle_non_stream_request(
     final_text_override: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let (response, mut attempt) = match provider.call_api_deferred(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -1298,6 +1318,12 @@ async fn handle_non_stream_request(
         match result {
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
+                    if let Some(message) = event.refusal_message() {
+                        attempt.report_refusal(message);
+                        return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(
+                            "api_error", format!("Upstream refused request (CONTENT_FILTERED): {}", message)
+                        ))).into_response();
+                    }
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
@@ -1468,6 +1494,7 @@ async fn handle_non_stream_request(
         }
     });
 
+    attempt.confirm_success();
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -2251,7 +2278,7 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream_deferred(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -2290,7 +2317,7 @@ fn create_buffered_sse_stream(
     response: KiroStreamResponse,
     ctx: BufferedStreamContext,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
+    let (body_stream, attempt) = response.into_deferred_parts();
 
     stream::unfold(
         (
@@ -2298,9 +2325,10 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
+            attempt,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut attempt, mut ping_interval)| async move {
             if finished {
                 return None;
             }
@@ -2315,7 +2343,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, attempt, ping_interval)));
                     }
 
                     // 然后处理数据流
@@ -2327,10 +2355,15 @@ fn create_buffered_sse_stream(
                                     tracing::warn!("缓冲区溢出: {}", e);
                                 }
 
+                                let mut refusal = None;
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
                                             if let Ok(event) = Event::from_frame(frame) {
+                                                if let Some(message) = event.refusal_message() {
+                                                    refusal = Some(message.to_string());
+                                                    break;
+                                                }
                                                 // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                 ctx.process_and_buffer(&event);
                                             }
@@ -2340,26 +2373,32 @@ fn create_buffered_sse_stream(
                                         }
                                     }
                                 }
+                                if let Some(message) = refusal {
+                                    attempt.report_refusal(&message);
+                                    return Some((stream::iter(vec![Ok(create_upstream_refusal_sse(&message))]), (body_stream, ctx, decoder, true, attempt, ping_interval)));
+                                }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
+                                if ctx.has_deliverable_output() { attempt.confirm_success(); }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, attempt, ping_interval)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
+                                if ctx.has_deliverable_output() { attempt.confirm_success(); }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, attempt, ping_interval)));
                             }
                         }
                     }
@@ -2434,10 +2473,14 @@ mod tests {
     }
 
     fn assistant_response_frame(content: &str) -> Bytes {
+        test_event_frame("assistantResponseEvent", json!({"content":content}))
+    }
+
+    fn test_event_frame(kind: &str, value: serde_json::Value) -> Bytes {
         let mut headers = Vec::new();
         append_event_stream_string_header(&mut headers, ":message-type", "event");
-        append_event_stream_string_header(&mut headers, ":event-type", "assistantResponseEvent");
-        let payload = serde_json::to_vec(&json!({"content": content})).unwrap();
+        append_event_stream_string_header(&mut headers, ":event-type", kind);
+        let payload = serde_json::to_vec(&value).unwrap();
         let total_length = 12 + headers.len() + payload.len() + 4;
 
         let mut frame = Vec::with_capacity(total_length);
@@ -2450,6 +2493,62 @@ mod tests {
         let message_crc = crate::kiro::parser::crc::crc32(&frame);
         frame.extend_from_slice(&message_crc.to_be_bytes());
         Bytes::from(frame)
+    }
+
+    #[tokio::test]
+    async fn metadata_refusal_is_preserved_without_success_or_retries() {
+        const MESSAGE: &str = "Your access to this model has been temporarily restricted due to excessive content refusals.";
+        for mode in 0..4 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = hits.clone();
+            let app = Router::new().route("/api", post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Response::new(Body::from(test_event_frame("metadataEvent", json!({
+                        "stopReason":"CONTENT_FILTERED", "stopDetails":{"refusal":{"explanation":MESSAGE}}
+                    }))))
+                }
+            }));
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let credential = KiroCredentials {
+                access_token: Some("test-token".to_string()),
+                expires_at: Some((Utc::now()+chrono::Duration::hours(1)).to_rfc3339()),
+                ..Default::default()
+            };
+            let manager=Arc::new(MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap());
+            let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+            endpoints.insert("test".to_string(),Arc::new(DelayedTestEndpoint{base_url:format!("http://{address}")}));
+            let provider=Arc::new(KiroProvider::with_proxy(manager.clone(),None,endpoints,"test".to_string()));
+            let body=r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"claude-opus-5.5"}}}}"#;
+            let response=match mode {
+                0=>handle_non_stream_request(provider,body,"claude-opus-5.5",10,false,false,false,HashMap::new(),None).await,
+                1|2=>handle_stream_request(provider,body,"claude-opus-5.5",10,false,SignatureMode::Disabled,false,HashMap::new(),None,mode==2).await,
+                _=>handle_stream_request_buffered(provider,body,"claude-opus-5.5",10,false,SignatureMode::Disabled,false,HashMap::new()).await,
+            };
+            if mode==0 {assert_eq!(response.status(),StatusCode::BAD_REQUEST);}
+            let bytes=axum::body::to_bytes(response.into_body(),1_000_000).await.unwrap();
+            let text=String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains(MESSAGE),"mode {mode}: {text}");
+            assert!(text.contains("CONTENT_FILTERED"));
+            assert!(!text.contains("message_stop"));
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst),1);
+            let snapshot=manager.snapshot();let entry=&snapshot.entries[0];
+            assert_eq!(entry.success_count,0);assert_eq!(entry.failure_count,0);
+            assert_eq!(entry.in_flight_requests,0);assert!(!entry.disabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_metadata_does_not_hide_a_successful_answer() {
+        let mut bytes=assistant_response_frame("OK").to_vec();
+        bytes.extend_from_slice(&test_event_frame("metadataEvent",json!({"stopReason":"END_TURN"})));
+        let mut decoder=EventStreamDecoder::new();decoder.feed(&bytes).unwrap();
+        let events=decoder.decode_iter().map(|f|Event::from_frame(f.unwrap()).unwrap()).collect::<Vec<_>>();
+        assert!(matches!(&events[0],Event::AssistantResponse(value) if value.content=="OK"));
+        assert!(events[1].refusal_message().is_none());
     }
 
     async fn delayed_assistant_stream() -> Response {
