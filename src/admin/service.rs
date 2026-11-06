@@ -1891,6 +1891,11 @@ impl AdminService {
         if self.token_manager.get_require_pro_plus_credential_proxy() {
             return true;
         }
+        if credentials.proxy_url.as_deref().is_some_and(|url| {
+            url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT)
+        }) {
+            return false;
+        }
         !Self::is_power_10k_without_proxy_allowed(credentials)
     }
 
@@ -4539,7 +4544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_gate_allows_only_power_10k_without_proxy() {
+    fn test_disabled_gate_allows_power_or_explicit_direct() {
         let mut config = Config::default();
         config.require_pro_plus_credential_proxy = false;
         let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
@@ -4553,7 +4558,13 @@ mod tests {
             let mut credential = KiroCredentials::default();
             credential.subscription_title = Some(title.to_string());
             assert!(service.requires_proxy_before_enable(&credential));
+            credential.proxy_url = Some("direct".to_string());
+            assert!(!service.requires_proxy_before_enable(&credential));
         }
+        service.token_manager.set_pro_plus_proxy_gate(true, 2).unwrap();
+        let mut direct = KiroCredentials::default();
+        direct.proxy_url = Some("direct".to_string());
+        assert!(service.requires_proxy_before_enable(&direct));
     }
 
     #[test]

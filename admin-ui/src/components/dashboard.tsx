@@ -1017,7 +1017,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   </Badge>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  关闭门禁后，仅官方识别为 KIRO POWER（1 万积分档）的账号可无代理启用；其它套餐仍必须绑定并验证账号级代理。
+                  关闭门禁后，明确设置 direct 的账号可直连启用；未配置代理时，仍仅允许 KIRO POWER（1 万积分档）启用。
                 </p>
               </div>
               <div className="flex items-center gap-3">
