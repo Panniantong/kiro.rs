@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import { formatSubscriptionTitle } from '@/lib/utils'
 // 禁用原因中文标签（与后端 DisabledReason 对应）
 const DISABLED_REASON_LABELS: Record<string, string> = {
   QuotaExceeded: '额度用尽',
@@ -270,8 +271,11 @@ export function CredentialCard({
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
+              <CardTitle className="text-lg flex flex-wrap items-center gap-2">
                 {credential.email || `凭据 #${credential.id}`}
+                <Badge variant="outline">
+                  {formatSubscriptionTitle(balance?.subscriptionTitle || credential.subscriptionTitle)}
+                </Badge>
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -382,11 +386,9 @@ export function CredentialCard({
               </span>
             </div>
             <div>
-              <span className="text-muted-foreground">订阅等级：</span>
+              <span className="text-muted-foreground">账号套餐：</span>
               <span className="font-medium">
-                {loadingBalance ? (
-                  <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                {formatSubscriptionTitle(balance?.subscriptionTitle || credential.subscriptionTitle)}
               </span>
             </div>
             <div>

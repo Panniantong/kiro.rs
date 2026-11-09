@@ -23,7 +23,7 @@ import {
   testProxyPoolEntry,
 } from '@/api/credentials'
 import type { CredentialStatusItem, ProxyPoolEntryStatus, ProxyPoolResponse } from '@/types/api'
-import { defaultImportNote } from '@/lib/utils'
+import { defaultImportNote, formatSubscriptionTitle } from '@/lib/utils'
 
 interface ProxyPoolStatusCardProps {
   data?: ProxyPoolResponse
@@ -340,7 +340,10 @@ export function ProxyPoolStatusCard({ data, isLoading, credentials, onChanged }:
               <label key={credential.id} className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 hover:bg-muted/50">
                 <Checkbox checked={selectedIds.has(credential.id)} onCheckedChange={() => toggleCandidate(credential.id)} />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate font-medium">#{credential.id} {credential.email || credential.subscriptionTitle || '未知账号'}</span>
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    <span className="max-w-full truncate font-medium">#{credential.id} {credential.email || '未知账号'}</span>
+                    <Badge variant="outline" className="shrink-0">{formatSubscriptionTitle(credential.subscriptionTitle)}</Badge>
+                  </span>
                   <span className="text-xs text-muted-foreground">
                     {credential.disabled ? `已禁用 · ${credential.disabledReason || '原因未知'}` : '可用'} · {credential.importNote || '无备注'} · RPM {credential.currentRpm}
                   </span>
@@ -410,7 +413,10 @@ function ProxyEntry({
         {proxy.assignedCredentials.length === 0 ? <div className="text-muted-foreground">暂无绑定账号</div> : proxy.assignedCredentials.map(credential => (
           <div key={credential.credentialId} className="flex items-center justify-between gap-2 rounded bg-muted/35 px-2 py-1.5">
             <div className="min-w-0">
-              <div className="truncate font-medium">#{credential.credentialId} {credential.email || credential.subscriptionTitle || '未知账号'}</div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="max-w-full truncate font-medium">#{credential.credentialId} {credential.email || '未知账号'}</span>
+                <Badge variant="outline" className="shrink-0">{formatSubscriptionTitle(credential.subscriptionTitle)}</Badge>
+              </div>
               <div className="text-muted-foreground">{credential.remaining == null || credential.usageLimit == null ? '余额未知' : `剩余 ${credential.remaining.toFixed(0)} / ${credential.usageLimit.toFixed(0)}`}</div>
               <div className="text-[11px] text-muted-foreground">
                 代理 {credential.proxyProbeState} · 账号 {credential.accountProbeState} · 恢复 {credential.recoveryState}

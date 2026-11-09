@@ -4,6 +4,7 @@ import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Switch } from '@/components/ui/switch'
 import { useSetDisabled } from '@/hooks/use-credentials'
+import { formatSubscriptionTitle } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 interface CredentialCompactTableProps {
@@ -98,7 +99,7 @@ export function CredentialCompactTable({
                     <div className="mt-1 flex flex-wrap gap-1">
                       <Badge variant="secondary">#{credential.id}</Badge>
                       <Badge variant="outline">{authLabel(credential.authMethod)}</Badge>
-                      <Badge variant="outline">{balance?.subscriptionTitle || credential.subscriptionTitle || '订阅未知'}</Badge>
+                      <Badge variant="outline">{formatSubscriptionTitle(balance?.subscriptionTitle || credential.subscriptionTitle)}</Badge>
                       {credential.isCurrent && <Badge variant="success">当前</Badge>}
                       {credential.boom && (
                         <Badge className="bg-orange-500 text-white hover:bg-orange-500">炸弹号</Badge>

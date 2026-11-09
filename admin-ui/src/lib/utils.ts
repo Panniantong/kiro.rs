@@ -5,6 +5,18 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+export function formatSubscriptionTitle(title?: string | null): string {
+  const plan = title?.trim().replace(/^KIRO\s+/i, '')
+  const labels: Record<string, string> = {
+    FREE: 'Free',
+    PRO: 'Pro',
+    'PRO+': 'Pro+',
+    'PRO MAX': 'Pro Max',
+    POWER: 'Power',
+  }
+  return plan ? labels[plan.toUpperCase()] || plan : '套餐未知'
+}
+
 /**
  * 解析后端错误响应，提取用户友好的错误信息
  */
