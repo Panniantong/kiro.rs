@@ -27,15 +27,16 @@ use super::types::{
     CredentialLogsResponse, CredentialProxyTestResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
     ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
-    ProPlusProxyGateResponse, ProxyAssignedCredentialStatus, ProxyPoolAssignmentSkip,
+    ProPlusProxyGateResponse, PromptGuardResponse, ProxyAssignedCredentialStatus,
+    ProxyPoolAssignmentSkip,
     ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, ProxyPoolTestRequest,
     ProxyPoolTestResponse, ProxyProbeSummary, RecoverQuotaRetiredRequest,
     RecoverQuotaRetiredResponse, RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest,
     SetBucketFailoverConfigRequest,
     SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
-    SetOveragePassthroughRequest, SetProPlusProxyGateRequest,
+    SetOveragePassthroughRequest, SetProPlusProxyGateRequest, SetPromptGuardRequest,
 };
-use crate::model::config::MaxRelayConfig;
+use crate::model::config::{MaxRelayConfig, PromptGuardConfig};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -3132,6 +3133,49 @@ impl AdminService {
         })
     }
 
+    /// 获取客户提示词审核关口配置（api_key 整串返回）
+    pub fn get_prompt_guard(&self) -> PromptGuardResponse {
+        Self::prompt_guard_response(&self.token_manager.get_prompt_guard())
+    }
+
+    /// 设置客户提示词审核关口 api_key（热生效并持久化）
+    ///
+    /// key 留空 = 关闭审核；mode / model / baseUrl / timeout 不由页面修改。
+    pub fn set_prompt_guard(
+        &self,
+        req: SetPromptGuardRequest,
+    ) -> Result<PromptGuardResponse, AdminServiceError> {
+        let api_key = req.api_key.trim();
+        if !api_key.is_empty() && !api_key.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(AdminServiceError::InvalidCredential(
+                "审核 Key 只能包含可见 ASCII 字符".to_string(),
+            ));
+        }
+
+        let mut cfg = self.token_manager.get_prompt_guard();
+        cfg.api_key = api_key.to_string();
+
+        self.token_manager
+            .set_prompt_guard(cfg)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_prompt_guard())
+    }
+
+    fn prompt_guard_response(cfg: &PromptGuardConfig) -> PromptGuardResponse {
+        PromptGuardResponse {
+            active: cfg.is_active(),
+            mode: match cfg.mode {
+                crate::model::config::PromptGuardMode::Off => "off",
+                crate::model::config::PromptGuardMode::Log => "log",
+                crate::model::config::PromptGuardMode::Block => "block",
+            }
+            .to_string(),
+            model: cfg.model.clone(),
+            api_key: cfg.api_key.clone(),
+        }
+    }
+
     /// 获取多桶故障转移配置
     pub fn get_bucket_failover_config(&self) -> BucketFailoverConfigResponse {
         BucketFailoverConfigResponse {
@@ -3788,6 +3832,87 @@ mod tests {
         assert!(!persisted.require_pro_plus_credential_proxy);
         assert_eq!(persisted.max_accounts_per_proxy, 2);
         assert!(!manager.snapshot().entries[0].disabled);
+
+        std::fs::remove_file(&credentials_path).unwrap();
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_prompt_guard_key_hot_swap_and_validation() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "kiro-admin-prompt-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let config_path = test_dir.join("config.json");
+        let credentials_path = test_dir.join("credentials.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string(&Config::default()).unwrap(),
+        )
+        .unwrap();
+
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("machine-1".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string_pretty(&vec![credential.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::load(&config_path).unwrap(),
+                vec![credential],
+                None,
+                Some(credentials_path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+
+        // 默认状态：block 模式、未填 key → 不生效
+        let initial = service.get_prompt_guard();
+        assert_eq!(initial.mode, "block");
+        assert!(!initial.active);
+        assert!(initial.api_key.is_empty());
+
+        // 空 key = 关闭审核
+        let cleared = service
+            .set_prompt_guard(SetPromptGuardRequest {
+                api_key: "  ".to_string(),
+            })
+            .unwrap();
+        assert!(!cleared.active);
+        assert!(cleared.api_key.is_empty());
+
+        // 合法 key → 生效并写回 config.json
+        let enabled = service
+            .set_prompt_guard(SetPromptGuardRequest {
+                api_key: "sk-test-123".to_string(),
+            })
+            .unwrap();
+        assert!(enabled.active);
+        assert_eq!(enabled.mode, "block");
+        assert_eq!(enabled.api_key, "sk-test-123");
+        assert!(manager.get_prompt_guard().is_active());
+        assert_eq!(
+            Config::load(&config_path).unwrap().prompt_guard.api_key,
+            "sk-test-123"
+        );
+
+        // 含空格的 key 被拒绝
+        let error = service
+            .set_prompt_guard(SetPromptGuardRequest {
+                api_key: "sk-bad key".to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, AdminServiceError::InvalidCredential(_)));
+        // 拒绝后原配置保持不变
+        assert_eq!(manager.get_prompt_guard().api_key, "sk-test-123");
 
         std::fs::remove_file(&credentials_path).unwrap();
         std::fs::remove_file(&config_path).unwrap();

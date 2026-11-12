@@ -312,6 +312,18 @@ export interface SetMaxRelayRequest {
   apiKey: string
 }
 
+// 客户提示词审核关口
+export interface PromptGuardResponse {
+  active: boolean
+  mode: string
+  model: string
+  apiKey: string
+}
+
+export interface SetPromptGuardRequest {
+  apiKey: string
+}
+
 export interface AccountLogAccount {
   id: number
   email?: string | null

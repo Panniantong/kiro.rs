@@ -35,6 +35,7 @@ use super::converter::{
 };
 use super::identity_response_guard::rewrite_kiro_self_identity;
 use super::middleware::AppState;
+use super::prompt_guard::GuardDecision;
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -482,6 +483,25 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 客户提示词审核关口：已知 CC Test 检测探针不送审（判官会把复述 tag / 问身份
+    // 判成 sysprompt，送审会让渠道检测失败），其余请求在 CC Test 透传之前审核。
+    let guard_cfg = provider.token_manager().get_prompt_guard();
+    if !is_cctest_probe_request(&payload, &headers)
+        && let GuardDecision::Reject { category } = state
+            .prompt_guard
+            .check(&guard_cfg, &payload.messages, &payload.model)
+            .await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!("Request rejected by content policy (category: {})", category),
+            )),
+        )
+            .into_response();
+    }
 
     // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
     // 普通用户请求（包括普通 Claude Code 请求）继续走本机 Kiro。
@@ -2112,6 +2132,25 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    // 客户提示词审核关口：已知 CC Test 检测探针不送审（判官会把复述 tag / 问身份
+    // 判成 sysprompt，送审会让渠道检测失败），其余请求在 CC Test 透传之前审核。
+    let guard_cfg = provider.token_manager().get_prompt_guard();
+    if !is_cctest_probe_request(&payload, &headers)
+        && let GuardDecision::Reject { category } = state
+            .prompt_guard
+            .check(&guard_cfg, &payload.messages, &payload.model)
+            .await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!("Request rejected by content policy (category: {})", category),
+            )),
+        )
+            .into_response();
+    }
 
     // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
     // 普通用户请求（包括普通 Claude Code 请求）继续走本机 Kiro。

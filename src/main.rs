@@ -175,6 +175,18 @@ async fn main() {
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
+    if config.prompt_guard.is_active() {
+        tracing::info!(
+            "消息审核已开启: 模式 {:?} 判官模型 {}",
+            config.prompt_guard.mode,
+            config.prompt_guard.model
+        );
+    } else {
+        tracing::warn!(
+            "消息审核未生效：后台还没填审核 Key（模式 {:?}）",
+            config.prompt_guard.mode
+        );
+    }
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),

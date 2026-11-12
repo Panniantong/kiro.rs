@@ -752,6 +752,35 @@ pub struct SetMaxRelayRequest {
     pub api_key: String,
 }
 
+// ============ 客户提示词审核关口配置 ============
+
+/// 客户提示词审核关口响应
+///
+/// `api_key` 整串返回（仅 Admin API Key 认证后可见，便于前端回填编辑）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptGuardResponse {
+    /// 关口是否真正生效（模式非 off 且 base_url / api_key 已填）
+    pub active: bool,
+    /// 审核模式："off" | "log" | "block"
+    pub mode: String,
+    /// 判官模型名
+    pub model: String,
+    /// 判官 api_key（整串返回）
+    pub api_key: String,
+}
+
+/// 设置客户提示词审核关口请求
+///
+/// 只允许改 api_key：留空 = 关闭审核；mode / model / baseUrl / timeout 不由页面修改。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPromptGuardRequest {
+    /// 判官 api_key（留空 = 关闭审核）
+    #[serde(default)]
+    pub api_key: String,
+}
+
 /// 多桶故障转移配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

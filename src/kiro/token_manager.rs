@@ -24,7 +24,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::{Config, MaxRelayConfig};
+use crate::model::config::{Config, MaxRelayConfig, PromptGuardConfig};
 
 /// Token refresh 失败日志中的 body 摘要最大字符数。
 const TOKEN_REFRESH_BODY_SUMMARY_MAX_CHARS: usize = 512;
@@ -1092,6 +1092,8 @@ pub struct MultiTokenManager {
     stable_disabled_tx: broadcast::Sender<u64>,
     /// CC Test 透传配置（运行时可修改，默认关闭）
     max_relay: Mutex<MaxRelayConfig>,
+    /// 客户提示词审核关口配置（运行时可修改，默认 block 模式、待填 apiKey）
+    prompt_guard: Mutex<PromptGuardConfig>,
     /// AWS 双桶故障转移开关（运行时可修改，默认关闭）：同一账号在 q. 被限速性失败时
     /// 换用 codewhisperer.{region}.amazonaws.com 重试。
     multi_bucket_failover: Mutex<bool>,
@@ -1255,6 +1257,7 @@ impl MultiTokenManager {
         let require_pro_plus_credential_proxy = config.require_pro_plus_credential_proxy;
         let max_accounts_per_proxy = config.max_accounts_per_proxy;
         let max_relay = config.max_relay.clone();
+        let prompt_guard = config.prompt_guard.clone();
         let multi_bucket_failover = config.multi_bucket_failover;
         let kiro_dev_failover = config.kiro_dev_failover;
         let (quota_exhausted_tx, _) = broadcast::channel(256);
@@ -1276,6 +1279,7 @@ impl MultiTokenManager {
             quota_exhausted_tx,
             stable_disabled_tx,
             max_relay: Mutex::new(max_relay),
+            prompt_guard: Mutex::new(prompt_guard),
             multi_bucket_failover: Mutex::new(multi_bucket_failover),
             kiro_dev_failover: Mutex::new(kiro_dev_failover),
             last_stats_save_at: Mutex::new(None),
@@ -3763,6 +3767,54 @@ impl MultiTokenManager {
             "CC Test 透传配置已更新: enabled={} base_url={}",
             cfg.enabled,
             cfg.base_url
+        );
+        Ok(())
+    }
+
+    /// 获取客户提示词审核关口配置（Admin API）
+    pub fn get_prompt_guard(&self) -> PromptGuardConfig {
+        self.prompt_guard.lock().clone()
+    }
+
+    fn persist_prompt_guard(&self, cfg: &PromptGuardConfig) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，客户提示词审核配置仅在当前进程生效: mode={:?}",
+                    cfg.mode
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.prompt_guard = cfg.clone();
+        config
+            .save()
+            .with_context(|| format!("持久化客户提示词审核配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 设置客户提示词审核关口配置（Admin API，热改并持久化，失败回滚）
+    pub fn set_prompt_guard(&self, cfg: PromptGuardConfig) -> anyhow::Result<()> {
+        let previous = self.get_prompt_guard();
+        *self.prompt_guard.lock() = cfg.clone();
+
+        if let Err(err) = self.persist_prompt_guard(&cfg) {
+            *self.prompt_guard.lock() = previous;
+            return Err(err);
+        }
+
+        // 只打模式与「是否已填 key」，绝不打印 key 本身。
+        tracing::info!(
+            "客户提示词审核配置已更新: mode={:?} key_configured={}",
+            cfg.mode,
+            !cfg.api_key.trim().is_empty()
         );
         Ok(())
     }

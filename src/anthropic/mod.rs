@@ -26,6 +26,7 @@ pub(crate) mod converter;
 mod handlers;
 mod identity_response_guard;
 mod middleware;
+mod prompt_guard;
 mod router;
 mod stream;
 pub mod types;

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, Activity, LayoutGrid, Table2, Shuffle, PencilLine, ScrollText } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Gauge, Network, Activity, LayoutGrid, Table2, Shuffle, PencilLine, ScrollText, ShieldCheck } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -34,6 +34,8 @@ import {
   useProxyPool,
   useMaxRelay,
   useSetMaxRelay,
+  usePromptGuard,
+  useSetPromptGuard,
 } from '@/hooks/use-credentials'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -125,6 +127,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [maxRelayEnabled, setMaxRelayEnabled] = useState(false)
   const [maxRelayBaseUrl, setMaxRelayBaseUrl] = useState('')
   const [maxRelayApiKey, setMaxRelayApiKey] = useState('')
+  const { data: promptGuardData } = usePromptGuard()
+  const { mutate: setPromptGuardKey, isPending: isSettingPromptGuard } = useSetPromptGuard()
+  const [promptGuardApiKey, setPromptGuardApiKey] = useState('')
 
   const sortedCredentials = useMemo(() => {
     return [...(data?.credentials || [])].sort((a, b) => {
@@ -186,6 +191,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
       setMaxRelayApiKey(maxRelayData.apiKey)
     }
   }, [maxRelayData])
+
+  // 消息审核 Key 加载后回填到本地输入框
+  useEffect(() => {
+    if (promptGuardData) {
+      setPromptGuardApiKey(promptGuardData.apiKey)
+    }
+  }, [promptGuardData])
 
   useEffect(() => {
     if (proPlusProxyGateData) {
@@ -818,6 +830,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
     )
   }
 
+  // 保存消息审核 Key
+  const handlePromptGuardSave = () => {
+    const apiKey = promptGuardApiKey.trim()
+    setPromptGuardKey(
+      { apiKey },
+      {
+        onSuccess: (data) => {
+          toast.success(
+            apiKey === ''
+              ? '已清空，消息审核已关闭'
+              : data.active && data.mode === 'block'
+                ? '已保存，消息审核已开启'
+                : `已保存（当前模式：${data.mode}，不会拦截）`
+          )
+        },
+        onError: (error) => {
+          toast.error(`保存失败: ${extractErrorMessage(error)}`)
+        }
+      }
+    )
+  }
+
   // 批量设置 RPM
   const handleBatchSetRpm = () => {
     if (selectedIds.size === 0) {
@@ -1119,6 +1153,52 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 )}
               </div>
               <span className="text-xs text-muted-foreground">未单独设置 RPM 的账号沿用此值</span>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 消息审核 */}
+        <Card className="mb-6">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+              消息审核
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              客户每条新消息先交给智谱审核，违规的直接拦下、不发给 Kiro。填好 Key 保存就生效，清空保存即关闭。
+            </p>
+            <div className="flex items-center gap-2 flex-wrap">
+              {promptGuardData?.active && promptGuardData.mode === 'block' ? (
+                <span className="text-xs text-green-600 dark:text-green-500">状态：已开启（拦截违规消息）</span>
+              ) : promptGuardData?.active ? (
+                <span className="text-xs text-amber-600 dark:text-amber-500">状态：只记录、不拦截（当前模式：{promptGuardData.mode}）</span>
+              ) : promptGuardData && promptGuardData.mode === 'off' ? (
+                <span className="text-xs text-amber-600 dark:text-amber-500">状态：未生效，配置里模式是 off</span>
+              ) : (
+                <span className="text-xs text-amber-600 dark:text-amber-500">状态：未生效，还没填 Key</span>
+              )}
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">智谱审核 Key</label>
+              <Input
+                type="password"
+                value={promptGuardApiKey}
+                onChange={(e) => setPromptGuardApiKey(e.target.value)}
+                placeholder="智谱开放平台 api_key"
+                className="h-9 text-sm"
+                autoComplete="new-password"
+              />
+            </div>
+            <div className="flex items-center justify-end pt-1">
+              <Button
+                size="sm"
+                onClick={handlePromptGuardSave}
+                disabled={isSettingPromptGuard}
+              >
+                {isSettingPromptGuard ? '保存中...' : '保存'}
+              </Button>
             </div>
           </CardContent>
         </Card>

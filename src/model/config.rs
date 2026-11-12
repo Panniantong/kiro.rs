@@ -38,6 +38,69 @@ pub struct MaxRelayConfig {
     pub api_key: String,
 }
 
+/// 客户提示词审核关口模式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptGuardMode {
+    /// 关闭（清空 apiKey 即为此模式）
+    Off,
+    /// 只记录判官结论，永不拦截
+    Log,
+    /// 判官判定违规时拦住请求（默认）
+    #[default]
+    Block,
+}
+
+/// 客户提示词审核关口配置
+///
+/// 默认模式为 `block`：填好 `api_key` 后审核立即生效（见 `is_active`）。
+/// 未填 `api_key` 时关口不生效，不影响号池启动。
+/// 命中违规时按 `mode` 处理：`log` 只落日志放行，`block` 直接拒绝。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptGuardConfig {
+    /// 审核模式（默认 block）
+    #[serde(default)]
+    pub mode: PromptGuardMode,
+
+    /// 判官服务 base_url（默认智谱开放平台，会拼接 /chat/completions）
+    #[serde(default = "default_prompt_guard_base_url")]
+    pub base_url: String,
+
+    /// 判官服务 api_key（留空 = 关口不生效）
+    #[serde(default)]
+    pub api_key: String,
+
+    /// 判官模型名（默认 "glm-4.5-air"）
+    #[serde(default = "default_prompt_guard_model")]
+    pub model: String,
+
+    /// 判官请求超时毫秒数（默认 3000）
+    #[serde(default = "default_prompt_guard_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl PromptGuardConfig {
+    /// 关口是否真正生效：模式非 off、base_url 和 api_key 都已填。
+    pub fn is_active(&self) -> bool {
+        self.mode != PromptGuardMode::Off
+            && !self.base_url.trim().is_empty()
+            && !self.api_key.trim().is_empty()
+    }
+}
+
+impl Default for PromptGuardConfig {
+    fn default() -> Self {
+        Self {
+            mode: PromptGuardMode::default(),
+            base_url: default_prompt_guard_base_url(),
+            api_key: String::new(),
+            model: default_prompt_guard_model(),
+            timeout_ms: default_prompt_guard_timeout_ms(),
+        }
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +247,13 @@ pub struct Config {
     #[serde(default)]
     pub max_relay: MaxRelayConfig,
 
+    /// 客户提示词审核关口（默认拦截，填了 apiKey 才生效）
+    ///
+    /// 客户最新一条 user 文本会先过判官模型；`log` 记日志放行，
+    /// `block` 命中违规直接拒绝。判官出错/超时一律放行。未填 apiKey 时关口不生效。
+    #[serde(default)]
+    pub prompt_guard: PromptGuardConfig,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -265,6 +335,18 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_prompt_guard_base_url() -> String {
+    "https://open.bigmodel.cn/api/paas/v4".to_string()
+}
+
+fn default_prompt_guard_model() -> String {
+    "glm-4.5-air".to_string()
+}
+
+fn default_prompt_guard_timeout_ms() -> u64 {
+    3000
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -324,6 +406,7 @@ impl Default for Config {
             require_pro_plus_credential_proxy: default_require_pro_plus_credential_proxy(),
             max_accounts_per_proxy: default_max_accounts_per_proxy(),
             max_relay: MaxRelayConfig::default(),
+            prompt_guard: PromptGuardConfig::default(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
@@ -364,6 +447,24 @@ impl Config {
         let mut config: Config = serde_json::from_str(&content)?;
         if config.max_accounts_per_proxy == 0 {
             anyhow::bail!("maxAccountsPerProxy 必须大于 0");
+        }
+        // apiKey 非空时才校验字符集：留空表示关口不生效，且避免了默认值报错。
+        // 只校验去掉首尾空白后的 Key（使用时也会 trim），手写配置多带的换行不致起不来。
+        if !config.prompt_guard.api_key.trim().is_empty()
+            && !config
+                .prompt_guard
+                .api_key
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_graphic())
+        {
+            anyhow::bail!("promptGuard.apiKey 只能包含可见 ASCII 字符（不能有空白、换行或中文）");
+        }
+        if config.prompt_guard.mode != PromptGuardMode::Off
+            && !(1..=10_000).contains(&config.prompt_guard.timeout_ms)
+        {
+            // block 模式下这个超时直接叠加到客户请求延迟上，不允许配得过大。
+            anyhow::bail!("promptGuard.timeoutMs 必须在 1 到 10000 之间");
         }
         config.config_path = Some(path.to_path_buf());
         Ok(config)
@@ -427,6 +528,74 @@ mod tests {
 
         let error = Config::load(&path).unwrap_err();
         assert!(error.to_string().contains("maxAccountsPerProxy 必须大于 0"));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prompt_guard_defaults_to_block_when_absent() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert_eq!(config.prompt_guard.mode, PromptGuardMode::Block);
+        assert_eq!(
+            config.prompt_guard.base_url,
+            "https://open.bigmodel.cn/api/paas/v4"
+        );
+        assert!(config.prompt_guard.api_key.is_empty());
+        assert_eq!(config.prompt_guard.model, "glm-4.5-air");
+        assert_eq!(config.prompt_guard.timeout_ms, 3000);
+        assert!(!config.prompt_guard.is_active());
+        assert_eq!(Config::default().prompt_guard.mode, PromptGuardMode::Block);
+        assert!(!Config::default().prompt_guard.is_active());
+    }
+
+    #[test]
+    fn config_load_allows_block_mode_without_api_key() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-prompt-guard-no-api-key-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"promptGuard":{"mode":"block","baseUrl":"https://open.bigmodel.cn/api/paas/v4"}}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.prompt_guard.mode, PromptGuardMode::Block);
+        assert!(!config.prompt_guard.is_active());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn config_load_allows_block_mode_with_api_key() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-prompt-guard-active-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, r#"{"promptGuard":{"apiKey":"test-key"}}"#).unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert!(config.prompt_guard.is_active());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn config_load_rejects_api_key_with_whitespace() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-prompt-guard-bad-api-key-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, r#"{"promptGuard":{"apiKey":"sk-abc def"}}"#).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("promptGuard.apiKey 只能包含可见 ASCII 字符")
+        );
 
         std::fs::remove_file(path).unwrap();
     }

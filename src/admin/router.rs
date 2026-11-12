@@ -13,12 +13,14 @@ use super::{
         get_armor_breaking, get_bucket_failover_config, get_credential_balance, get_credential_logs,
         get_default_rpm, get_recent_model_status,
         get_load_balancing_mode,
-        get_max_relay, get_overage_passthrough, get_pro_plus_proxy_gate, get_proxy_pool,
+        get_max_relay, get_overage_passthrough, get_pro_plus_proxy_gate, get_prompt_guard,
+        get_proxy_pool,
         manual_bind_proxy, manual_unbind_proxy, recover_quota_retired, remove_proxy_pool_entries,
         reset_failure_count, search_log_accounts, set_armor_breaking, set_bucket_failover_config,
         set_credential_disabled, set_credential_priority,
         set_credential_proxy, set_credential_rpm, set_default_rpm, set_load_balancing_mode,
-        set_max_relay, set_overage_passthrough, set_pro_plus_proxy_gate, test_credential_proxy,
+        set_max_relay, set_overage_passthrough, set_pro_plus_proxy_gate, set_prompt_guard,
+        test_credential_proxy,
         test_proxy_pool_entry,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -107,6 +109,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_armor_breaking).put(set_armor_breaking),
         )
         .route("/config/max-relay", get(get_max_relay).put(set_max_relay))
+        .route(
+            "/config/prompt-guard",
+            get(get_prompt_guard).put(set_prompt_guard),
+        )
         .route(
             "/config/bucket-failover",
             get(get_bucket_failover_config).put(set_bucket_failover_config),

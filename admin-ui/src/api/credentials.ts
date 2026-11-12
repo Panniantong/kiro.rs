@@ -21,6 +21,8 @@ import type {
   ProPlusProxyGateResponse,
   SetProPlusProxyGateRequest,
   SetMaxRelayRequest,
+  PromptGuardResponse,
+  SetPromptGuardRequest,
   ProxyPoolResponse,
   ProxyPoolTestResponse,
   ManualProxyBindRequest,
@@ -277,6 +279,18 @@ export async function getMaxRelay(): Promise<MaxRelayResponse> {
 // 设置 CC Test 透传配置
 export async function setMaxRelay(req: SetMaxRelayRequest): Promise<MaxRelayResponse> {
   const { data } = await api.put<MaxRelayResponse>('/config/max-relay', req)
+  return data
+}
+
+// 获取客户提示词审核关口配置
+export async function getPromptGuard(): Promise<PromptGuardResponse> {
+  const { data } = await api.get<PromptGuardResponse>('/config/prompt-guard')
+  return data
+}
+
+// 设置客户提示词审核关口 api_key（保存即生效）
+export async function setPromptGuard(req: SetPromptGuardRequest): Promise<PromptGuardResponse> {
+  const { data } = await api.put<PromptGuardResponse>('/config/prompt-guard', req)
   return data
 }
 

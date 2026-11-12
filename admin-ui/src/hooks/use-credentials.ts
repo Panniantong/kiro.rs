@@ -23,6 +23,8 @@ import {
   setProPlusProxyGate,
   getMaxRelay,
   setMaxRelay,
+  getPromptGuard,
+  setPromptGuard,
   getProxyPool,
   testProxyPoolEntry,
   batchGetCredentialBalance,
@@ -33,6 +35,7 @@ import type {
   AddCredentialRequest,
   SetCredentialProxyRequest,
   SetMaxRelayRequest,
+  SetPromptGuardRequest,
   SetProPlusProxyGateRequest,
   CredentialLogQuery,
 } from '@/types/api'
@@ -294,6 +297,25 @@ export function useSetMaxRelay() {
     mutationFn: (req: SetMaxRelayRequest) => setMaxRelay(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['maxRelay'] })
+    },
+  })
+}
+
+// 获取客户提示词审核关口配置
+export function usePromptGuard() {
+  return useQuery({
+    queryKey: ['promptGuard'],
+    queryFn: getPromptGuard,
+  })
+}
+
+// 设置客户提示词审核关口 api_key（保存即生效）
+export function useSetPromptGuard() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetPromptGuardRequest) => setPromptGuard(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['promptGuard'] })
     },
   })
 }

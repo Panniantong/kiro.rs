@@ -17,6 +17,7 @@ use super::{
         SetCredentialProxyRequest,
         SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
         SetOveragePassthroughRequest, SetPriorityRequest, SetProPlusProxyGateRequest,
+        SetPromptGuardRequest,
         SetRpmRequest, SuccessResponse,
     },
 };
@@ -528,6 +529,24 @@ pub async fn set_max_relay(
     Json(payload): Json<SetMaxRelayRequest>,
 ) -> impl IntoResponse {
     match state.service.set_max_relay(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/prompt-guard
+/// 获取客户提示词审核关口配置
+pub async fn get_prompt_guard(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_prompt_guard())
+}
+
+/// PUT /api/admin/config/prompt-guard
+/// 设置客户提示词审核关口 api_key（热生效并持久化）
+pub async fn set_prompt_guard(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetPromptGuardRequest>,
+) -> impl IntoResponse {
+    match state.service.set_prompt_guard(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
