@@ -21,6 +21,10 @@ pub const KIND_BLOCK: &str = "block";
 pub const KIND_LOG_ONLY: &str = "log_only";
 /// 判官出错 / 超时（照常放行）。
 pub const KIND_JUDGE_ERROR: &str = "judge_error";
+/// 这段对话此前已被 Kiro 拒绝过，重发 / 接着发被本地直接 400 拒绝（不经判官、不送 Kiro）。
+pub const KIND_CONVERSATION_BLOCK: &str = "conversation_block";
+/// 本地拦截被拒对话时记录的类别。
+pub const CATEGORY_KIRO_REFUSED: &str = "kiro_refused";
 
 /// 记录保留期（秒）。
 const RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
@@ -36,7 +40,7 @@ const MAX_PAGE_SIZE: u64 = 100;
 pub struct PromptGuardEvent {
     /// 毫秒时间戳
     pub created_at_ms: i64,
-    /// `block` / `log_only` / `judge_error`
+    /// `block` / `log_only` / `judge_error` / `conversation_block`
     pub kind: String,
     pub category: String,
     pub reason: String,
@@ -78,6 +82,23 @@ impl PromptGuardEvent {
             elapsed_ms: elapsed_ms as i64,
             chars: chars as i64,
             truncated,
+            preview: truncate_chars(text, PREVIEW_CHARS),
+        }
+    }
+
+    /// 被拒对话本地拦截记录：`text` 为客户最后一句文字（可为空）。
+    pub fn conversation_block(model: &str, path: &str, chars: usize, text: &str) -> Self {
+        Self {
+            created_at_ms: Utc::now().timestamp_millis(),
+            kind: KIND_CONVERSATION_BLOCK.to_string(),
+            category: CATEGORY_KIRO_REFUSED.to_string(),
+            reason: "这段对话之前已被 Kiro 拒绝，本地拦下重发".to_string(),
+            model: model.to_string(),
+            path: path.to_string(),
+            status: Some(400),
+            elapsed_ms: 0,
+            chars: chars as i64,
+            truncated: false,
             preview: truncate_chars(text, PREVIEW_CHARS),
         }
     }
@@ -126,6 +147,7 @@ pub struct PromptGuardEventTotals {
     pub block: u64,
     pub log_only: u64,
     pub judge_error: u64,
+    pub conversation_block: u64,
 }
 
 /// 某类别的违规条数。
@@ -332,6 +354,7 @@ fn query_from_path(
                 KIND_BLOCK => totals.block = count,
                 KIND_LOG_ONLY => totals.log_only = count,
                 KIND_JUDGE_ERROR => totals.judge_error = count,
+                KIND_CONVERSATION_BLOCK => totals.conversation_block = count,
                 _ => {}
             }
         }
@@ -778,6 +801,7 @@ mod tests {
                 block: 1,
                 log_only: 2,
                 judge_error: 3,
+                conversation_block: 6,
             },
             categories: vec![PromptGuardCategoryCount {
                 category: "porn".to_string(),
@@ -793,6 +817,7 @@ mod tests {
         assert_eq!(value["totals"]["block"], 1);
         assert_eq!(value["totals"]["logOnly"], 2);
         assert_eq!(value["totals"]["judgeError"], 3);
+        assert_eq!(value["totals"]["conversationBlock"], 6);
         assert_eq!(value["recentJudgeErrors1h"], 4);
         assert_eq!(value["categories"][0]["category"], "porn");
         assert_eq!(value["categories"][0]["count"], 3);

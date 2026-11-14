@@ -21,7 +21,9 @@ use tokio::sync::Semaphore;
 use super::prompt_guard_events::{
     KIND_BLOCK, KIND_LOG_ONLY, PromptGuardEvent, PromptGuardEventStore,
 };
+use super::refusal_memory::{RefusalMemory, conversation_prefix_keys, is_conversation_refusal};
 use super::types::Message;
+use crate::kiro::provider::RefusalHook;
 use crate::model::config::{PromptGuardConfig, PromptGuardMode};
 
 const JUDGE_PROMPT: &str = include_str!("prompt_guard_prompt.txt");
@@ -53,6 +55,16 @@ pub struct PromptGuard {
     log_slots: Arc<Semaphore>,
     /// 拦截记录存储；未配置缓存目录时为空（只打日志）。
     events: Option<Arc<PromptGuardEventStore>>,
+    /// 被 Kiro 拒过的对话（进程内存，重启即清空）。
+    refusal_memory: Arc<RefusalMemory>,
+}
+
+/// 被拒对话记忆的判定结果。
+pub enum ConversationMemoryDecision {
+    /// 这段对话之前已被 Kiro 拒绝过，本地直接拒绝。
+    Refused,
+    /// 放行；带上「上游拒绝时记住这段对话」的回调（记忆关闭时为空）。
+    Continue(Option<RefusalHook>),
 }
 
 impl PromptGuard {
@@ -67,7 +79,65 @@ impl PromptGuard {
             client,
             log_slots: Arc::new(Semaphore::new(LOG_MODE_MAX_INFLIGHT)),
             events,
+            refusal_memory: Arc::new(RefusalMemory::new()),
         })
+    }
+
+    /// 被拒对话记忆：在判官之前调用。这段对话（或它的某个前缀）之前被 Kiro 以
+    /// 「cannot continue this conversation」拒绝过 → `Refused`（记一条 conversation_block）；
+    /// 否则返回回调，交给本次上游尝试，上游拒绝时把这段对话记下来。
+    pub fn check_conversation_memory(
+        &self,
+        cfg: &PromptGuardConfig,
+        messages: &[Message],
+        model_name: &str,
+        path: &'static str,
+    ) -> ConversationMemoryDecision {
+        if cfg.refusal_memory_minutes == 0 || messages.is_empty() {
+            return ConversationMemoryDecision::Continue(None);
+        }
+        let ttl = Duration::from_secs(cfg.refusal_memory_minutes.saturating_mul(60));
+        let keys = conversation_prefix_keys(messages);
+
+        if !self.refusal_memory.is_empty() && self.refusal_memory.matches_any(&keys, ttl) {
+            let text = extract_latest_user_text(messages).unwrap_or_default();
+            let chars = text.chars().count();
+            tracing::warn!(
+                target: "prompt_guard",
+                verdict = "conversation_block",
+                model = model_name,
+                path,
+                messages = messages.len(),
+                "这段对话之前已被 Kiro 拒绝，本地拦下重发"
+            );
+            if let Some(events) = self.events.as_deref() {
+                events.record(PromptGuardEvent::conversation_block(
+                    model_name, path, chars, &text,
+                ));
+            }
+            return ConversationMemoryDecision::Refused;
+        }
+
+        let Some(&key) = keys.last() else {
+            return ConversationMemoryDecision::Continue(None);
+        };
+        let memory = Arc::clone(&self.refusal_memory);
+        let model = model_name.to_string();
+        let message_count = messages.len();
+        let hook: RefusalHook = Arc::new(move |message: &str| {
+            if is_conversation_refusal(message) {
+                memory.remember(key, ttl);
+                tracing::warn!(
+                    target: "prompt_guard",
+                    verdict = "conversation_remembered",
+                    model = %model,
+                    path,
+                    messages = message_count,
+                    "Kiro 拒绝了这段对话，记下，之后重发本地直接拒绝"
+                );
+            }
+        });
+        ConversationMemoryDecision::Continue(Some(hook))
     }
 
     /// 审核请求；判定为违规且配置为 `block` 模式时返回拒绝。
@@ -519,6 +589,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model: "glm-4.5-air".to_string(),
             timeout_ms,
+            refusal_memory_minutes: 60,
         }
     }
 

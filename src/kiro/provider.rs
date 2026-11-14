@@ -131,7 +131,11 @@ pub struct DeferredStreamAttempt {
     attempt_id: String,
     model: Option<String>,
     active: bool,
+    refusal_hook: Option<RefusalHook>,
 }
+
+/// 上游拒绝本次请求时回调（参数是上游的拒绝文案），供上层记住被拒对话。
+pub type RefusalHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl DeferredStreamAttempt {
     fn new(
@@ -146,7 +150,12 @@ impl DeferredStreamAttempt {
             attempt_id,
             model,
             active: true,
+            refusal_hook: None,
         }
+    }
+
+    pub fn set_refusal_hook(&mut self, hook: Option<RefusalHook>) {
+        self.refusal_hook = hook;
     }
 
     pub fn credential_id(&self) -> u64 {
@@ -202,6 +211,9 @@ impl DeferredStreamAttempt {
                 error_message = %KiroProvider::redact_sensitive_text(message),
                 "上游拒绝本次模型请求"
             );
+        if let Some(hook) = &self.refusal_hook {
+            hook(message);
+        }
     }
 }
 
@@ -254,6 +266,14 @@ impl KiroStreamResponse {
                 success.model,
             )),
         }
+    }
+
+    /// 给这次尝试挂上「上游拒绝」回调；非延迟结算的响应没有尝试租约，忽略。
+    pub fn with_refusal_hook(mut self, hook: Option<RefusalHook>) -> Self {
+        if let Some(attempt) = self.deferred_attempt.as_mut() {
+            attempt.set_refusal_hook(hook);
+        }
+        self
     }
 
     pub fn bytes_stream(self) -> KiroByteStream {

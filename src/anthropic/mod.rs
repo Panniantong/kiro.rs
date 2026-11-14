@@ -28,6 +28,7 @@ mod identity_response_guard;
 mod middleware;
 mod prompt_guard;
 pub mod prompt_guard_events;
+mod refusal_memory;
 mod router;
 mod stream;
 pub mod types;

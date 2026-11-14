@@ -325,7 +325,7 @@ export interface SetPromptGuardRequest {
 }
 
 // 消息审核拦截事件明细
-export type PromptGuardEventKind = 'block' | 'log_only' | 'judge_error'
+export type PromptGuardEventKind = 'block' | 'log_only' | 'judge_error' | 'conversation_block'
 
 export type PromptGuardEventCategory =
   | 'bio'
@@ -345,6 +345,7 @@ export type PromptGuardEventCategory =
   | 'politics'
   | 'roleplay'
   | 'zhipu_filter'
+  | 'kiro_refused'
   | 'unknown'
 
 export interface PromptGuardEventsQuery {
@@ -365,6 +366,7 @@ export interface PromptGuardEventTotals {
   block: number
   logOnly: number
   judgeError: number
+  conversationBlock: number
 }
 
 export interface PromptGuardEventCategoryCount {

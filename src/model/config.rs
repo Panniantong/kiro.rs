@@ -78,6 +78,12 @@ pub struct PromptGuardConfig {
     /// 判官请求超时毫秒数（默认 3000）
     #[serde(default = "default_prompt_guard_timeout_ms")]
     pub timeout_ms: u64,
+
+    /// 被 Kiro 以「cannot continue this conversation」拒绝的对话记多少分钟（默认 60，0 = 关）。
+    /// 期间同一段对话重发或接着发，本地直接拒绝、不再送到号池账号上。
+    /// 与审核模式无关：判官关掉也照样生效。
+    #[serde(default = "default_refusal_memory_minutes")]
+    pub refusal_memory_minutes: u64,
 }
 
 impl PromptGuardConfig {
@@ -97,6 +103,7 @@ impl Default for PromptGuardConfig {
             api_key: String::new(),
             model: default_prompt_guard_model(),
             timeout_ms: default_prompt_guard_timeout_ms(),
+            refusal_memory_minutes: default_refusal_memory_minutes(),
         }
     }
 }
@@ -341,6 +348,10 @@ fn default_prompt_guard_base_url() -> String {
 
 fn default_prompt_guard_model() -> String {
     "glm-4.5-air".to_string()
+}
+
+fn default_refusal_memory_minutes() -> u64 {
+    60
 }
 
 fn default_prompt_guard_timeout_ms() -> u64 {

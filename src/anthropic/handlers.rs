@@ -11,7 +11,7 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::{
-    DeferredStreamAttempt, KiroByteStream, KiroProvider, KiroStreamResponse,
+    DeferredStreamAttempt, KiroByteStream, KiroProvider, KiroStreamResponse, RefusalHook,
 };
 use crate::kiro::token_manager::AllRateLimitedError;
 use crate::model::config::MaxRelayConfig;
@@ -35,7 +35,7 @@ use super::converter::{
 };
 use super::identity_response_guard::rewrite_kiro_self_identity;
 use super::middleware::AppState;
-use super::prompt_guard::GuardDecision;
+use super::prompt_guard::{ConversationMemoryDecision, GuardDecision};
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -44,6 +44,36 @@ use super::types::{
 use super::websearch;
 
 const MAX_ACCEPTED_INPUT_TOKENS: u64 = 1_000_000;
+
+/// 本地审核关口拦下的请求（判官判违规）。对外不说原因，`ref` 编号供我们自己识别：
+/// 与 Kiro 上游拒绝（`api_error` + `Upstream refused request`）区分开。
+/// 文案避开 New API 自动停渠道关键词，保持 400 `invalid_request_error`。
+const LOCAL_GUARD_BLOCK_MESSAGE: &str =
+    "Your request could not be processed. Please modify your input and try again. (ref: R4021)";
+/// 本地拦下被 Kiro 拒过的对话的重发。
+const LOCAL_CONVERSATION_BLOCK_MESSAGE: &str = "This conversation cannot be continued. Please start a new conversation or go back to an earlier message. (ref: R4022)";
+
+fn local_guard_block_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            LOCAL_GUARD_BLOCK_MESSAGE,
+        )),
+    )
+        .into_response()
+}
+
+fn local_conversation_block_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            LOCAL_CONVERSATION_BLOCK_MESSAGE,
+        )),
+    )
+        .into_response()
+}
 
 fn reject_if_input_too_large(endpoint: &str, model: &str, input_tokens: u64) -> Option<Response> {
     if input_tokens <= MAX_ACCEPTED_INPUT_TOKENS {
@@ -487,20 +517,22 @@ pub async fn post_messages(
     // 客户提示词审核关口：已知 CC Test 检测探针不送审（判官会把复述 tag / 问身份
     // 判成 sysprompt，送审会让渠道检测失败），其余请求在 CC Test 透传之前审核。
     let guard_cfg = provider.token_manager().get_prompt_guard();
+    let refusal_hook = match state.prompt_guard.check_conversation_memory(
+        &guard_cfg,
+        &payload.messages,
+        &payload.model,
+        "/v1/messages",
+    ) {
+        ConversationMemoryDecision::Refused => return local_conversation_block_response(),
+        ConversationMemoryDecision::Continue(hook) => hook,
+    };
     if !is_cctest_probe_request(&payload, &headers)
-        && let GuardDecision::Reject { category } = state
+        && let GuardDecision::Reject { .. } = state
             .prompt_guard
             .check(&guard_cfg, &payload.messages, &payload.model, "/v1/messages")
             .await
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                format!("Request rejected by content policy (category: {})", category),
-            )),
-        )
-            .into_response();
+        return local_guard_block_response();
     }
 
     // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
@@ -638,6 +670,7 @@ pub async fn post_messages(
             tool_name_map,
             final_text_override,
             guard_empty_stream_success,
+            refusal_hook,
         )
         .await
     } else {
@@ -653,6 +686,7 @@ pub async fn post_messages(
             false,
             tool_name_map,
             final_text_override,
+            refusal_hook,
         )
         .await
     }
@@ -670,6 +704,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
     guard_empty_stream_success: bool,
+    refusal_hook: Option<RefusalHook>,
 ) -> Response {
     if guard_empty_stream_success {
         return handle_stream_request_with_empty_retry(
@@ -682,13 +717,14 @@ async fn handle_stream_request(
             emit_thinking_text,
             tool_name_map,
             final_text_override,
+            refusal_hook,
         )
         .await;
     }
 
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream_deferred(request_body).await {
-        Ok(resp) => resp,
+        Ok(resp) => resp.with_refusal_hook(refusal_hook),
         Err(e) => return map_provider_error(e),
     };
 
@@ -754,9 +790,10 @@ async fn handle_stream_request_with_empty_retry(
     emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
+    refusal_hook: Option<RefusalHook>,
 ) -> Response {
     let first_response = match provider.call_api_stream_deferred(request_body).await {
-        Ok(resp) => resp,
+        Ok(resp) => resp.with_refusal_hook(refusal_hook.clone()),
         Err(e) => return map_provider_error(e),
     };
 
@@ -771,6 +808,7 @@ async fn handle_stream_request_with_empty_retry(
         tool_name_map,
         final_text_override,
         first_response,
+        refusal_hook,
     );
 
     Response::builder()
@@ -871,6 +909,7 @@ fn create_retrying_buffered_sse_stream(
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
     first_response: KiroStreamResponse,
+    refusal_hook: Option<RefusalHook>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let first_ctx = new_buffered_context(
         &model,
@@ -890,6 +929,7 @@ fn create_retrying_buffered_sse_stream(
         let model = model.clone();
         let tool_name_map = tool_name_map.clone();
         let final_text_override = final_text_override.clone();
+        let refusal_hook = refusal_hook.clone();
 
         async move {
             match state {
@@ -904,6 +944,7 @@ fn create_retrying_buffered_sse_stream(
 
                     match provider.call_api_stream_deferred(&request_body).await {
                         Ok(response) => {
+                            let response = response.with_refusal_hook(refusal_hook);
                             let ctx = new_buffered_context(
                                 &model,
                                 input_tokens,
@@ -1292,12 +1333,14 @@ async fn handle_non_stream_request(
     use_context_usage_input_tokens: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     final_text_override: Option<String>,
+    refusal_hook: Option<RefusalHook>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, mut attempt) = match provider.call_api_deferred(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    attempt.set_refusal_hook(refusal_hook);
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -2136,20 +2179,22 @@ pub async fn post_messages_cc(
     // 客户提示词审核关口：已知 CC Test 检测探针不送审（判官会把复述 tag / 问身份
     // 判成 sysprompt，送审会让渠道检测失败），其余请求在 CC Test 透传之前审核。
     let guard_cfg = provider.token_manager().get_prompt_guard();
+    let refusal_hook = match state.prompt_guard.check_conversation_memory(
+        &guard_cfg,
+        &payload.messages,
+        &payload.model,
+        "/cc/v1/messages",
+    ) {
+        ConversationMemoryDecision::Refused => return local_conversation_block_response(),
+        ConversationMemoryDecision::Continue(hook) => hook,
+    };
     if !is_cctest_probe_request(&payload, &headers)
-        && let GuardDecision::Reject { category } = state
+        && let GuardDecision::Reject { .. } = state
             .prompt_guard
             .check(&guard_cfg, &payload.messages, &payload.model, "/cc/v1/messages")
             .await
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                format!("Request rejected by content policy (category: {})", category),
-            )),
-        )
-            .into_response();
+        return local_guard_block_response();
     }
 
     // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
@@ -2282,6 +2327,7 @@ pub async fn post_messages_cc(
             signature_mode,
             emit_thinking_text,
             tool_name_map,
+            refusal_hook,
         )
         .await
     } else {
@@ -2297,6 +2343,7 @@ pub async fn post_messages_cc(
             true,
             tool_name_map,
             None,
+            refusal_hook,
         )
         .await
     }
@@ -2315,10 +2362,11 @@ async fn handle_stream_request_buffered(
     signature_mode: SignatureMode,
     emit_thinking_text: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    refusal_hook: Option<RefusalHook>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream_deferred(request_body).await {
-        Ok(resp) => resp,
+        Ok(resp) => resp.with_refusal_hook(refusal_hook),
         Err(e) => return map_provider_error(e),
     };
 
@@ -2563,9 +2611,9 @@ mod tests {
             let provider=Arc::new(KiroProvider::with_proxy(manager.clone(),None,endpoints,"test".to_string()));
             let body=r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"claude-opus-5.5"}}}}"#;
             let response=match mode {
-                0=>handle_non_stream_request(provider,body,"claude-opus-5.5",10,false,false,false,HashMap::new(),None).await,
-                1|2=>handle_stream_request(provider,body,"claude-opus-5.5",10,false,SignatureMode::Disabled,false,HashMap::new(),None,mode==2).await,
-                _=>handle_stream_request_buffered(provider,body,"claude-opus-5.5",10,false,SignatureMode::Disabled,false,HashMap::new()).await,
+                0=>handle_non_stream_request(provider,body,"claude-opus-5.5",10,false,false,false,HashMap::new(),None,None).await,
+                1|2=>handle_stream_request(provider,body,"claude-opus-5.5",10,false,SignatureMode::Disabled,false,HashMap::new(),None,mode==2,None).await,
+                _=>handle_stream_request_buffered(provider,body,"claude-opus-5.5",10,false,SignatureMode::Disabled,false,HashMap::new(),None).await,
             };
             if mode==0 {assert_eq!(response.status(),StatusCode::BAD_REQUEST);}
             let bytes=axum::body::to_bytes(response.into_body(),1_000_000).await.unwrap();
@@ -2655,6 +2703,7 @@ mod tests {
             HashMap::new(),
             None,
             response,
+            None,
         );
         tokio::pin!(guarded);
 
@@ -2727,6 +2776,7 @@ mod tests {
             HashMap::new(),
             None,
             response,
+            None,
         );
 
         let body = timeout(Duration::from_secs(5), async {
@@ -2794,6 +2844,7 @@ mod tests {
             HashMap::new(),
             None,
             response,
+            None,
         );
         (guarded, manager)
     }

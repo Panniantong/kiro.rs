@@ -58,6 +58,7 @@ const CATEGORY_LABELS: Record<PromptGuardEventCategory, string> = {
   politics: '政治',
   roleplay: '角色扮演陪聊',
   zhipu_filter: '智谱风控拦截',
+  kiro_refused: 'Kiro 拒过的对话',
   unknown: '未分类',
 }
 
@@ -65,9 +66,10 @@ const KIND_LABELS: Record<PromptGuardEventKind, string> = {
   block: 'AI 拦截',
   log_only: '仅记录',
   judge_error: '审核出错放行',
+  conversation_block: '被拒对话重发拦截',
 }
 
-const KIND_OPTIONS: PromptGuardEventKind[] = ['block', 'log_only', 'judge_error']
+const KIND_OPTIONS: PromptGuardEventKind[] = ['block', 'conversation_block', 'log_only', 'judge_error']
 
 const DAYS_OPTIONS: { value: number; label: string }[] = [
   { value: 1, label: '近 24 小时' },
@@ -80,6 +82,7 @@ const DETAIL_DESCRIPTIONS: Record<PromptGuardEventKind, string> = {
   block: '本地拦截，没有转发给 Kiro。',
   log_only: '只记录，请求已照常转发。',
   judge_error: '审核服务出错，请求已照常放行。',
+  conversation_block: '这段对话之前已被 Kiro 拒绝，客户端又重发，本地直接拦下，没有转发给 Kiro。',
 }
 
 function categoryLabel(category: string): string {
@@ -87,7 +90,7 @@ function categoryLabel(category: string): string {
 }
 
 function kindBadgeVariant(kind: PromptGuardEventKind): 'destructive' | 'warning' | 'secondary' {
-  if (kind === 'block') return 'destructive'
+  if (kind === 'block' || kind === 'conversation_block') return 'destructive'
   if (kind === 'log_only') return 'warning'
   return 'secondary'
 }
@@ -215,6 +218,7 @@ export function PromptGuardEventsDialog({ open, onOpenChange }: PromptGuardEvent
                 value={data?.totals.judgeError ?? 0}
                 hint={`近 1 小时 ${data?.recentJudgeErrors1h ?? 0} 次`}
               />
+              <StatBlock label="被拒对话重发拦截" value={data?.totals.conversationBlock ?? 0} />
               {logOnly !== 0 && <StatBlock label="仅记录" value={logOnly} />}
               <div className="rounded-md border p-3">
                 <div className="text-xs text-muted-foreground">当前状态</div>
