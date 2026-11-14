@@ -529,7 +529,13 @@ pub async fn post_messages(
     if !is_cctest_probe_request(&payload, &headers)
         && let GuardDecision::Reject { .. } = state
             .prompt_guard
-            .check(&guard_cfg, &payload.messages, &payload.model, "/v1/messages")
+            .check(
+                &guard_cfg,
+                &payload.messages,
+                payload.system.as_deref(),
+                &payload.model,
+                "/v1/messages",
+            )
             .await
     {
         return local_guard_block_response();
@@ -2191,7 +2197,13 @@ pub async fn post_messages_cc(
     if !is_cctest_probe_request(&payload, &headers)
         && let GuardDecision::Reject { .. } = state
             .prompt_guard
-            .check(&guard_cfg, &payload.messages, &payload.model, "/cc/v1/messages")
+            .check(
+                &guard_cfg,
+                &payload.messages,
+                payload.system.as_deref(),
+                &payload.model,
+                "/cc/v1/messages",
+            )
             .await
     {
         return local_guard_block_response();

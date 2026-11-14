@@ -5,14 +5,25 @@
 //! 超时、返回不可解析时一律放行（审核是附加关卡，不能成为新的可用性单点）。
 //! 唯一例外：判官输出被截断、拿不到完整 JSON 但能看出 `"v":1` 时按违规处理。
 //!
-//! 不做缓存：每次请求都实时问判官。关口自身不保存配置，每次从 `MultiTokenManager`
-//! 读取（Admin API 可热改），因此填好 Key 保存后无需重启即生效。
+//! 关口自身不保存配置，每次从 `MultiTokenManager` 读取（Admin API 可热改），因此填好
+//! Key 保存后无需重启即生效。
 //!
-//! 已知覆盖范围（有意取舍）：只审最后一条 user 消息里的 text 块（含 system-reminder
-//! 内容）；不审 tool_result 内容、system、tools 描述；超过 4000 字只看头 3000 + 尾 1000。
+//! 审两样东西，并行送判官，任一违规即拦：
+//! 1. 最后一条 user 消息里的 text 块（含 system-reminder 内容），每次实时审；超过 4000 字
+//!    只看头 3000 + 尾 1000。
+//! 2. system 提示词（客户给 AI 的角色设定），用专门针对 Kiro 的严格问法：Kiro 会拒绝
+//!    渗透测试 / 攻击类 agent，即使声称已授权也拒，拒多了整池号对该模型被上游锁住。
+//!    按 8000 字切块全量审，每块按内容哈希缓存判定（6 小时），同一套设定只判一次；
+//!    判官出错的块不缓存，下次再审。
+//!
+//! 不审 tool_result 内容、tools 描述、更早的历史消息。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use futures::StreamExt;
+use parking_lot::Mutex;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -22,11 +33,25 @@ use super::prompt_guard_events::{
     KIND_BLOCK, KIND_LOG_ONLY, PromptGuardEvent, PromptGuardEventStore,
 };
 use super::refusal_memory::{RefusalMemory, conversation_prefix_keys, is_conversation_refusal};
-use super::types::Message;
+use super::types::{Message, SystemMessage};
 use crate::kiro::provider::RefusalHook;
 use crate::model::config::{PromptGuardConfig, PromptGuardMode};
 
 const JUDGE_PROMPT: &str = include_str!("prompt_guard_prompt.txt");
+/// system 提示词专用的严格问法（不放过「已授权」的渗透测试 / 攻击 agent）。
+const SYSTEM_JUDGE_PROMPT: &str = include_str!("prompt_guard_system_prompt.txt");
+
+/// system 提示词按多少字切块送审。
+const SYSTEM_CHUNK_CHARS: usize = 8000;
+/// 相邻块起点间隔（块长一半）：块与块重叠一半，违规段落不会被切成两半各自“看着正常”。
+const SYSTEM_CHUNK_STRIDE: usize = SYSTEM_CHUNK_CHARS / 2;
+/// 同一请求 system 块并发送审上限。
+const SYSTEM_CHUNK_CONCURRENCY: usize = 8;
+/// system 块判定缓存时长与条数上限。
+const SYSTEM_VERDICT_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const SYSTEM_VERDICT_MAX_ENTRIES: usize = 50_000;
+/// Claude Code 每次请求都会变的计费头块，不送审（无内容、且每次都会缓存未命中）。
+const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header";
 
 /// 送审文本的字符上限，超过则头 3000 + 尾 1000 截断。
 const MAX_INPUT_CHARS: usize = 4000;
@@ -57,6 +82,8 @@ pub struct PromptGuard {
     events: Option<Arc<PromptGuardEventStore>>,
     /// 被 Kiro 拒过的对话（进程内存，重启即清空）。
     refusal_memory: Arc<RefusalMemory>,
+    /// system 提示词块的判定缓存（进程内存，重启即清空）。
+    system_verdicts: SystemVerdictCache,
 }
 
 /// 被拒对话记忆的判定结果。
@@ -80,6 +107,7 @@ impl PromptGuard {
             log_slots: Arc::new(Semaphore::new(LOG_MODE_MAX_INFLIGHT)),
             events,
             refusal_memory: Arc::new(RefusalMemory::new()),
+            system_verdicts: SystemVerdictCache::default(),
         })
     }
 
@@ -143,11 +171,12 @@ impl PromptGuard {
     /// 审核请求；判定为违规且配置为 `block` 模式时返回拒绝。
     ///
     /// 配置未生效（mode 为 off、base_url 或 api_key 为空）时不调用判官，直接放行。
-    /// 无待审文本、判官出错/超时一律放行。
+    /// 最后一句话和 system 提示词并行送审，任一违规即拒；无待审文本、判官出错/超时放行。
     pub async fn check(
         self: &Arc<Self>,
         cfg: &PromptGuardConfig,
         messages: &[Message],
+        system: Option<&[SystemMessage]>,
         model_name: &str,
         path: &'static str,
     ) -> GuardDecision {
@@ -155,9 +184,11 @@ impl PromptGuard {
             return GuardDecision::Allow;
         }
 
-        let Some(text) = extract_latest_user_text(messages) else {
+        let text = extract_latest_user_text(messages);
+        let chunks = system_chunks(system.unwrap_or_default());
+        if text.is_none() && chunks.is_empty() {
             return GuardDecision::Allow;
-        };
+        }
 
         match cfg.mode {
             PromptGuardMode::Off => GuardDecision::Allow,
@@ -169,7 +200,6 @@ impl PromptGuard {
                         mode = "log",
                         verdict = "skipped",
                         model = model_name,
-                        bytes = text.len(),
                         "prompt guard 后台判官并发已满，跳过本次审核"
                     );
                     return GuardDecision::Allow;
@@ -179,44 +209,203 @@ impl PromptGuard {
                 let model = model_name.to_string();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let started = Instant::now();
-                    let result = guard.judge(&cfg, &text).await;
-                    log_verdict(
-                        guard.events.as_deref(),
-                        path,
-                        "log",
-                        &model,
-                        &text,
-                        started.elapsed().as_millis() as u64,
-                        &result,
+                    tokio::join!(
+                        guard.review_user_text(&cfg, text.as_deref(), &model, path),
+                        guard.review_system(&cfg, &chunks, &model, path),
                     );
                 });
                 GuardDecision::Allow
             }
             PromptGuardMode::Block => {
-                let started = Instant::now();
-                let result = self.judge(cfg, &text).await;
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                log_verdict(
-                    self.events.as_deref(),
-                    path,
-                    "block",
-                    model_name,
-                    &text,
-                    elapsed_ms,
-                    &result,
+                let (user, system) = tokio::join!(
+                    self.review_user_text(cfg, text.as_deref(), model_name, path),
+                    self.review_system(cfg, &chunks, model_name, path),
                 );
-                match result {
-                    Ok(Verdict::Violation { category, .. }) => GuardDecision::Reject { category },
-                    // Pass 或判官出错（Err）一律放行。
-                    _ => GuardDecision::Allow,
+                match user.or(system) {
+                    Some(category) => GuardDecision::Reject { category },
+                    None => GuardDecision::Allow,
                 }
             }
         }
     }
 
-    /// 调用判官模型判定文本。
-    async fn judge(&self, cfg: &PromptGuardConfig, text: &str) -> Result<Verdict, String> {
+    /// 审最后一句话：违规返回类别（是否拦截由调用方按模式决定），并落日志 / 记录。
+    async fn review_user_text(
+        &self,
+        cfg: &PromptGuardConfig,
+        text: Option<&str>,
+        model_name: &str,
+        path: &'static str,
+    ) -> Option<String> {
+        let text = text?;
+        let mode = mode_label(cfg);
+        let started = Instant::now();
+        let result = self
+            .judge(cfg, JUDGE_PROMPT, &prepare_judge_input(text))
+            .await;
+        log_verdict(
+            self.events.as_deref(),
+            path,
+            mode,
+            model_name,
+            text,
+            started.elapsed().as_millis() as u64,
+            &result,
+        );
+        match result {
+            Ok(Verdict::Violation { category, .. }) => Some(category),
+            _ => None,
+        }
+    }
+
+    /// 审 system 提示词块：先查缓存，未命中的并发送判官；违规返回类别。
+    /// 判定结果（通过或违规）按块内容哈希缓存；判官出错的块不缓存、按放行处理。
+    async fn review_system(
+        &self,
+        cfg: &PromptGuardConfig,
+        chunks: &[String],
+        model_name: &str,
+        path: &'static str,
+    ) -> Option<String> {
+        if chunks.is_empty() {
+            return None;
+        }
+        let mode = mode_label(cfg);
+        let total_chars: usize = chunks.iter().map(|c| c.chars().count()).sum();
+        let started = Instant::now();
+
+        // 待审块记下标而不是借用，避免 tokio::spawn 里流组合子的高阶生命周期推断失败。
+        let mut pending: Vec<(SystemChunkKey, usize)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let key: SystemChunkKey = Sha256::digest(chunk.as_bytes()).into();
+            if !seen.insert(key) {
+                continue;
+            }
+            match self.system_verdicts.get(&key) {
+                Some(SystemVerdict::Violation { category, reason }) => {
+                    log_system_violation(
+                        self.events.as_deref(),
+                        path,
+                        mode,
+                        model_name,
+                        &category,
+                        &reason,
+                        0,
+                        total_chars,
+                        chunk,
+                        true,
+                    );
+                    return Some(category);
+                }
+                Some(SystemVerdict::Pass) => {}
+                None => pending.push((key, index)),
+            }
+        }
+        if pending.is_empty() {
+            return None;
+        }
+
+        let judged = pending.len();
+        let results: Vec<(SystemChunkKey, usize, Result<Verdict, String>)> =
+            futures::stream::iter(pending)
+                .map(|(key, index)| async move {
+                    let result = self
+                        .judge(cfg, SYSTEM_JUDGE_PROMPT, &wrap_judge_input(&chunks[index]))
+                        .await;
+                    (key, index, result)
+                })
+                .buffer_unordered(SYSTEM_CHUNK_CONCURRENCY)
+                .collect()
+                .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let mut violation: Option<(String, String, &str)> = None;
+        let mut errors: Vec<String> = Vec::new();
+        for (key, index, result) in results {
+            match result {
+                Ok(Verdict::Pass) => self.system_verdicts.put(key, SystemVerdict::Pass),
+                Ok(Verdict::Violation { category, reason }) => {
+                    self.system_verdicts.put(
+                        key,
+                        SystemVerdict::Violation {
+                            category: category.clone(),
+                            reason: reason.clone(),
+                        },
+                    );
+                    if violation.is_none() {
+                        violation = Some((category, reason, chunks[index].as_str()));
+                    }
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+
+        if let Some(error) = errors.first() {
+            tracing::warn!(
+                target: "prompt_guard",
+                mode = mode,
+                verdict = "error",
+                scope = "system",
+                reason = %error,
+                failed_chunks = errors.len(),
+                model = model_name,
+                elapsed_ms = elapsed_ms,
+                "prompt guard system verdict"
+            );
+            if let Some(store) = self.events.as_deref() {
+                store.record(PromptGuardEvent::judge_error(
+                    &format!("system 提示词审核: {}", error),
+                    model_name,
+                    path,
+                    elapsed_ms,
+                    total_chars,
+                    false,
+                ));
+            }
+        }
+
+        match violation {
+            Some((category, reason, chunk)) => {
+                log_system_violation(
+                    self.events.as_deref(),
+                    path,
+                    mode,
+                    model_name,
+                    &category,
+                    &reason,
+                    elapsed_ms,
+                    total_chars,
+                    chunk,
+                    false,
+                );
+                Some(category)
+            }
+            None => {
+                tracing::info!(
+                    target: "prompt_guard",
+                    mode = mode,
+                    verdict = "pass",
+                    scope = "system",
+                    model = model_name,
+                    chunks = chunks.len(),
+                    judged = judged,
+                    elapsed_ms = elapsed_ms,
+                    chars = total_chars,
+                    "prompt guard system verdict"
+                );
+                None
+            }
+        }
+    }
+
+    /// 调用判官模型判定 `input`（已包好 `<待审文本>` 标签），`prompt` 为判官问法。
+    async fn judge(
+        &self,
+        cfg: &PromptGuardConfig,
+        prompt: &str,
+        input: &str,
+    ) -> Result<Verdict, String> {
         let url = format!(
             "{}/chat/completions",
             cfg.base_url.trim().trim_end_matches('/')
@@ -224,8 +413,8 @@ impl PromptGuard {
         let body = json!({
             "model": cfg.model,
             "messages": [
-                {"role": "system", "content": JUDGE_PROMPT},
-                {"role": "user", "content": prepare_judge_input(text)},
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": input},
             ],
             "temperature": 0,
             "max_tokens": 200,
@@ -364,24 +553,152 @@ fn split_system_reminders(input: &str) -> (String, String) {
 /// 把客户文本包进 `<待审文本>` 标签送给判官；先把客户自己写的标签转义，
 /// 防止伪造审核边界。超长文本按字符截断为头 3000 + 尾 1000。
 pub fn prepare_judge_input(text: &str) -> String {
-    let sanitized = sanitize_for_judge(text);
-
     // 按字符边界切片，不 collect 成 Vec<char>，避免超大请求体在内存里放大 4 倍。
-    let total = sanitized.chars().count();
-    let body = if total > MAX_INPUT_CHARS {
-        let byte_at = |n: usize| sanitized.char_indices().nth(n).map_or(sanitized.len(), |(i, _)| i);
-        let head_end = byte_at(INPUT_HEAD_CHARS);
-        let tail_start = byte_at(total - INPUT_TAIL_CHARS);
-        format!(
-            "{}\n…（中间省略）…\n{}",
-            &sanitized[..head_end],
-            &sanitized[tail_start..]
-        )
-    } else {
-        sanitized
-    };
+    let total = text.chars().count();
+    if total <= MAX_INPUT_CHARS {
+        return wrap_judge_input(text);
+    }
+    let byte_at = |n: usize| text.char_indices().nth(n).map_or(text.len(), |(i, _)| i);
+    let head_end = byte_at(INPUT_HEAD_CHARS);
+    let tail_start = byte_at(total - INPUT_TAIL_CHARS);
+    wrap_judge_input(&format!(
+        "{}\n…（中间省略）…\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    ))
+}
 
-    format!("<待审文本>\n{}\n</待审文本>", body)
+/// 把文本转义后原样（不截断）包进 `<待审文本>` 标签。
+pub fn wrap_judge_input(text: &str) -> String {
+    format!("<待审文本>\n{}\n</待审文本>", sanitize_for_judge(text))
+}
+
+/// 把 system 提示词切成送审块：逐块 trim，跳过空块和 Claude Code 计费头块，
+/// 每块按字符切成不超过 8000 字的片段。
+pub fn system_chunks(system: &[SystemMessage]) -> Vec<String> {
+    let mut chunks = Vec::new();
+    for block in system {
+        let text = block.text.trim();
+        if text.is_empty() || text.starts_with(BILLING_HEADER_PREFIX) {
+            continue;
+        }
+        let bounds: Vec<usize> = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        let char_count = bounds.len() - 1;
+        let mut start = 0;
+        loop {
+            let end = (start + SYSTEM_CHUNK_CHARS).min(char_count);
+            chunks.push(text[bounds[start]..bounds[end]].to_string());
+            if end == char_count {
+                break;
+            }
+            start += SYSTEM_CHUNK_STRIDE;
+        }
+    }
+    chunks
+}
+
+fn mode_label(cfg: &PromptGuardConfig) -> &'static str {
+    match cfg.mode {
+        PromptGuardMode::Block => "block",
+        _ => "log",
+    }
+}
+
+/// system 块内容的 SHA256。
+type SystemChunkKey = [u8; 32];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SystemVerdict {
+    Pass,
+    Violation { category: String, reason: String },
+}
+
+/// system 块判定缓存：按内容哈希存判定，6 小时过期，最多 5 万条。
+#[derive(Default)]
+struct SystemVerdictCache {
+    entries: Mutex<HashMap<SystemChunkKey, (SystemVerdict, Instant)>>,
+}
+
+impl SystemVerdictCache {
+    fn get(&self, key: &SystemChunkKey) -> Option<SystemVerdict> {
+        let mut entries = self.entries.lock();
+        match entries.get(key) {
+            Some((verdict, at)) if at.elapsed() < SYSTEM_VERDICT_TTL => Some(verdict.clone()),
+            Some(_) => {
+                entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn put(&self, key: SystemChunkKey, verdict: SystemVerdict) {
+        let mut entries = self.entries.lock();
+        if entries.len() >= SYSTEM_VERDICT_MAX_ENTRIES && !entries.contains_key(&key) {
+            entries.retain(|_, (_, at)| at.elapsed() < SYSTEM_VERDICT_TTL);
+            if entries.len() >= SYSTEM_VERDICT_MAX_ENTRIES
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(key, _)| *key)
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, (verdict, Instant::now()));
+    }
+}
+
+/// system 提示词违规：落一条拦截记录（理由前加「系统设定：」）+ info 日志。
+#[allow(clippy::too_many_arguments)]
+fn log_system_violation(
+    events: Option<&PromptGuardEventStore>,
+    path: &'static str,
+    mode: &str,
+    model: &str,
+    category: &str,
+    reason: &str,
+    elapsed_ms: u64,
+    total_chars: usize,
+    chunk: &str,
+    cached: bool,
+) {
+    if let Some(store) = events {
+        let (kind, status) = match mode {
+            "block" => (KIND_BLOCK, Some(400)),
+            _ => (KIND_LOG_ONLY, None),
+        };
+        store.record(PromptGuardEvent::violation(
+            kind,
+            category,
+            &format!("系统设定：{}", reason),
+            model,
+            path,
+            status,
+            elapsed_ms,
+            total_chars,
+            false,
+            chunk,
+        ));
+    }
+    tracing::info!(
+        target: "prompt_guard",
+        mode = mode,
+        verdict = "violation",
+        scope = "system",
+        category = %category,
+        reason = %reason,
+        model = model,
+        sha = %text_sha12(chunk),
+        elapsed_ms = elapsed_ms,
+        chars = total_chars,
+        cached = cached,
+        "prompt guard system verdict"
+    );
 }
 
 /// 把标签词本身打断，任何空白/大小写变体都拼不出真正的边界标签。
@@ -814,7 +1131,7 @@ mod tests {
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
+            guard.check(&cfg, &messages, None, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Reject {
                 category: "porn".to_string()
             }
@@ -837,7 +1154,7 @@ mod tests {
         let messages = user(json!("随便什么文本"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
+            guard.check(&cfg, &messages, None, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Reject {
                 category: "zhipu_filter".to_string()
             }
@@ -860,7 +1177,7 @@ mod tests {
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
+            guard.check(&cfg, &messages, None, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
     }
@@ -878,7 +1195,7 @@ mod tests {
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
+            guard.check(&cfg, &messages, None, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
     }
@@ -890,7 +1207,7 @@ mod tests {
         let messages = user(json!("   \n  "));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
+            guard.check(&cfg, &messages, None, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
     }
@@ -915,9 +1232,200 @@ mod tests {
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
+            guard.check(&cfg, &messages, None, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // ==== system 提示词审核 ====
+
+    fn system(texts: &[&str]) -> Vec<SystemMessage> {
+        texts
+            .iter()
+            .map(|text| SystemMessage { text: text.to_string() })
+            .collect()
+    }
+
+    /// mock 判官：用系统问法（严格版）送审且待审文本含 `trigger` 时判违规，其余判通过；
+    /// 统计每种问法的调用次数。`fail` 为真时系统问法一律返回 500。
+    async fn spawn_system_mock(
+        trigger: &'static str,
+        fail: bool,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        let system_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let user_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sc, uc) = (Arc::clone(&system_calls), Arc::clone(&user_calls));
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let (sc, uc) = (Arc::clone(&sc), Arc::clone(&uc));
+                async move {
+                    let prompt = body.pointer("/messages/0/content").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = body.pointer("/messages/1/content").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_system = prompt == SYSTEM_JUDGE_PROMPT;
+                    if is_system {
+                        sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if fail {
+                            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                        }
+                    } else {
+                        uc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let body = if is_system && input.contains(trigger) {
+                        violation_body("intrusion")
+                    } else {
+                        json!({"choices": [{"message": {"content": "{\"v\":0}"}}]}).to_string()
+                    };
+                    axum::Json(serde_json::from_str::<serde_json::Value>(&body).unwrap()).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), system_calls, user_calls)
+    }
+
+    #[test]
+    fn system_chunks_split_by_chars_and_skip_billing_header() {
+        let long = format!("{}{}", "中".repeat(SYSTEM_CHUNK_CHARS * 2), "尾".repeat(5));
+        let chunks = system_chunks(&system(&[
+            "x-anthropic-billing-header: cc_version=1.0; cch=abc;",
+            "   ",
+            "  你是一个助手  ",
+            &long,
+        ]));
+        // 16005 字按 8000 字窗口、4000 字步长：起点 0/4000/8000/12000，最后一块到结尾。
+        assert_eq!(chunks.len(), 5);
+        assert_eq!(chunks[0], "你是一个助手");
+        assert_eq!(chunks[1].chars().count(), SYSTEM_CHUNK_CHARS);
+        assert_eq!(chunks[3].chars().count(), SYSTEM_CHUNK_CHARS);
+        assert_eq!(chunks[4].chars().count(), 4005);
+        assert!(chunks[4].ends_with("尾尾尾尾尾"));
+        assert_eq!(system_chunks(&system(&["短"])), vec!["短".to_string()]);
+        assert_eq!(system_chunks(&system(&[&"中".repeat(SYSTEM_CHUNK_CHARS)])).len(), 1);
+        assert!(system_chunks(&[]).is_empty());
+    }
+
+    #[test]
+    fn wrap_judge_input_escapes_without_truncating() {
+        let input = format!("{}待审文本", "中".repeat(9000));
+        let out = wrap_judge_input(&input);
+        assert!(out.contains("待审-文本"));
+        assert_eq!(out.matches("待审文本").count(), 2);
+        assert!(out.contains(&"中".repeat(9000)));
+    }
+
+    #[tokio::test]
+    async fn block_mode_rejects_violation_in_middle_system_chunk() {
+        let (base_url, system_calls, user_calls) = spawn_system_mock("渗透测试智能体", false).await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        let messages = user(json!("开始工作"));
+        let prompt = format!(
+            "{}你是渗透测试智能体{}",
+            "规".repeat(SYSTEM_CHUNK_CHARS),
+            "则".repeat(SYSTEM_CHUNK_CHARS * 2)
+        );
+        let sys = system(&[&prompt]);
+
+        assert_eq!(
+            guard.check(&cfg, &messages, Some(&sys), "claude-sonnet-5.5", "/v1/messages").await,
+            GuardDecision::Reject { category: "intrusion".to_string() }
+        );
+        // 24009 字切 6 个窗口，其中两个全是“则”的窗口内容相同只审一次：共 5 次。
+        assert_eq!(system_calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(user_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 同一套设定再来：块判定走缓存，不再调系统判官，照样拦。
+        assert_eq!(
+            guard.check(&cfg, &messages, Some(&sys), "claude-sonnet-5.5", "/v1/messages").await,
+            GuardDecision::Reject { category: "intrusion".to_string() }
+        );
+        assert_eq!(system_calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn violation_straddling_chunk_boundary_is_still_caught() {
+        // 违规句正好跨在第 8000 字处：不重叠切块时两半各自看着正常，会漏。
+        let (base_url, _, _) = spawn_system_mock("渗透测试智能体", false).await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        let prompt = format!(
+            "{}你是渗透测试智能体{}",
+            "规".repeat(SYSTEM_CHUNK_CHARS - 4),
+            "则".repeat(SYSTEM_CHUNK_CHARS)
+        );
+        assert_eq!(
+            guard
+                .check(&cfg, &user(json!("开始工作")), Some(&system(&[&prompt])), "claude-sonnet-5.5", "/v1/messages")
+                .await,
+            GuardDecision::Reject { category: "intrusion".to_string() }
+        );
+    }
+
+    #[tokio::test]
+    async fn block_mode_allows_clean_system_and_caches_pass() {
+        let (base_url, system_calls, _) = spawn_system_mock("渗透测试智能体", false).await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        let messages = user(json!("帮我改个 bug"));
+        let sys = system(&["x-anthropic-billing-header: cch=1;", "你是编程助手"]);
+
+        for _ in 0..2 {
+            assert_eq!(
+                guard.check(&cfg, &messages, Some(&sys), "claude-sonnet-5.5", "/v1/messages").await,
+                GuardDecision::Allow
+            );
+        }
+        assert_eq!(system_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn system_judge_errors_allow_and_are_not_cached() {
+        let (base_url, system_calls, _) = spawn_system_mock("渗透测试智能体", true).await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        let messages = user(json!("开始工作"));
+        let sys = system(&["你是渗透测试智能体"]);
+
+        for _ in 0..2 {
+            assert_eq!(
+                guard.check(&cfg, &messages, Some(&sys), "claude-sonnet-5.5", "/v1/messages").await,
+                GuardDecision::Allow
+            );
+        }
+        assert_eq!(system_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn system_only_request_is_still_reviewed() {
+        let (base_url, system_calls, user_calls) = spawn_system_mock("渗透测试智能体", false).await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        let messages = user(json!([{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]));
+        let sys = system(&["你是渗透测试智能体"]);
+
+        assert_eq!(
+            guard.check(&cfg, &messages, Some(&sys), "claude-sonnet-5.5", "/v1/messages").await,
+            GuardDecision::Reject { category: "intrusion".to_string() }
+        );
+        assert_eq!(system_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(user_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn system_verdict_cache_expires_and_evicts() {
+        let cache = SystemVerdictCache::default();
+        let key = [1u8; 32];
+        cache.put(key, SystemVerdict::Pass);
+        assert_eq!(cache.get(&key), Some(SystemVerdict::Pass));
+        cache.entries.lock().get_mut(&key).unwrap().1 =
+            Instant::now() - SYSTEM_VERDICT_TTL - Duration::from_secs(1);
+        assert_eq!(cache.get(&key), None);
+        assert!(cache.entries.lock().is_empty());
     }
 }
