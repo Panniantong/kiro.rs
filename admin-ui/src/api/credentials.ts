@@ -23,6 +23,8 @@ import type {
   SetMaxRelayRequest,
   PromptGuardResponse,
   SetPromptGuardRequest,
+  PromptGuardEventsQuery,
+  PromptGuardEventsResponse,
   ProxyPoolResponse,
   ProxyPoolTestResponse,
   ManualProxyBindRequest,
@@ -291,6 +293,16 @@ export async function getPromptGuard(): Promise<PromptGuardResponse> {
 // 设置客户提示词审核关口 api_key（保存即生效）
 export async function setPromptGuard(req: SetPromptGuardRequest): Promise<PromptGuardResponse> {
   const { data } = await api.put<PromptGuardResponse>('/config/prompt-guard', req)
+  return data
+}
+
+// 获取消息审核拦截事件明细
+export async function getPromptGuardEvents(
+  query: PromptGuardEventsQuery = {}
+): Promise<PromptGuardEventsResponse> {
+  const { data } = await api.get<PromptGuardEventsResponse>('/prompt-guard/events', {
+    params: query,
+  })
   return data
 }
 

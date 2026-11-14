@@ -1,5 +1,7 @@
 //! Anthropic API 路由配置
 
+use std::sync::Arc;
+
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -12,6 +14,7 @@ use crate::kiro::provider::KiroProvider;
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
+    prompt_guard_events::PromptGuardEventStore,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -38,8 +41,9 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    prompt_guard_events: Option<Arc<PromptGuardEventStore>>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking, prompt_guard_events);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

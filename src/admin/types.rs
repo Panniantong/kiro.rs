@@ -781,6 +781,46 @@ pub struct SetPromptGuardRequest {
     pub api_key: String,
 }
 
+// ============ 客户提示词审核拦截记录 ============
+
+/// 拦截记录查询参数（都可选）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptGuardEventQuery {
+    /// 天数：1 / 7 / 30；0 或缺省 = 全部时间
+    pub days: Option<i64>,
+    /// block / log_only / judge_error
+    pub kind: Option<String>,
+    pub category: Option<String>,
+    /// 从 1 开始，默认 1
+    pub page: Option<u64>,
+    /// 默认 20，最大 100
+    pub page_size: Option<u64>,
+}
+
+/// 审核关口当前状态（不返回 api_key）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptGuardStatus {
+    /// 关口是否真正生效
+    pub active: bool,
+    /// 审核模式："off" | "log" | "block"
+    pub mode: String,
+    /// 判官模型名
+    pub model: String,
+}
+
+/// 拦截记录查询响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptGuardEventsResponse {
+    /// 关口当前状态
+    pub status: PromptGuardStatus,
+    /// 计数 / 类别分布 / 记录页
+    #[serde(flatten)]
+    pub report: crate::anthropic::prompt_guard_events::PromptGuardEventReport,
+}
+
 /// 多桶故障转移配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -862,5 +902,9 @@ impl AdminErrorResponse {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
+    }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::new("service_unavailable", message)
     }
 }

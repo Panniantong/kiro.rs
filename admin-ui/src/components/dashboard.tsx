@@ -10,6 +10,7 @@ import { CredentialCard } from '@/components/credential-card'
 import { CredentialCompactTable } from '@/components/credential-compact-table'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AccountLogsDialog } from '@/components/account-logs-dialog'
+import { PromptGuardEventsDialog } from '@/components/prompt-guard-events-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { BatchEditDialog } from '@/components/batch-edit-dialog'
@@ -130,6 +131,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: promptGuardData } = usePromptGuard()
   const { mutate: setPromptGuardKey, isPending: isSettingPromptGuard } = useSetPromptGuard()
   const [promptGuardApiKey, setPromptGuardApiKey] = useState('')
+  const [promptGuardEventsOpen, setPromptGuardEventsOpen] = useState(false)
 
   const sortedCredentials = useMemo(() => {
     return [...(data?.credentials || [])].sort((a, b) => {
@@ -1179,6 +1181,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               ) : (
                 <span className="text-xs text-amber-600 dark:text-amber-500">状态：未生效，还没填 Key</span>
               )}
+              <Button
+                variant="outline"
+                size="sm"
+                className="ml-auto"
+                onClick={() => setPromptGuardEventsOpen(true)}
+              >
+                查看拦截明细
+              </Button>
             </div>
             <div className="space-y-1">
               <label className="text-xs font-medium text-muted-foreground">智谱审核 Key</label>
@@ -1543,6 +1553,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
         credentials={data?.credentials || []}
         initialCredentialId={logsCredentialId}
       />
+
+      {/* 消息审核拦截明细 */}
+      <PromptGuardEventsDialog
+        open={promptGuardEventsOpen}
+        onOpenChange={setPromptGuardEventsOpen}
+      />
+
       {/* 添加凭据对话框 */}
       <AddCredentialDialog
         open={addDialogOpen}

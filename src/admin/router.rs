@@ -14,7 +14,7 @@ use super::{
         get_default_rpm, get_recent_model_status,
         get_load_balancing_mode,
         get_max_relay, get_overage_passthrough, get_pro_plus_proxy_gate, get_prompt_guard,
-        get_proxy_pool,
+        get_prompt_guard_events, get_proxy_pool,
         manual_bind_proxy, manual_unbind_proxy, recover_quota_retired, remove_proxy_pool_entries,
         reset_failure_count, search_log_accounts, set_armor_breaking, set_bucket_failover_config,
         set_credential_disabled, set_credential_priority,
@@ -112,6 +112,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/prompt-guard",
             get(get_prompt_guard).put(set_prompt_guard),
+        )
+        .route(
+            "/prompt-guard/events",
+            get(get_prompt_guard_events),
         )
         .route(
             "/config/bucket-failover",

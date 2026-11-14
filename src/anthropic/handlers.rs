@@ -490,7 +490,7 @@ pub async fn post_messages(
     if !is_cctest_probe_request(&payload, &headers)
         && let GuardDecision::Reject { category } = state
             .prompt_guard
-            .check(&guard_cfg, &payload.messages, &payload.model)
+            .check(&guard_cfg, &payload.messages, &payload.model, "/v1/messages")
             .await
     {
         return (
@@ -2139,7 +2139,7 @@ pub async fn post_messages_cc(
     if !is_cctest_probe_request(&payload, &headers)
         && let GuardDecision::Reject { category } = state
             .prompt_guard
-            .check(&guard_cfg, &payload.messages, &payload.model)
+            .check(&guard_cfg, &payload.messages, &payload.model, "/cc/v1/messages")
             .await
     {
         return (

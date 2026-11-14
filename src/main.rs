@@ -158,6 +158,20 @@ async fn main() {
             None
         }
     };
+    let prompt_guard_events =
+        match anthropic::prompt_guard_events::PromptGuardEventStore::open(token_manager.cache_dir())
+        {
+            Ok(store) => {
+                if store.is_some() {
+                    tracing::info!("拦截记录 SQLite 存储已启用");
+                }
+                store
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "拦截记录 SQLite 存储初始化失败，将只打日志");
+                None
+            }
+        };
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -191,6 +205,7 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        prompt_guard_events.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -210,7 +225,8 @@ async fn main() {
             let stable_disabled_events = token_manager.subscribe_stable_disabled();
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
-                    .with_account_log_store(account_log_store.clone());
+                    .with_account_log_store(account_log_store.clone())
+                    .with_prompt_guard_event_store(prompt_guard_events.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let rotation_service = admin_state.service.clone();
             tokio::spawn(rotation_service.run_quota_rotation_worker(quota_events));

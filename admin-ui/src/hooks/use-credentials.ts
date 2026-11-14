@@ -25,6 +25,7 @@ import {
   setMaxRelay,
   getPromptGuard,
   setPromptGuard,
+  getPromptGuardEvents,
   getProxyPool,
   testProxyPoolEntry,
   batchGetCredentialBalance,
@@ -38,6 +39,7 @@ import type {
   SetPromptGuardRequest,
   SetProPlusProxyGateRequest,
   CredentialLogQuery,
+  PromptGuardEventsQuery,
 } from '@/types/api'
 
 // 查询凭据列表
@@ -317,6 +319,16 @@ export function useSetPromptGuard() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['promptGuard'] })
     },
+  })
+}
+
+// 查询消息审核拦截事件明细，弹窗打开时才请求
+export function usePromptGuardEvents(filters: PromptGuardEventsQuery, enabled: boolean) {
+  return useQuery({
+    queryKey: ['prompt-guard-events', filters],
+    queryFn: () => getPromptGuardEvents(filters),
+    enabled,
+    retry: false,
   })
 }
 

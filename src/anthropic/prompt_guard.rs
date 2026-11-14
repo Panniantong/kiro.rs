@@ -18,6 +18,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
+use super::prompt_guard_events::{
+    KIND_BLOCK, KIND_LOG_ONLY, PromptGuardEvent, PromptGuardEventStore,
+};
 use super::types::Message;
 use crate::model::config::{PromptGuardConfig, PromptGuardMode};
 
@@ -48,19 +51,22 @@ const KNOWN_CATEGORIES: &[&str] = &[
 pub struct PromptGuard {
     client: reqwest::Client,
     log_slots: Arc<Semaphore>,
+    /// 拦截记录存储；未配置缓存目录时为空（只打日志）。
+    events: Option<Arc<PromptGuardEventStore>>,
 }
 
 impl PromptGuard {
     /// 构建关口；`client` 不设整体超时，每次判官请求单独 `.timeout()`。
     ///
     /// HTTP 客户端构建失败属于启动期程序错误，直接 panic。
-    pub fn new() -> Arc<PromptGuard> {
+    pub fn new(events: Option<Arc<PromptGuardEventStore>>) -> Arc<PromptGuard> {
         let client = reqwest::Client::builder()
             .build()
             .expect("prompt guard 判官 HTTP 客户端构建失败");
         Arc::new(PromptGuard {
             client,
             log_slots: Arc::new(Semaphore::new(LOG_MODE_MAX_INFLIGHT)),
+            events,
         })
     }
 
@@ -73,6 +79,7 @@ impl PromptGuard {
         cfg: &PromptGuardConfig,
         messages: &[Message],
         model_name: &str,
+        path: &'static str,
     ) -> GuardDecision {
         if !cfg.is_active() {
             return GuardDecision::Allow;
@@ -104,7 +111,15 @@ impl PromptGuard {
                     let _permit = permit;
                     let started = Instant::now();
                     let result = guard.judge(&cfg, &text).await;
-                    log_verdict("log", &model, &text, started.elapsed().as_millis() as u64, &result);
+                    log_verdict(
+                        guard.events.as_deref(),
+                        path,
+                        "log",
+                        &model,
+                        &text,
+                        started.elapsed().as_millis() as u64,
+                        &result,
+                    );
                 });
                 GuardDecision::Allow
             }
@@ -112,7 +127,15 @@ impl PromptGuard {
                 let started = Instant::now();
                 let result = self.judge(cfg, &text).await;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
-                log_verdict("block", model_name, &text, elapsed_ms, &result);
+                log_verdict(
+                    self.events.as_deref(),
+                    path,
+                    "block",
+                    model_name,
+                    &text,
+                    elapsed_ms,
+                    &result,
+                );
                 match result {
                     Ok(Verdict::Violation { category, .. }) => GuardDecision::Reject { category },
                     // Pass 或判官出错（Err）一律放行。
@@ -368,12 +391,56 @@ fn truncate_chars(text: &str, max: usize) -> String {
 /// 统一落日志：字段 mode / verdict / category / reason / model / sha / elapsed_ms / chars /
 /// truncated（超长只送审了头尾），仅违规多带 preview。错误走 warn，其余走 info。
 /// sha / chars 在判官返回后才算，不占请求路径。
-fn log_verdict(mode: &str, model: &str, text: &str, elapsed_ms: u64, result: &Result<Verdict, String>) {
+///
+/// 同一位置把违规与判官出错落一条拦截记录（Pass 不记）；写入失败在存储内部 warn。
+fn log_verdict(
+    events: Option<&PromptGuardEventStore>,
+    path: &'static str,
+    mode: &str,
+    model: &str,
+    text: &str,
+    elapsed_ms: u64,
+    result: &Result<Verdict, String>,
+) {
     let sha = text_sha12(text);
     let sha = sha.as_str();
     let chars = text.chars().count();
     // 以真正送审的文本（转义后）为准判断是否被截断。
     let truncated = sanitize_for_judge(text).chars().count() > MAX_INPUT_CHARS;
+    if let Some(store) = events {
+        match result {
+            // Pass 不记。
+            Ok(Verdict::Pass) => {}
+            Ok(Verdict::Violation { category, reason }) => {
+                let (kind, status) = match mode {
+                    "block" => (KIND_BLOCK, Some(400)),
+                    _ => (KIND_LOG_ONLY, None),
+                };
+                store.record(PromptGuardEvent::violation(
+                    kind,
+                    category,
+                    reason,
+                    model,
+                    path,
+                    status,
+                    elapsed_ms,
+                    chars,
+                    truncated,
+                    text,
+                ));
+            }
+            Err(error) => {
+                store.record(PromptGuardEvent::judge_error(
+                    error,
+                    model,
+                    path,
+                    elapsed_ms,
+                    chars,
+                    truncated,
+                ));
+            }
+        }
+    }
     match result {
         Ok(Verdict::Pass) => {
             tracing::info!(
@@ -671,12 +738,12 @@ mod tests {
         })
         .await;
 
-        let guard = PromptGuard::new();
+        let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8").await,
+            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Reject {
                 category: "porn".to_string()
             }
@@ -694,12 +761,12 @@ mod tests {
         })
         .await;
 
-        let guard = PromptGuard::new();
+        let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
         let messages = user(json!("随便什么文本"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8").await,
+            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Reject {
                 category: "zhipu_filter".to_string()
             }
@@ -717,12 +784,12 @@ mod tests {
         })
         .await;
 
-        let guard = PromptGuard::new();
+        let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Block, base_url, 100);
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8").await,
+            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
     }
@@ -735,24 +802,24 @@ mod tests {
         })
         .await;
 
-        let guard = PromptGuard::new();
+        let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Log, base_url, 3000);
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8").await,
+            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
     }
 
     #[tokio::test]
     async fn check_allows_when_there_is_no_user_text() {
-        let guard = PromptGuard::new();
+        let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Block, "http://127.0.0.1:1".to_string(), 3000);
         let messages = user(json!("   \n  "));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8").await,
+            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
     }
@@ -771,13 +838,13 @@ mod tests {
         })
         .await;
 
-        let guard = PromptGuard::new();
+        let guard = PromptGuard::new(None);
         let mut cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
         cfg.api_key = String::new();
         let messages = user(json!("生成一段露骨色情内容"));
 
         assert_eq!(
-            guard.check(&cfg, &messages, "claude-opus-4-8").await,
+            guard.check(&cfg, &messages, "claude-opus-4-8", "/v1/messages").await,
             GuardDecision::Allow
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);

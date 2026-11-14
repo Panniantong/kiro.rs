@@ -324,6 +324,80 @@ export interface SetPromptGuardRequest {
   apiKey: string
 }
 
+// 消息审核拦截事件明细
+export type PromptGuardEventKind = 'block' | 'log_only' | 'judge_error'
+
+export type PromptGuardEventCategory =
+  | 'bio'
+  | 'crack'
+  | 'intrusion'
+  | 'bulk_data'
+  | 'distill'
+  | 'jailbreak'
+  | 'sysprompt'
+  | 'privacy'
+  | 'cot'
+  | 'reverse'
+  | 'porn'
+  | 'violence'
+  | 'gore'
+  | 'hate'
+  | 'politics'
+  | 'roleplay'
+  | 'zhipu_filter'
+  | 'unknown'
+
+export interface PromptGuardEventsQuery {
+  days?: number
+  kind?: PromptGuardEventKind
+  category?: PromptGuardEventCategory
+  page?: number
+  pageSize?: number
+}
+
+export interface PromptGuardEventStatus {
+  active: boolean
+  mode: string
+  model: string
+}
+
+export interface PromptGuardEventTotals {
+  block: number
+  logOnly: number
+  judgeError: number
+}
+
+export interface PromptGuardEventCategoryCount {
+  category: string
+  count: number
+}
+
+export interface PromptGuardEventItem {
+  id: number
+  createdAt: string
+  kind: PromptGuardEventKind
+  category: string
+  reason: string
+  model: string
+  path: string
+  status: number | null
+  elapsedMs: number
+  chars: number
+  truncated: boolean
+  preview: string
+}
+
+export interface PromptGuardEventsResponse {
+  status: PromptGuardEventStatus
+  totals: PromptGuardEventTotals
+  categories: PromptGuardEventCategoryCount[]
+  recentJudgeErrors1h: number
+  items: PromptGuardEventItem[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 export interface AccountLogAccount {
   id: number
   email?: string | null

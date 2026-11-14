@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use crate::account_logs::{AccountLogEvent, AccountLogFilters, AccountLogStore};
+use crate::anthropic::prompt_guard_events::{PromptGuardEventFilters, PromptGuardEventStore};
 
 use crate::kiro::model::credentials::{KiroCredentials, refresh_token_tail};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
@@ -27,7 +28,8 @@ use super::types::{
     CredentialLogsResponse, CredentialProxyTestResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultRpmResponse, LoadBalancingModeResponse,
     ManualProxyOperationResponse, MaxRelayResponse, OveragePassthroughResponse,
-    ProPlusProxyGateResponse, PromptGuardResponse, ProxyAssignedCredentialStatus,
+    ProPlusProxyGateResponse, PromptGuardEventQuery, PromptGuardEventsResponse, PromptGuardResponse,
+    PromptGuardStatus, ProxyAssignedCredentialStatus,
     ProxyPoolAssignmentSkip,
     ProxyPoolEligibility, ProxyPoolEntryStatus, ProxyPoolResponse, ProxyPoolTestRequest,
     ProxyPoolTestResponse, ProxyProbeSummary, RecoverQuotaRetiredRequest,
@@ -132,7 +134,8 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     /// 账号级结构化日志存储；未配置缓存目录时为空。
     account_log_store: Option<Arc<AccountLogStore>>,
-
+    /// 客户提示词审核拦截记录存储；未配置缓存目录时为空。
+    prompt_guard_event_store: Option<Arc<PromptGuardEventStore>>,
 }
 
 impl AdminService {
@@ -160,6 +163,7 @@ impl AdminService {
             allocation_lock: tokio::sync::Mutex::new(()),
             known_endpoints: known_endpoints.into_iter().collect(),
             account_log_store: None,
+            prompt_guard_event_store: None,
         };
         service.disable_unbound_kiro_pro_plus();
         service
@@ -167,6 +171,14 @@ impl AdminService {
 
     pub fn with_account_log_store(mut self, store: Option<Arc<AccountLogStore>>) -> Self {
         self.account_log_store = store;
+        self
+    }
+
+    pub fn with_prompt_guard_event_store(
+        mut self,
+        store: Option<Arc<PromptGuardEventStore>>,
+    ) -> Self {
+        self.prompt_guard_event_store = store;
         self
     }
 
@@ -531,6 +543,38 @@ impl AdminService {
             generated_at: now.to_rfc3339(),
             accounts,
         })
+    }
+
+    /// 查询客户提示词审核拦截记录（只读）。
+    ///
+    /// 存储未启用（未配置缓存目录）时返回 `Ok(None)`，由接口层回 503。
+    pub async fn get_prompt_guard_events(
+        &self,
+        query: PromptGuardEventQuery,
+    ) -> Result<Option<PromptGuardEventsResponse>, AdminServiceError> {
+        let Some(store) = self.prompt_guard_event_store.as_ref() else {
+            return Ok(None);
+        };
+        let report = store
+            .query(PromptGuardEventFilters {
+                days: query.days.unwrap_or(0).max(0),
+                kind: query.kind,
+                category: query.category,
+                page: query.page.unwrap_or(1).max(1),
+                page_size: query.page_size.unwrap_or(20).clamp(1, 100),
+            })
+            .await
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        // status 复用关口配置响应，只取不含 api_key 的三个字段。
+        let cfg = Self::prompt_guard_response(&self.token_manager.get_prompt_guard());
+        Ok(Some(PromptGuardEventsResponse {
+            status: PromptGuardStatus {
+                active: cfg.active,
+                mode: cfg.mode,
+                model: cfg.model,
+            },
+            report,
+        }))
     }
 
     /// 设置凭据禁用状态

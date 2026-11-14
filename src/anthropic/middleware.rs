@@ -14,6 +14,7 @@ use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
 use super::prompt_guard::PromptGuard;
+use super::prompt_guard_events::PromptGuardEventStore;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -32,12 +33,16 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        prompt_guard_events: Option<Arc<PromptGuardEventStore>>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
-            prompt_guard: PromptGuard::new(),
+            prompt_guard: PromptGuard::new(prompt_guard_events),
         }
     }
 

@@ -3,16 +3,18 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
     response::IntoResponse,
 };
 
 use super::{
     middleware::AdminState,
     types::{
+        AdminErrorResponse,
         AccountLogSearchQuery, AddCredentialRequest, AddProxyPoolEntriesRequest, AssignCredentialProxyFromPoolRequest,
         BatchBalanceRequest, BatchCredentialIdsRequest, BatchSetCredentialProxyRequest,
         BatchSetRpmRequest, BatchUpdateCredentialsRequest, CredentialLogQuery, ManualProxyBindRequest,
-        ManualProxyUnbindRequest, ProxyPoolTestRequest, RecentModelStatusQuery, RecoverQuotaRetiredRequest,
+        ManualProxyUnbindRequest, PromptGuardEventQuery, ProxyPoolTestRequest, RecentModelStatusQuery, RecoverQuotaRetiredRequest,
         RemoveProxyPoolEntriesRequest, SetArmorBreakingRequest, SetBucketFailoverConfigRequest,
         SetCredentialProxyRequest,
         SetDefaultRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetMaxRelayRequest,
@@ -549,6 +551,23 @@ pub async fn set_prompt_guard(
     match state.service.set_prompt_guard(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/prompt-guard/events
+/// 查询客户提示词审核拦截记录（只读，时间倒序分页）。
+pub async fn get_prompt_guard_events(
+    State(state): State<AdminState>,
+    Query(query): Query<PromptGuardEventQuery>,
+) -> impl IntoResponse {
+    match state.service.get_prompt_guard_events(query).await {
+        Ok(Some(response)) => Json(response).into_response(),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AdminErrorResponse::service_unavailable("拦截记录存储未启用")),
+        )
+            .into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 
