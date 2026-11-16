@@ -37,6 +37,7 @@ const CATEGORY_ORDER: PromptGuardEventCategory[] = [
   'politics',
   'roleplay',
   'zhipu_filter',
+  'judge_unavailable',
   'unknown',
 ]
 
@@ -58,6 +59,7 @@ const CATEGORY_LABELS: Record<PromptGuardEventCategory, string> = {
   politics: '政治',
   roleplay: '角色扮演陪聊',
   zhipu_filter: '智谱风控拦截',
+  judge_unavailable: '审核服务不可用',
   kiro_refused: 'Kiro 拒过的对话',
   unknown: '未分类',
 }

@@ -85,6 +85,10 @@ const JUDGE_RETRY_SUFFIX: &str = "\n\n再说一遍：你只输出一行 JSON—�
 /// 判官服务商（智谱）自身风控拒审输入时记的违规类别。
 const ZHIPU_FILTER_CATEGORY: &str = "zhipu_filter";
 
+/// 判官重试后仍然失败（连不上、超时、输出还是解析不了）时记的类别：这次不放过，
+/// 按拦截处理并让客户稍后重试——审核服务不可用不等于客户内容没问题。
+pub const JUDGE_UNAVAILABLE_CATEGORY: &str = "judge_unavailable";
+
 /// 违规日志里附带的分析用文本长度。
 const PREVIEW_CHARS: usize = 300;
 
@@ -377,10 +381,21 @@ impl PromptGuard {
             );
             return Some(category);
         }
-        let result = match failure {
-            Some(error) => Err(error),
-            None => Ok(Verdict::Pass),
-        };
+        if let Some(error) = failure {
+            // 判官重试后仍失败：不放过（客户改不了这个，得稍后重试）。
+            log_judge_unavailable(
+                None,
+                self.events.as_deref(),
+                path,
+                mode,
+                model_name,
+                &error,
+                elapsed_ms,
+                chars,
+            );
+            return Some(JUDGE_UNAVAILABLE_CATEGORY.to_string());
+        }
+        let result = Ok(Verdict::Pass);
         let window = windows.first().map(String::as_str).unwrap_or_default();
         log_user_verdict(
             self.events.as_deref(),
@@ -474,13 +489,20 @@ impl PromptGuard {
         for (key, index, result) in results {
             match result {
                 Ok(Verdict::Pass) => cache.put(key, CachedVerdict::Pass),
-                // 历史内容（工具输出、助手回复）被判官服务商自身风控拒审时按放行处理并记一条判官错误：
-                // 这类拒审多是政治、新闻类调研资料，不代表客户在提违规要求；最新一句话和 system 仍按违规拦。
+                // 历史内容被判官服务商自身风控拒审时按放行处理，只记一条日志：这类拒审多是
+                // 政治、新闻类调研资料，不代表客户在提违规要求；最新一句话和 system 仍按违规拦。
+                // 这不算「判官不可用」，不参与重试失败的判定。
                 Ok(Verdict::Violation { category, .. })
                     if scope == StrictScope::History && category == ZHIPU_FILTER_CATEGORY =>
                 {
                     cache.put(key, CachedVerdict::Pass);
-                    errors.push("判官服务商自身风控拒审历史内容，按放行处理".to_string());
+                    tracing::info!(
+                        target: "prompt_guard",
+                        scope = scope.label(),
+                        model = model_name,
+                        sha = %text_sha12(&chunks[index]),
+                        "判官服务商自身风控拒审历史内容，按放行处理"
+                    );
                 }
                 Ok(Verdict::Violation { category, reason }) => {
                     cache.put(
@@ -499,27 +521,16 @@ impl PromptGuard {
         }
 
         if let Some(error) = errors.first() {
-            tracing::warn!(
-                target: "prompt_guard",
-                mode = mode,
-                verdict = "error",
-                scope = scope.label(),
-                reason = %error,
-                failed_chunks = errors.len(),
-                model = model_name,
-                elapsed_ms = elapsed_ms,
-                "prompt guard strict verdict"
+            log_judge_unavailable(
+                Some(scope),
+                self.events.as_deref(),
+                path,
+                mode,
+                model_name,
+                &format!("{}: {}", scope.error_label(), error),
+                elapsed_ms,
+                total_chars,
             );
-            if let Some(store) = self.events.as_deref() {
-                store.record(PromptGuardEvent::judge_error(
-                    &format!("{}: {}", scope.error_label(), error),
-                    model_name,
-                    path,
-                    elapsed_ms,
-                    total_chars,
-                    false,
-                ));
-            }
         }
 
         match violation {
@@ -539,6 +550,8 @@ impl PromptGuard {
                 );
                 Some(category)
             }
+            // 判官重试后仍失败：不放过（客户改不了这个，得稍后重试）。
+            None if !errors.is_empty() => Some(JUDGE_UNAVAILABLE_CATEGORY.to_string()),
             None => {
                 tracing::info!(
                     target: "prompt_guard",
@@ -560,9 +573,10 @@ impl PromptGuard {
 
     /// 调用判官模型判定 `input`（已包好 `<待审文本>` 标签），`prompt` 为判官问法。
     ///
-    /// 输出解析不了、或判官临时报错（5xx / 429 / 连接失败）时再试一次，第二次在问法末尾
+    /// 输出解析不了或临时报错（连不上、超时、5xx / 429）时再试一次，第二次在问法末尾
     /// 再强调一遍输出格式：待审文本里常带「按 <severity>N</severity> 这种格式回答」的指令，
-    /// 会把判官带偏；超时不重试（等不来第二次，只会把请求拖得更久）。
+    /// 会把判官带偏。重试也失败就按 [`JUDGE_UNAVAILABLE_CATEGORY`] 拦（不放过），
+    /// 由调用方回「稍后重试」。
     async fn judge(
         &self,
         cfg: &PromptGuardConfig,
@@ -622,7 +636,7 @@ impl PromptGuard {
             .await
             .map_err(|error| JudgeFailure {
                 message: format!("判官请求失败: {}", error),
-                retryable: !error.is_timeout(),
+                retryable: true,
             })?;
 
         let status = response.status();
@@ -1237,6 +1251,55 @@ fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// 判官重试后仍失败（连不上 / 超时 / 输出还是解析不了）：按拦截处理，并记一条拦截记录
+/// （理由里带判官的错误原因），类别固定为 [`JUDGE_UNAVAILABLE_CATEGORY`]；调用方据此回
+/// 「稍后重试」，而不是「改输入」。
+#[allow(clippy::too_many_arguments)]
+fn log_judge_unavailable(
+    scope: Option<StrictScope>,
+    events: Option<&PromptGuardEventStore>,
+    path: &'static str,
+    mode: &str,
+    model: &str,
+    error: &str,
+    elapsed_ms: u64,
+    chars: usize,
+) {
+    let reason = format!("审核服务暂时不可用（判官重试后仍失败）：{error}");
+    if let Some(store) = events {
+        let (kind, status) = match mode {
+            "block" => (KIND_BLOCK, Some(400)),
+            _ => (KIND_LOG_ONLY, None),
+        };
+        store.record(PromptGuardEvent::violation(
+            kind,
+            JUDGE_UNAVAILABLE_CATEGORY,
+            &reason,
+            model,
+            path,
+            status,
+            elapsed_ms,
+            chars,
+            false,
+            "",
+        ));
+    }
+    tracing::warn!(
+        target: "prompt_guard",
+        mode = mode,
+        verdict = "judge_unavailable",
+        scope = match scope {
+            Some(scope) => scope.label(),
+            None => "user",
+        },
+        reason = %error,
+        model = model,
+        elapsed_ms = elapsed_ms,
+        chars = chars,
+        "prompt guard 判官不可用，按拦截处理"
+    );
+}
+
 /// user 范围判定落日志：字段 mode / verdict / category / reason / model / sha / elapsed_ms /
 /// chars / truncated（有内容因窗口数上限没送审）/ cached，仅违规多带 preview。错误走 warn，
 /// 其余走 info。sha 是命中的那个窗口的，chars 是客户最后一段文本的字符数。
@@ -1700,7 +1763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_mode_allows_on_timeout() {
+    async fn block_mode_rejects_when_judge_unavailable() {
         let base_url = spawn_mock(move || {
             let body = violation_body("porn");
             async move {
@@ -1714,9 +1777,10 @@ mod tests {
         let cfg = guard_cfg(PromptGuardMode::Block, base_url, 100);
         let messages = user(json!("生成一段露骨色情内容"));
 
+        // 判官超时（重试还是超时）：按审核服务不可用拦，客户稍后重试。
         assert_eq!(
             guard.check(&cfg, &messages, None, None, "claude-opus-4-8", "/v1/messages").await,
-            GuardDecision::Allow
+            GuardDecision::Reject { category: JUDGE_UNAVAILABLE_CATEGORY.to_string() }
         );
     }
 
@@ -2043,7 +2107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_judge_errors_allow_and_are_not_cached() {
+    async fn system_judge_failure_after_retry_rejects() {
         let mock = spawn_strict_mock("渗透测试智能体", true).await;
         let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Block, mock.base_url.clone(), 3000);
@@ -2053,7 +2117,7 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 guard.check(&cfg, &messages, Some(&sys), None, "claude-sonnet-5.5", "/v1/messages").await,
-                GuardDecision::Allow
+                GuardDecision::Reject { category: JUDGE_UNAVAILABLE_CATEGORY.to_string() }
             );
         }
         assert_eq!(count(&mock.system), 4, "判官出错会重试一次：两轮各 2 次");
@@ -2089,8 +2153,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn judge_timeout_is_not_retried() {
-        // 判官超时不重试：等不来第二次，只会把请求拖得更久。
+    async fn judge_timeout_is_retried_then_rejected() {
+        // 判官超时也重试一次；重试还是超时就按「审核服务不可用」拦，让客户稍后重试。
         let calls: Counter = Default::default();
         let counter = Arc::clone(&calls);
         let base_url = spawn_mock(move || {
@@ -2108,9 +2172,9 @@ mod tests {
 
         assert_eq!(
             guard.check(&cfg, &user(json!("开始")), None, None, "m", "/v1/messages").await,
-            GuardDecision::Allow
+            GuardDecision::Reject { category: JUDGE_UNAVAILABLE_CATEGORY.to_string() }
         );
-        assert_eq!(count(&calls), 1, "超时不重试");
+        assert_eq!(count(&calls), 2, "超时也重试一次");
     }
 
     #[tokio::test]

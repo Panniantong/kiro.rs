@@ -346,6 +346,7 @@ export type PromptGuardEventCategory =
   | 'roleplay'
   | 'zhipu_filter'
   | 'kiro_refused'
+  | 'judge_unavailable'
   | 'unknown'
 
 export interface PromptGuardEventsQuery {

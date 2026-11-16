@@ -35,7 +35,7 @@ use super::converter::{
 };
 use super::identity_response_guard::rewrite_kiro_self_identity;
 use super::middleware::AppState;
-use super::prompt_guard::{ConversationMemoryDecision, GuardDecision};
+use super::prompt_guard::{ConversationMemoryDecision, GuardDecision, JUDGE_UNAVAILABLE_CATEGORY};
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -52,6 +52,8 @@ const LOCAL_GUARD_BLOCK_MESSAGE: &str =
     "Your request could not be processed. Please modify your input and try again. (ref: R4021)";
 /// 本地拦下被 Kiro 拒过的对话的重发。
 const LOCAL_CONVERSATION_BLOCK_MESSAGE: &str = "This conversation cannot be continued. Please start a new conversation or go back to an earlier message. (ref: R4022)";
+/// 审核服务（判官）重试后仍不可用：不是客户内容的问题，让客户稍后重试，别去改输入。
+const LOCAL_GUARD_UNAVAILABLE_MESSAGE: &str = "Content review is temporarily unavailable. Please retry this request in a moment. (ref: R4023)";
 
 fn local_guard_block_response() -> Response {
     (
@@ -62,6 +64,26 @@ fn local_guard_block_response() -> Response {
         )),
     )
         .into_response()
+}
+
+fn local_guard_unavailable_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            LOCAL_GUARD_UNAVAILABLE_MESSAGE,
+        )),
+    )
+        .into_response()
+}
+
+/// 审核关口拒绝时的对外回复：判官不可用回「稍后重试」，其余（判违规）回「改输入」。
+fn local_guard_reject_response(category: &str) -> Response {
+    if category == JUDGE_UNAVAILABLE_CATEGORY {
+        local_guard_unavailable_response()
+    } else {
+        local_guard_block_response()
+    }
 }
 
 fn local_conversation_block_response() -> Response {
@@ -530,7 +552,7 @@ pub async fn post_messages(
     if is_cctest_probe_request(&payload, &headers) {
         audit_cfg.mode = PromptGuardMode::Log;
     }
-    if let GuardDecision::Reject { .. } = state
+    if let GuardDecision::Reject { category } = state
         .prompt_guard
         .check(
             &audit_cfg,
@@ -542,7 +564,7 @@ pub async fn post_messages(
         )
         .await
     {
-        return local_guard_block_response();
+        return local_guard_reject_response(&category);
     }
 
     // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
@@ -2202,7 +2224,7 @@ pub async fn post_messages_cc(
     if is_cctest_probe_request(&payload, &headers) {
         audit_cfg.mode = PromptGuardMode::Log;
     }
-    if let GuardDecision::Reject { .. } = state
+    if let GuardDecision::Reject { category } = state
         .prompt_guard
         .check(
             &audit_cfg,
@@ -2214,7 +2236,7 @@ pub async fn post_messages_cc(
         )
         .await
     {
-        return local_guard_block_response();
+        return local_guard_reject_response(&category);
     }
 
     // CC Test 透传开关：开启且命中检测探针时才原样转发到上游；
