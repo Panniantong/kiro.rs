@@ -14,7 +14,7 @@ use crate::kiro::provider::{
     DeferredStreamAttempt, KiroByteStream, KiroProvider, KiroStreamResponse, RefusalHook,
 };
 use crate::kiro::token_manager::AllRateLimitedError;
-use crate::model::config::{MaxRelayConfig, PromptGuardConfig, PromptGuardMode};
+use crate::model::config::MaxRelayConfig;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -35,7 +35,9 @@ use super::converter::{
 };
 use super::identity_response_guard::rewrite_kiro_self_identity;
 use super::middleware::AppState;
-use super::prompt_guard::{ConversationMemoryDecision, GuardDecision, JUDGE_UNAVAILABLE_CATEGORY};
+use super::prompt_guard::{
+    CONTENT_TOO_LONG_CATEGORY, ConversationMemoryDecision, GuardDecision, JUDGE_UNAVAILABLE_CATEGORY,
+};
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -54,6 +56,8 @@ const LOCAL_GUARD_BLOCK_MESSAGE: &str =
 const LOCAL_CONVERSATION_BLOCK_MESSAGE: &str = "This conversation cannot be continued. Please start a new conversation or go back to an earlier message. (ref: R4022)";
 /// 审核服务（判官）重试后仍不可用：不是客户内容的问题，让客户稍后重试，别去改输入。
 const LOCAL_GUARD_UNAVAILABLE_MESSAGE: &str = "Content review is temporarily unavailable. Please retry this request in a moment. (ref: R4023)";
+/// 内容长/大到审核不完：让客户拆开再发，别静默放过没审的部分。
+const LOCAL_GUARD_TOO_LONG_MESSAGE: &str = "This request is too large to review in one piece. Please split it into smaller requests and try again. (ref: R4024)";
 
 fn local_guard_block_response() -> Response {
     (
@@ -77,24 +81,27 @@ fn local_guard_unavailable_response() -> Response {
         .into_response()
 }
 
-/// 审核关口拒绝时的对外回复：判官不可用回「稍后重试」，其余（判违规）回「改输入」。
+fn local_guard_too_long_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            LOCAL_GUARD_TOO_LONG_MESSAGE,
+        )),
+    )
+        .into_response()
+}
+
+/// 审核关口拒绝时的对外回复：判官不可用回「稍后重试」，内容审不完回「拆开再发」，
+/// 其余（判违规）回「改输入」。
 fn local_guard_reject_response(category: &str) -> Response {
     if category == JUDGE_UNAVAILABLE_CATEGORY {
         local_guard_unavailable_response()
+    } else if category == CONTENT_TOO_LONG_CATEGORY {
+        local_guard_too_long_response()
     } else {
         local_guard_block_response()
     }
-}
-
-/// 本次请求实际用的审核配置：CC Test 检测探针只把 `block` 降成 `log`（判官会把复述 tag /
-/// 问身份判成 sysprompt，拦了会让渠道检测失败），但 `off` 就是 off——不能因为探针把
-/// 已经关掉的审核重新打开、把客户内容再发给外部判官。
-fn audit_config(guard_cfg: &PromptGuardConfig, probe: bool) -> PromptGuardConfig {
-    let mut cfg = guard_cfg.clone();
-    if probe && cfg.mode == PromptGuardMode::Block {
-        cfg.mode = PromptGuardMode::Log;
-    }
-    cfg
 }
 
 fn local_conversation_block_response() -> Response {
@@ -547,8 +554,7 @@ pub async fn post_messages(
         }
     };
 
-    // 客户提示词审核关口：CC Test 检测探针不按违规拦（判官会把复述 tag / 问身份判成
-    // sysprompt，拦了会让渠道检测失败），但仍按只记日志送审——探针话术不能用来跳过审核。
+    // 客户提示词审核关口：按配置拦（命中检测话术的请求一样审、一样拦——话术不能用来跳过审核）。
     let guard_cfg = provider.token_manager().get_prompt_guard();
     let refusal_hook = match state.prompt_guard.check_conversation_memory(
         &guard_cfg,
@@ -559,7 +565,7 @@ pub async fn post_messages(
         ConversationMemoryDecision::Refused => return local_conversation_block_response(),
         ConversationMemoryDecision::Continue(hook) => hook,
     };
-    let audit_cfg = audit_config(&guard_cfg, is_cctest_probe_request(&payload, &headers));
+    let audit_cfg = guard_cfg.clone();
     if let GuardDecision::Reject { category } = state
         .prompt_guard
         .check(
@@ -2216,8 +2222,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 客户提示词审核关口：CC Test 检测探针不按违规拦（判官会把复述 tag / 问身份判成
-    // sysprompt，拦了会让渠道检测失败），但仍按只记日志送审——探针话术不能用来跳过审核。
+    // 客户提示词审核关口：按配置拦（命中检测话术的请求一样审、一样拦——话术不能用来跳过审核）。
     let guard_cfg = provider.token_manager().get_prompt_guard();
     let refusal_hook = match state.prompt_guard.check_conversation_memory(
         &guard_cfg,
@@ -2228,7 +2233,7 @@ pub async fn post_messages_cc(
         ConversationMemoryDecision::Refused => return local_conversation_block_response(),
         ConversationMemoryDecision::Continue(hook) => hook,
     };
-    let audit_cfg = audit_config(&guard_cfg, is_cctest_probe_request(&payload, &headers));
+    let audit_cfg = guard_cfg.clone();
     if let GuardDecision::Reject { category } = state
         .prompt_guard
         .check(
@@ -2559,38 +2564,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::time::timeout;
-
-    /// 探针请求只把 block 降成 log：管理员关掉审核（off）时不能被探针重新打开。
-    #[test]
-    fn probe_audit_config_only_downgrades_block() {
-        let guard_cfg = |mode: PromptGuardMode| PromptGuardConfig {
-            mode,
-            base_url: "http://127.0.0.1:1".to_string(),
-            api_key: "test-key".to_string(),
-            model: "glm-4.5-air".to_string(),
-            timeout_ms: 3000,
-            refusal_memory_minutes: 60,
-            vision_model: String::new(),
-            vision_fallback_model: String::new(),
-        };
-
-        assert_eq!(
-            audit_config(&guard_cfg(PromptGuardMode::Block), true).mode,
-            PromptGuardMode::Log
-        );
-        assert_eq!(
-            audit_config(&guard_cfg(PromptGuardMode::Block), false).mode,
-            PromptGuardMode::Block
-        );
-        assert_eq!(
-            audit_config(&guard_cfg(PromptGuardMode::Off), true).mode,
-            PromptGuardMode::Off
-        );
-        assert_eq!(
-            audit_config(&guard_cfg(PromptGuardMode::Log), true).mode,
-            PromptGuardMode::Log
-        );
-    }
 
     struct DelayedTestEndpoint {
         base_url: String,
