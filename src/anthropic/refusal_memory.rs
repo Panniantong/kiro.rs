@@ -8,7 +8,15 @@
 //! 只认对话消息本身：system / tools 不参与（Claude Code 的 system 每次带变化的计费头）。
 //! 客户回到更早的消息重新编辑、或开新对话，前缀不同，不受影响。
 //!
-//! 「账号已受限」那类拒绝说的是账号、不是对话，不记。
+//! 键里**不含模型名**：同一段对话在 A 模型上被拒，换 B 模型发同一段也照样拦（对话内容一样，
+//! 换模型通常也救不回来）。要按模型区分就得把模型名并进哈希。
+//!
+//! 「账号已受限」那类拒绝说的是账号、不是对话，不记；上游只回 `CONTENT_FILTERED`（没有
+//! `cannot continue this conversation` 字样）的拒绝也**不记**——只认
+//! [`CONVERSATION_REFUSAL_MARKER`]。
+//!
+//! 记忆只在进程内存 + 定期落盘（[`PERSIST_INTERVAL`] 节流、异步写）：正常重启能把落盘的
+//! 装回来，但崩溃 / 强退会丢掉最后这个窗口内的新记忆。
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,7 +36,8 @@ const MAX_ENTRIES: usize = 20_000;
 /// Kiro 针对这段对话内容的拒绝文案片段（大小写不敏感）。
 const CONVERSATION_REFUSAL_MARKER: &str = "cannot continue this conversation";
 /// 被拒对话记忆落盘的节奏：最多这么长时间写一次（重发风暴时不必每条都写盘）。
-const PERSIST_INTERVAL: Duration = Duration::from_secs(60);
+/// 崩溃 / 强退最多丢掉这个窗口内的新记忆（写盘还是异步的，正在写的那次也可能来不及）。
+const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 当前时间（epoch 毫秒）。到期时间用 epoch 毫秒而不是 `Instant`，这样能落盘、重启后接着用。
 pub fn now_ms() -> i64 {

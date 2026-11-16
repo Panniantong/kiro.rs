@@ -347,6 +347,8 @@ export type PromptGuardEventCategory =
   | 'zhipu_filter'
   | 'kiro_refused'
   | 'judge_unavailable'
+  | 'content_too_long'
+  | 'review_incomplete'
   | 'unknown'
 
 export interface PromptGuardEventsQuery {

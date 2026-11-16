@@ -38,6 +38,8 @@ const CATEGORY_ORDER: PromptGuardEventCategory[] = [
   'roleplay',
   'zhipu_filter',
   'judge_unavailable',
+  'content_too_long',
+  'review_incomplete',
   'unknown',
 ]
 
@@ -60,6 +62,8 @@ const CATEGORY_LABELS: Record<PromptGuardEventCategory, string> = {
   roleplay: '角色扮演陪聊',
   zhipu_filter: '智谱风控拦截',
   judge_unavailable: '审核服务不可用',
+  content_too_long: '内容超出可审范围（已拒）',
+  review_incomplete: '这轮没审完（已拒）',
   kiro_refused: 'Kiro 拒过的对话',
   unknown: '未分类',
 }

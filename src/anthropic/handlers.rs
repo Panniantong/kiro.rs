@@ -37,6 +37,7 @@ use super::identity_response_guard::rewrite_kiro_self_identity;
 use super::middleware::AppState;
 use super::prompt_guard::{
     CONTENT_TOO_LONG_CATEGORY, ConversationMemoryDecision, GuardDecision, JUDGE_UNAVAILABLE_CATEGORY,
+    REVIEW_INCOMPLETE_CATEGORY,
 };
 use super::stream::{BufferedStreamContext, SignatureMode, SseEvent, StreamContext};
 use super::types::{
@@ -58,6 +59,8 @@ const LOCAL_CONVERSATION_BLOCK_MESSAGE: &str = "This conversation cannot be cont
 const LOCAL_GUARD_UNAVAILABLE_MESSAGE: &str = "Content review is temporarily unavailable. Please retry this request in a moment. (ref: R4023)";
 /// 内容长/大到审核不完：让客户拆开再发，别静默放过没审的部分。
 const LOCAL_GUARD_TOO_LONG_MESSAGE: &str = "This request is too large to review in one piece. Please split it into smaller requests and try again. (ref: R4024)";
+/// 这一轮没审完（历史块数超预算）：内容没问题，但审核没做完，让客户稍后重试。
+const LOCAL_GUARD_INCOMPLETE_MESSAGE: &str = "Content review for this request is not finished yet. Please retry in a moment; each retry makes progress. (ref: R4025)";
 
 fn local_guard_block_response() -> Response {
     (
@@ -92,13 +95,26 @@ fn local_guard_too_long_response() -> Response {
         .into_response()
 }
 
-/// 审核关口拒绝时的对外回复：判官不可用回「稍后重试」，内容审不完回「拆开再发」，
-/// 其余（判违规）回「改输入」。
+fn local_guard_incomplete_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            LOCAL_GUARD_INCOMPLETE_MESSAGE,
+        )),
+    )
+        .into_response()
+}
+
+/// 审核关口拒绝时的对外回复：判官不可用回「稍后重试」，内容太大回「拆开再发」，
+/// 这轮没审完回「稍后重试」，其余（判违规）回「改输入」。
 fn local_guard_reject_response(category: &str) -> Response {
     if category == JUDGE_UNAVAILABLE_CATEGORY {
         local_guard_unavailable_response()
     } else if category == CONTENT_TOO_LONG_CATEGORY {
         local_guard_too_long_response()
+    } else if category == REVIEW_INCOMPLETE_CATEGORY {
+        local_guard_incomplete_response()
     } else {
         local_guard_block_response()
     }

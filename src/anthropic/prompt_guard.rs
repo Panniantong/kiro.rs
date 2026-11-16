@@ -64,8 +64,11 @@ const CONTENT_CHUNK_MAX_CHARS: usize = 6000;
 const CONTENT_CUT_MODULUS: u8 = 16;
 /// 同一请求同一类块（system / 历史）并发送审上限。
 const STRICT_CHUNK_CONCURRENCY: usize = 8;
-/// 历史内容每次请求最多新送审的块数（缓存命中不算）；没审到的下一轮接着审。
-const HISTORY_MAX_JUDGED: usize = 16;
+/// 历史内容每次请求最多新审多少块（缓存命中的不算）：审不完就按「审核未完成」拒（R4025），
+/// 不静默放过没审的历史内容。实测今天随机 1071 个请求里，历史超过 64 块的只占 1.1%。
+const HISTORY_MAX_JUDGED: usize = 64;
+/// 历史范围切窗口时的上限（内存上限，约 300 万字）；切不完同样按「审核未完成」拒。
+const HISTORY_MAX_WINDOW_SCAN: usize = 512;
 /// 块判定缓存：通过的 6 小时，违规的 24 小时（同一 agent 的变体靠它持续拦住）。
 const PASS_VERDICT_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const VIOLATION_VERDICT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -101,6 +104,10 @@ pub const JUDGE_UNAVAILABLE_CATEGORY: &str = "judge_unavailable";
 /// 内容长/大到审不完（客户文本切不满窗口、图片超过单张或张数上限）时记的类别：
 /// 没审到的内容不能静默放过，直接拒绝，让客户拆开再发。
 pub const CONTENT_TOO_LONG_CATEGORY: &str = "content_too_long";
+
+/// 这一轮审不完（历史块数超过预算、或切窗口到上限）：内容没问题，但**没审完**，
+/// 不能当成通过放行；让客户稍后重试（缓存会记住已审的块，重试是递进完成的）。
+pub const REVIEW_INCOMPLETE_CATEGORY: &str = "review_incomplete";
 
 /// 违规日志里附带的分析用文本长度。
 const PREVIEW_CHARS: usize = 300;
@@ -266,12 +273,14 @@ impl PromptGuard {
             .or_else(|| images_over_limit.then(|| "单张图片超过上限或图片张数超过上限".to_string()));
         if let Some(what) = over_limit {
             let chars = user.as_ref().map(|user| user.chars).unwrap_or_default();
-            log_content_too_long(
+            log_incomplete_review(
+                CONTENT_TOO_LONG_CATEGORY,
+                "user",
                 self.events.as_deref(),
                 path,
                 mode_label(cfg),
                 model_name,
-                &what,
+                &format!("内容超出可完整审核的上限（{what}），未送审"),
                 chars,
             );
             return match cfg.mode {
@@ -283,7 +292,7 @@ impl PromptGuard {
         }
         let mut chunks = system_chunks(system.unwrap_or_default());
         chunks.extend(tool_chunks(tools.unwrap_or_default()));
-        let history = history_chunks(messages);
+        let (history, history_cut) = history_chunks(messages);
         if user.is_none() && images.is_empty() && chunks.is_empty() && history.is_empty() {
             return GuardDecision::Allow;
         }
@@ -313,8 +322,8 @@ impl PromptGuard {
                     tokio::join!(
                         guard.review_user_text(&cfg, user.as_ref(), &model, path),
                         guard.review_images(&cfg, &images, &model, path),
-                        guard.review_strict(StrictScope::System, &cfg, &chunks, &model, path),
-                        guard.review_strict(StrictScope::History, &cfg, &history, &model, path),
+                        guard.review_strict(StrictScope::System, &cfg, &chunks, false, &model, path),
+                        guard.review_strict(StrictScope::History, &cfg, &history, history_cut, &model, path),
                     );
                 });
                 GuardDecision::Allow
@@ -323,15 +332,19 @@ impl PromptGuard {
                 let (user_verdict, image_verdict, system_verdict, history_verdict) = tokio::join!(
                     self.review_user_text(cfg, user.as_ref(), model_name, path),
                     self.review_images(cfg, &images, model_name, path),
-                    self.review_strict(StrictScope::System, cfg, &chunks, model_name, path),
-                    self.review_strict(StrictScope::History, cfg, &history, model_name, path),
+                    self.review_strict(StrictScope::System, cfg, &chunks, false, model_name, path),
+                    self.review_strict(StrictScope::History, cfg, &history, history_cut, model_name, path),
                 );
-                // 多个范围同时有结果时优先报真实违规：判官不可用只是「没确认」，不该盖过已确认的违规。
+                // 多个范围同时有结果时优先报真实违规：判官不可用 / 这轮没审完只是「没确认」，
+                // 不该盖过已确认的违规。
                 let verdicts = [user_verdict, image_verdict, system_verdict, history_verdict];
                 let confirmed = verdicts
                     .iter()
                     .flatten()
-                    .find(|category| category.as_str() != JUDGE_UNAVAILABLE_CATEGORY)
+                    .find(|category| {
+                        category.as_str() != JUDGE_UNAVAILABLE_CATEGORY
+                            && category.as_str() != REVIEW_INCOMPLETE_CATEGORY
+                    })
                     .cloned();
                 match confirmed.or_else(|| verdicts.into_iter().flatten().next()) {
                     Some(category) => GuardDecision::Reject { category },
@@ -638,10 +651,25 @@ impl PromptGuard {
         scope: StrictScope,
         cfg: &PromptGuardConfig,
         chunks: &[String],
+        scan_cut: bool,
         model_name: &str,
         path: &'static str,
     ) -> Option<String> {
         if chunks.is_empty() {
+            // 没有块但有内容没切完（超大单块）：同样按没审完拒。
+            if scan_cut {
+                log_incomplete_review(
+                    REVIEW_INCOMPLETE_CATEGORY,
+                    scope.label(),
+                    self.events.as_deref(),
+                    path,
+                    mode_label(cfg),
+                    model_name,
+                    &format!("{} 内容超过切窗口上限，这一轮没审完", scope.error_label()),
+                    0,
+                );
+                return Some(REVIEW_INCOMPLETE_CATEGORY.to_string());
+            }
             return None;
         }
         let mode = mode_label(cfg);
@@ -771,6 +799,34 @@ impl PromptGuard {
             }
             // 判官重试后仍失败：不放过（客户改不了这个，得稍后重试）。
             None if !errors.is_empty() => Some(JUDGE_UNAVAILABLE_CATEGORY.to_string()),
+            // 没审完（切窗口到上限、或有块超过这轮预算）：不放过，让客户稍后重试。
+            // 已审的块在缓存里，重试是递进完成的。
+            None if scan_cut || skipped > 0 => {
+                let reason = if scan_cut {
+                    format!(
+                        "{} 内容超过切窗口上限（{} 块），这一轮没审完",
+                        scope.error_label(),
+                        HISTORY_MAX_WINDOW_SCAN
+                    )
+                } else {
+                    format!(
+                        "{} 还有 {skipped} 块这轮没审（每次最多新审 {} 块）",
+                        scope.error_label(),
+                        scope.max_judged()
+                    )
+                };
+                log_incomplete_review(
+                    REVIEW_INCOMPLETE_CATEGORY,
+                    scope.label(),
+                    self.events.as_deref(),
+                    path,
+                    mode,
+                    model_name,
+                    &reason,
+                    total_chars,
+                );
+                Some(REVIEW_INCOMPLETE_CATEGORY.to_string())
+            }
             None => {
                 tracing::info!(
                     target: "prompt_guard",
@@ -1226,9 +1282,16 @@ pub fn tool_chunks(tools: &[Tool]) -> Vec<String> {
 /// 把对话历史切成送审块，从最新的消息往前排：assistant 的文本、思考内容和工具调用参数
 /// （JSON），以及 user 消息里的 tool_result 内容（字符串或其中的 text 块）。客户手打的文本、
 /// 图片不收。每段内容按内容定边界切块（见 [`content_windows`]）。
-pub fn history_chunks(messages: &[Message]) -> Vec<String> {
-    let mut chunks = Vec::new();
+///
+/// 返回块和「是否因为切窗口上限没切完」（切不完由调用方按「审核未完成」拒，不静默放过）。
+pub fn history_chunks(messages: &[Message]) -> (Vec<String>, bool) {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cut_short = false;
     for message in messages.iter().rev() {
+        if chunks.len() >= HISTORY_MAX_WINDOW_SCAN {
+            cut_short = true;
+            break;
+        }
         let mut texts: Vec<String> = Vec::new();
         match (message.role.as_str(), &message.content) {
             ("assistant", serde_json::Value::String(text)) => texts.push(text.clone()),
@@ -1268,11 +1331,14 @@ pub fn history_chunks(messages: &[Message]) -> Vec<String> {
         for text in &texts {
             let text = text.trim();
             if !text.is_empty() {
-                chunks.extend(content_windows(text));
+                let remaining = HISTORY_MAX_WINDOW_SCAN.saturating_sub(chunks.len());
+                let (mut windows, cut) = content_windows_limited(text, remaining);
+                cut_short |= cut;
+                chunks.append(&mut windows);
             }
         }
     }
-    chunks
+    (chunks, cut_short)
 }
 
 /// tool_result 的 content：字符串直接用；数组只拼 text 块。
@@ -1619,43 +1685,38 @@ fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// 内容长/大到审不完：按拦截处理并记一条拦截记录（truncated 记真，确实有内容没送审）。
-fn log_content_too_long(
+/// 这一关没能审完（内容超出容量 / 这轮块数超预算 / 切窗口到上限）：按拦截处理并记一条记录，
+/// 类别区分「内容太大」（`content_too_long`，客户拆开再发）和「这轮没审完」（`review_incomplete`，
+/// 稍后重试会递进完成）。`truncated` 记真：确实有内容没送审。
+#[allow(clippy::too_many_arguments)]
+fn log_incomplete_review(
+    category: &str,
+    scope: &'static str,
     events: Option<&PromptGuardEventStore>,
     path: &'static str,
     mode: &str,
     model: &str,
-    what: &str,
+    reason: &str,
     chars: usize,
 ) {
-    let reason = format!("内容超出可完整审核的上限（{what}），未送审");
     if let Some(store) = events {
         let (kind, status) = match mode {
             "block" => (KIND_BLOCK, Some(400)),
             _ => (KIND_LOG_ONLY, None),
         };
         store.record(PromptGuardEvent::violation(
-            kind,
-            CONTENT_TOO_LONG_CATEGORY,
-            &reason,
-            model,
-            path,
-            status,
-            0,
-            chars,
-            true,
-            "",
+            kind, category, reason, model, path, status, 0, chars, true, "",
         ));
     }
     tracing::warn!(
         target: "prompt_guard",
         mode = mode,
-        verdict = "content_too_long",
-        scope = "user",
+        verdict = category,
+        scope = scope,
         reason = %reason,
         model = model,
         chars = chars,
-        "prompt guard 内容审不完，按拦截处理"
+        "prompt guard 这一关没审完，按拦截处理"
     );
 }
 
@@ -2421,17 +2482,20 @@ mod tests {
             msg("assistant", json!("新回复")),
             msg("user", json!([{"type": "tool_result", "tool_use_id": "t2", "content": "最新输出"}])),
         ];
-        assert_eq!(
-            history_chunks(&messages),
-            vec![
-                "最新输出",
-                "新回复",
-                "工具输出",
-                "思考内容",
-                "旧回复",
-                "{\"command\":\"ls\"}"
-            ]
-        );
+        let (chunks, cut_short) = history_chunks(&messages);
+        let expected: Vec<String> = [
+            "最新输出",
+            "新回复",
+            "工具输出",
+            "思考内容",
+            "旧回复",
+            "{\"command\":\"ls\"}",
+        ]
+        .iter()
+        .map(|text| text.to_string())
+        .collect();
+        assert_eq!(chunks, expected);
+        assert!(!cut_short);
     }
 
     #[tokio::test]
@@ -3035,10 +3099,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_reviews_at_most_budget_new_chunks_per_request() {
+    async fn history_reviews_all_chunks_or_rejects_as_incomplete() {
         let mock = spawn_strict_mock("永远不会出现", false).await;
         let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Block, mock.base_url.clone(), 3000);
+
+        // 小对话：40 块一次审完，判定走缓存后不再调判官。
         let mut messages = vec![msg("user", json!("开始"))];
         for i in 0..20 {
             messages.push(msg("assistant", json!(format!("第{}次回复", i))));
@@ -3048,12 +3114,31 @@ mod tests {
             guard.check(&cfg, &messages, None, None, "m", "/v1/messages").await,
             GuardDecision::Allow
         );
-        assert_eq!(count(&mock.history), HISTORY_MAX_JUDGED);
-        // 后面几轮：已审过的走缓存，每轮接着审 16 块，40 块三轮审完，之后不再调判官。
-        for expected in [2 * HISTORY_MAX_JUDGED, 40, 40] {
-            guard.check(&cfg, &messages, None, None, "m", "/v1/messages").await;
-            assert_eq!(count(&mock.history), expected);
+        let judged = count(&mock.history);
+        assert_eq!(judged, 40, "40 块全都要审（不再只审前 16 块）");
+        assert_eq!(
+            guard.check(&cfg, &messages, None, None, "m", "/v1/messages").await,
+            GuardDecision::Allow
+        );
+        assert_eq!(count(&mock.history), judged, "第二轮全部走缓存");
+
+        // 大对话：80 块超过这轮预算（64）→ 不放过，按「没审完」拒。
+        let mut many = vec![msg("user", json!("大对话开始"))];
+        for i in 0..40 {
+            many.push(msg("assistant", json!(format!("大对话第{}次回复", i))));
+            many.push(msg("user", json!([{"type": "tool_result", "tool_use_id": "t", "content": format!("大对话第{}次输出", i)}])));
         }
+        assert_eq!(
+            guard.check(&cfg, &many, None, None, "m", "/v1/messages").await,
+            GuardDecision::Reject { category: REVIEW_INCOMPLETE_CATEGORY.to_string() }
+        );
+        assert_eq!(count(&mock.history), 40 + HISTORY_MAX_JUDGED);
+        // 再发一次：上一轮审过的 64 块走缓存，剩下 16 块补上 → 审完即放行（递进完成）。
+        assert_eq!(
+            guard.check(&cfg, &many, None, None, "m", "/v1/messages").await,
+            GuardDecision::Allow
+        );
+        assert_eq!(count(&mock.history), 40 + 80);
     }
 
     #[test]
