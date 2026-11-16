@@ -14,7 +14,7 @@ use crate::kiro::provider::{
     DeferredStreamAttempt, KiroByteStream, KiroProvider, KiroStreamResponse, RefusalHook,
 };
 use crate::kiro::token_manager::AllRateLimitedError;
-use crate::model::config::MaxRelayConfig;
+use crate::model::config::{MaxRelayConfig, PromptGuardMode};
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -514,8 +514,8 @@ pub async fn post_messages(
         }
     };
 
-    // 客户提示词审核关口：已知 CC Test 检测探针不送审（判官会把复述 tag / 问身份
-    // 判成 sysprompt，送审会让渠道检测失败），其余请求在 CC Test 透传之前审核。
+    // 客户提示词审核关口：CC Test 检测探针不按违规拦（判官会把复述 tag / 问身份判成
+    // sysprompt，拦了会让渠道检测失败），但仍按只记日志送审——探针话术不能用来跳过审核。
     let guard_cfg = provider.token_manager().get_prompt_guard();
     let refusal_hook = match state.prompt_guard.check_conversation_memory(
         &guard_cfg,
@@ -526,17 +526,21 @@ pub async fn post_messages(
         ConversationMemoryDecision::Refused => return local_conversation_block_response(),
         ConversationMemoryDecision::Continue(hook) => hook,
     };
-    if !is_cctest_probe_request(&payload, &headers)
-        && let GuardDecision::Reject { .. } = state
-            .prompt_guard
-            .check(
-                &guard_cfg,
-                &payload.messages,
-                payload.system.as_deref(),
-                &payload.model,
-                "/v1/messages",
-            )
-            .await
+    let mut audit_cfg = guard_cfg.clone();
+    if is_cctest_probe_request(&payload, &headers) {
+        audit_cfg.mode = PromptGuardMode::Log;
+    }
+    if let GuardDecision::Reject { .. } = state
+        .prompt_guard
+        .check(
+            &audit_cfg,
+            &payload.messages,
+            payload.system.as_deref(),
+            payload.tools.as_deref(),
+            &payload.model,
+            "/v1/messages",
+        )
+        .await
     {
         return local_guard_block_response();
     }
@@ -2182,8 +2186,8 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 客户提示词审核关口：已知 CC Test 检测探针不送审（判官会把复述 tag / 问身份
-    // 判成 sysprompt，送审会让渠道检测失败），其余请求在 CC Test 透传之前审核。
+    // 客户提示词审核关口：CC Test 检测探针不按违规拦（判官会把复述 tag / 问身份判成
+    // sysprompt，拦了会让渠道检测失败），但仍按只记日志送审——探针话术不能用来跳过审核。
     let guard_cfg = provider.token_manager().get_prompt_guard();
     let refusal_hook = match state.prompt_guard.check_conversation_memory(
         &guard_cfg,
@@ -2194,17 +2198,21 @@ pub async fn post_messages_cc(
         ConversationMemoryDecision::Refused => return local_conversation_block_response(),
         ConversationMemoryDecision::Continue(hook) => hook,
     };
-    if !is_cctest_probe_request(&payload, &headers)
-        && let GuardDecision::Reject { .. } = state
-            .prompt_guard
-            .check(
-                &guard_cfg,
-                &payload.messages,
-                payload.system.as_deref(),
-                &payload.model,
-                "/cc/v1/messages",
-            )
-            .await
+    let mut audit_cfg = guard_cfg.clone();
+    if is_cctest_probe_request(&payload, &headers) {
+        audit_cfg.mode = PromptGuardMode::Log;
+    }
+    if let GuardDecision::Reject { .. } = state
+        .prompt_guard
+        .check(
+            &audit_cfg,
+            &payload.messages,
+            payload.system.as_deref(),
+            payload.tools.as_deref(),
+            &payload.model,
+            "/cc/v1/messages",
+        )
+        .await
     {
         return local_guard_block_response();
     }
