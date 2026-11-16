@@ -64,6 +64,15 @@ const CONTENT_CHUNK_MAX_CHARS: usize = 6000;
 const CONTENT_CUT_MODULUS: u8 = 16;
 /// 同一请求同一类块（system / 历史）并发送审上限。
 const STRICT_CHUNK_CONCURRENCY: usize = 8;
+/// 判官调用的**全进程并发上限**。智谱的限制是「同一时刻处理中的请求数」（错误码 1302
+/// 「您的账户已达到速率限制」，官方建议就是降低并发 + 加排队），而一个请求会并发问几十块，
+/// 池里有几条请求同时在跑就会顶穿账户额度。所有判官调用都过这道闸门，排队等不到位置就按
+/// 「审核服务忙」拒（R4023），绝不放过没审的内容。
+const JUDGE_MAX_CONCURRENCY: usize = 6;
+/// 判官调用在全进程闸门前的排队时限：等不到位置就按「审核服务忙」拒（不无限等）。
+const JUDGE_QUEUE_TIMEOUT: Duration = Duration::from_millis(2500);
+/// 撞上 429（速率限制）时，重试前先等这么久（避免立刻再撞）。
+const JUDGE_RATE_LIMIT_BACKOFF: Duration = Duration::from_millis(300);
 /// 历史内容每次请求最多新审多少块（缓存命中的不算）：审不完就按「审核未完成」拒（R4025），
 /// 不静默放过没审的历史内容。实测今天随机 1071 个请求里，历史超过 64 块的只占 1.1%。
 const HISTORY_MAX_JUDGED: usize = 64;
@@ -129,6 +138,8 @@ const KNOWN_CATEGORIES: &[&str] = &[
 pub struct PromptGuard {
     client: reqwest::Client,
     log_slots: Arc<Semaphore>,
+    /// 判官调用的全进程并发闸门（见 [`JUDGE_MAX_CONCURRENCY`]）。
+    judge_slots: Arc<Semaphore>,
     /// 拦截记录存储；未配置缓存目录时为空（只打日志）。
     events: Option<Arc<PromptGuardEventStore>>,
     /// 被 Kiro 拒过的对话（进程内存，重启即清空）。
@@ -172,6 +183,7 @@ impl PromptGuard {
         Arc::new(PromptGuard {
             client,
             log_slots: Arc::new(Semaphore::new(LOG_MODE_MAX_INFLIGHT)),
+            judge_slots: Arc::new(Semaphore::new(JUDGE_MAX_CONCURRENCY)),
             events,
             refusal_memory,
             system_verdicts: VerdictCache::new(SYSTEM_VERDICT_MAX_ENTRIES),
@@ -889,6 +901,9 @@ impl PromptGuard {
             reason = %failure.message,
             "判官第一次没给出可用的判定，重试一次"
         );
+        if let Some(delay) = failure.retry_delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut retry_prompt = prompt.to_string();
         retry_prompt.push_str(JUDGE_RETRY_SUFFIX);
         match self
@@ -925,6 +940,34 @@ impl PromptGuard {
             "thinking": {"type": "disabled"},
         });
 
+        // 全进程并发闸门：智谱按「同一时刻处理中的请求数」限流（1302），排队等不到位置就按
+        // 「审核服务忙」拒，不无限等、也不放过没审的内容。
+        let _permit = match tokio::time::timeout(
+            JUDGE_QUEUE_TIMEOUT,
+            Arc::clone(&self.judge_slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(JudgeFailure {
+                    message: "判官并发闸门已关闭".to_string(),
+                    retryable: false,
+                    retry_delay: None,
+                });
+            }
+            Err(_) => {
+                return Err(JudgeFailure {
+                    message: format!(
+                        "判官并发已满（全进程上限 {JUDGE_MAX_CONCURRENCY}），排队 {}ms 没获位置",
+                        JUDGE_QUEUE_TIMEOUT.as_millis()
+                    ),
+                    retryable: false,
+                    retry_delay: None,
+                });
+            }
+        };
+
         let response = self
             .client
             .post(&url)
@@ -936,12 +979,14 @@ impl PromptGuard {
             .map_err(|error| JudgeFailure {
                 message: format!("判官请求失败: {}", error),
                 retryable: true,
+                retry_delay: None,
             })?;
 
         let status = response.status();
         let raw = response.text().await.map_err(|error| JudgeFailure {
             message: format!("判官响应读取失败: {}", error),
             retryable: true,
+            retry_delay: None,
         })?;
 
         if status == reqwest::StatusCode::OK {
@@ -949,6 +994,7 @@ impl PromptGuard {
                 serde_json::from_str(&raw).map_err(|error| JudgeFailure {
                     message: format!("判官响应不是 JSON: {}", error),
                     retryable: true,
+                    retry_delay: None,
                 })?;
             let content = parsed
                 .pointer("/choices/0/message/content")
@@ -956,10 +1002,12 @@ impl PromptGuard {
                 .ok_or_else(|| JudgeFailure {
                     message: "判官响应缺少 choices[0].message.content".to_string(),
                     retryable: true,
+                    retry_delay: None,
                 })?;
             return parse_verdict(content).map_err(|message| JudgeFailure {
                 message,
                 retryable: true,
+                retry_delay: None,
             });
         }
 
@@ -974,6 +1022,7 @@ impl PromptGuard {
         let retryable = status.is_server_error()
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+        let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
         Err(JudgeFailure {
             message: format!(
                 "判官请求失败: HTTP {} 正文: {}",
@@ -981,6 +1030,7 @@ impl PromptGuard {
                 truncate_chars(&raw, 200)
             ),
             retryable,
+            retry_delay: rate_limited.then_some(JUDGE_RATE_LIMIT_BACKOFF),
         })
     }
 }
@@ -1007,6 +1057,8 @@ pub enum Verdict {
 struct JudgeFailure {
     message: String,
     retryable: bool,
+    /// 重试前先等这么久（撞速率限制时用，避免立刻再撞）。
+    retry_delay: Option<Duration>,
 }
 
 /// 抽取最后一条 `user` 消息的文本（口径见 [`extract_user_text`]）。
@@ -3096,6 +3148,54 @@ mod tests {
         );
         // 第一条 user 消息的「继续」现在也走 user 范围（以前只看最后一条），历史那条命中攻击。
         assert_eq!(count(&mock.user), 1);
+    }
+
+    #[tokio::test]
+    async fn judge_calls_are_capped_by_the_global_gate() {
+        // 一个请求会并发问好几块：多条请求一起跑时，全进程同时进行的判官调用不能超过闸门上限
+        // （智谱按并发数限流，1302 就是并发过高）。
+        let inflight: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let peak: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let (current, highest) = (Arc::clone(&inflight), Arc::clone(&peak));
+        let base_url = spawn_mock(move || {
+            let (current, highest) = (Arc::clone(&current), Arc::clone(&highest));
+            async move {
+                let now = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                highest.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(json!({"choices": [{"message": {"content": "{\"v\":0}"}}]}))
+                    .into_response()
+            }
+        })
+        .await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+
+        let history = |tag: &str| {
+            let mut messages = vec![msg("user", json!(format!("{tag} 开始")))];
+            for i in 0..8 {
+                messages.push(msg("assistant", json!(format!("{tag} 第{i}次回复"))));
+                messages.push(msg(
+                    "user",
+                    json!([{"type": "tool_result", "tool_use_id": "t", "content": format!("{tag} 第{i}次输出")}]),
+                ));
+            }
+            messages
+        };
+        let sets: Vec<Vec<Message>> = ["A", "B", "C"].iter().map(|tag| history(tag)).collect();
+        let runs = sets.iter().map(| messages| {
+            guard.check(&cfg, messages, None, None, "m", "/v1/messages")
+        });
+        for decision in futures::future::join_all(runs).await {
+            assert_eq!(decision, GuardDecision::Allow);
+        }
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak > 1, "应该真的并发跑了（peak={peak}）");
+        assert!(
+            peak <= JUDGE_MAX_CONCURRENCY,
+            "同时进行的判官调用 {peak} 超过闸门上限 {JUDGE_MAX_CONCURRENCY}"
+        );
     }
 
     #[tokio::test]
