@@ -84,6 +84,16 @@ pub struct PromptGuardConfig {
     /// 与审核模式无关：判官关掉也照样生效。
     #[serde(default = "default_refusal_memory_minutes")]
     pub refusal_memory_minutes: u64,
+
+    /// 审图用的视觉模型名（留空 = 图片不送审，如 "glm-4v-flash"）。
+    /// 客户最后一条消息里的图片会按这份模型送审，判定和对最后一句话同一套口径。
+    #[serde(default)]
+    pub vision_model: String,
+
+    /// 审图重试换的模型（留空 = 重试还用 visionModel，如 "glm-4.6v-flashx"）。
+    /// 免费视觉模型偶尔限流，配一个便宜付费模型兜底就不必因此拒客户。
+    #[serde(default)]
+    pub vision_fallback_model: String,
 }
 
 impl PromptGuardConfig {
@@ -104,6 +114,8 @@ impl Default for PromptGuardConfig {
             model: default_prompt_guard_model(),
             timeout_ms: default_prompt_guard_timeout_ms(),
             refusal_memory_minutes: default_refusal_memory_minutes(),
+            vision_model: String::new(),
+            vision_fallback_model: String::new(),
         }
     }
 }

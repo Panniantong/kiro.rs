@@ -2570,6 +2570,8 @@ mod tests {
             model: "glm-4.5-air".to_string(),
             timeout_ms: 3000,
             refusal_memory_minutes: 60,
+            vision_model: String::new(),
+            vision_fallback_model: String::new(),
         };
 
         assert_eq!(
