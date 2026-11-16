@@ -14,7 +14,7 @@ use crate::kiro::provider::{
     DeferredStreamAttempt, KiroByteStream, KiroProvider, KiroStreamResponse, RefusalHook,
 };
 use crate::kiro::token_manager::AllRateLimitedError;
-use crate::model::config::{MaxRelayConfig, PromptGuardMode};
+use crate::model::config::{MaxRelayConfig, PromptGuardConfig, PromptGuardMode};
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -84,6 +84,17 @@ fn local_guard_reject_response(category: &str) -> Response {
     } else {
         local_guard_block_response()
     }
+}
+
+/// 本次请求实际用的审核配置：CC Test 检测探针只把 `block` 降成 `log`（判官会把复述 tag /
+/// 问身份判成 sysprompt，拦了会让渠道检测失败），但 `off` 就是 off——不能因为探针把
+/// 已经关掉的审核重新打开、把客户内容再发给外部判官。
+fn audit_config(guard_cfg: &PromptGuardConfig, probe: bool) -> PromptGuardConfig {
+    let mut cfg = guard_cfg.clone();
+    if probe && cfg.mode == PromptGuardMode::Block {
+        cfg.mode = PromptGuardMode::Log;
+    }
+    cfg
 }
 
 fn local_conversation_block_response() -> Response {
@@ -548,10 +559,7 @@ pub async fn post_messages(
         ConversationMemoryDecision::Refused => return local_conversation_block_response(),
         ConversationMemoryDecision::Continue(hook) => hook,
     };
-    let mut audit_cfg = guard_cfg.clone();
-    if is_cctest_probe_request(&payload, &headers) {
-        audit_cfg.mode = PromptGuardMode::Log;
-    }
+    let audit_cfg = audit_config(&guard_cfg, is_cctest_probe_request(&payload, &headers));
     if let GuardDecision::Reject { category } = state
         .prompt_guard
         .check(
@@ -2220,10 +2228,7 @@ pub async fn post_messages_cc(
         ConversationMemoryDecision::Refused => return local_conversation_block_response(),
         ConversationMemoryDecision::Continue(hook) => hook,
     };
-    let mut audit_cfg = guard_cfg.clone();
-    if is_cctest_probe_request(&payload, &headers) {
-        audit_cfg.mode = PromptGuardMode::Log;
-    }
+    let audit_cfg = audit_config(&guard_cfg, is_cctest_probe_request(&payload, &headers));
     if let GuardDecision::Reject { category } = state
         .prompt_guard
         .check(
@@ -2554,6 +2559,36 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::time::timeout;
+
+    /// 探针请求只把 block 降成 log：管理员关掉审核（off）时不能被探针重新打开。
+    #[test]
+    fn probe_audit_config_only_downgrades_block() {
+        let guard_cfg = |mode: PromptGuardMode| PromptGuardConfig {
+            mode,
+            base_url: "http://127.0.0.1:1".to_string(),
+            api_key: "test-key".to_string(),
+            model: "glm-4.5-air".to_string(),
+            timeout_ms: 3000,
+            refusal_memory_minutes: 60,
+        };
+
+        assert_eq!(
+            audit_config(&guard_cfg(PromptGuardMode::Block), true).mode,
+            PromptGuardMode::Log
+        );
+        assert_eq!(
+            audit_config(&guard_cfg(PromptGuardMode::Block), false).mode,
+            PromptGuardMode::Block
+        );
+        assert_eq!(
+            audit_config(&guard_cfg(PromptGuardMode::Off), true).mode,
+            PromptGuardMode::Off
+        );
+        assert_eq!(
+            audit_config(&guard_cfg(PromptGuardMode::Log), true).mode,
+            PromptGuardMode::Log
+        );
+    }
 
     struct DelayedTestEndpoint {
         base_url: String,

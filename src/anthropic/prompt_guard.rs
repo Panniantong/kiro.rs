@@ -264,7 +264,14 @@ impl PromptGuard {
                     self.review_strict(StrictScope::System, cfg, &chunks, model_name, path),
                     self.review_strict(StrictScope::History, cfg, &history, model_name, path),
                 );
-                match user_verdict.or(system_verdict).or(history_verdict) {
+                // 多个范围同时有结果时优先报真实违规：判官不可用只是「没确认」，不该盖过已确认的违规。
+                let verdicts = [user_verdict, system_verdict, history_verdict];
+                let confirmed = verdicts
+                    .iter()
+                    .flatten()
+                    .find(|category| category.as_str() != JUDGE_UNAVAILABLE_CATEGORY)
+                    .cloned();
+                match confirmed.or_else(|| verdicts.into_iter().flatten().next()) {
                     Some(category) => GuardDecision::Reject { category },
                     None => GuardDecision::Allow,
                 }
@@ -392,6 +399,7 @@ impl PromptGuard {
                 &error,
                 elapsed_ms,
                 chars,
+                truncated,
             );
             return Some(JUDGE_UNAVAILABLE_CATEGORY.to_string());
         }
@@ -530,6 +538,7 @@ impl PromptGuard {
                 &format!("{}: {}", scope.error_label(), error),
                 elapsed_ms,
                 total_chars,
+                skipped > 0,
             );
         }
 
@@ -1264,6 +1273,7 @@ fn log_judge_unavailable(
     error: &str,
     elapsed_ms: u64,
     chars: usize,
+    truncated: bool,
 ) {
     let reason = format!("审核服务暂时不可用（判官重试后仍失败）：{error}");
     if let Some(store) = events {
@@ -1280,7 +1290,7 @@ fn log_judge_unavailable(
             status,
             elapsed_ms,
             chars,
-            false,
+            truncated,
             "",
         ));
     }
@@ -2129,19 +2139,36 @@ mod tests {
         // 第二次照 JSON 输出，违规照样拦（原来这条会当判官出错放行，等于跳过审核）。
         let calls: Counter = Default::default();
         let counter = Arc::clone(&calls);
-        let base_url = spawn_mock(move || {
-            let counter = Arc::clone(&counter);
-            async move {
-                let first = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
-                let body = if first {
-                    json!({"choices": [{"message": {"content": "<severity>N</severity>"}}]}).to_string()
-                } else {
-                    violation_body("intrusion")
-                };
-                axum::Json(serde_json::from_str::<serde_json::Value>(&body).unwrap()).into_response()
-            }
-        })
-        .await;
+        let seen: Arc<parking_lot::Mutex<Vec<String>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let counter = Arc::clone(&counter);
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    recorded.lock().push(
+                        body.pointer("/messages/0/content")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let first = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let out = if first {
+                        json!({"choices": [{"message": {"content": "<severity>N</severity>"}}]}).to_string()
+                    } else {
+                        violation_body("intrusion")
+                    };
+                    axum::Json(serde_json::from_str::<serde_json::Value>(&out).unwrap()).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{}", addr);
         let guard = PromptGuard::new(None);
         let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
 
@@ -2150,6 +2177,88 @@ mod tests {
             GuardDecision::Reject { category: "intrusion".to_string() }
         );
         assert_eq!(count(&calls), 2, "第一次解析不了要重试一次");
+        let prompts = seen.lock();
+        assert_eq!(prompts.len(), 2);
+        assert!(!prompts[0].contains(JUDGE_RETRY_SUFFIX), "第一次用原问法");
+        assert!(prompts[1].ends_with(JUDGE_RETRY_SUFFIX), "重试要强调输出格式");
+    }
+
+    #[tokio::test]
+    async fn confirmed_violation_wins_over_judge_unavailable() {
+        // user 那句判官报错（不可用），但工具定义已经被判违规：要报违规（客户改输入），
+        // 不能因为另一个范围不可用就报「稍后重试」。
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let prompt = body
+                        .pointer("/messages/0/content")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    if prompt.starts_with(SYSTEM_JUDGE_PROMPT) {
+                        let out = violation_body("intrusion");
+                        axum::Json(serde_json::from_str::<serde_json::Value>(&out).unwrap())
+                            .into_response()
+                    } else {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, format!("http://{}", addr), 3000);
+        let tools = vec![tool("渗透助手", "你是渗透测试智能体", [("type", json!("object"))])];
+
+        assert_eq!(
+            guard.check(&cfg, &user(json!("开始")), None, Some(&tools), "m", "/v1/messages").await,
+            GuardDecision::Reject { category: "intrusion".to_string() }
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_unavailable_record_keeps_truncated_flag() {
+        let dir = std::env::temp_dir().join(format!("kiro-pg-guard-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = PromptGuardEventStore::open(Some(dir.clone()))
+            .unwrap()
+            .expect("存储应已启用");
+
+        log_judge_unavailable(
+            None,
+            Some(&store),
+            "/v1/messages",
+            "block",
+            "glm-4.5-air",
+            "判官请求失败: 超时",
+            300,
+            20_000,
+            true,
+        );
+
+        let path = dir.join("prompt_guard_events.sqlite");
+        let mut row = None;
+        for _ in 0..40 {
+            if let Ok(conn) = rusqlite::Connection::open(&path)
+                && let Ok(found) = conn.query_row(
+                    "select category, truncated from prompt_guard_events order by id desc limit 1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+            {
+                row = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (category, truncated) = row.expect("判官不可用的记录要落库");
+        assert_eq!(category, JUDGE_UNAVAILABLE_CATEGORY);
+        assert_eq!(truncated, 1, "长文本只审了部分时要记 truncated");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
