@@ -72,6 +72,9 @@ const MAX_INPUT_CHARS: usize = 4000;
 const INPUT_HEAD_CHARS: usize = 3000;
 const INPUT_TAIL_CHARS: usize = 1000;
 
+/// 判官服务商（智谱）自身风控拒审输入时记的违规类别。
+const ZHIPU_FILTER_CATEGORY: &str = "zhipu_filter";
+
 /// 违规日志里附带的分析用文本长度。
 const PREVIEW_CHARS: usize = 300;
 
@@ -355,6 +358,14 @@ impl PromptGuard {
         for (key, index, result) in results {
             match result {
                 Ok(Verdict::Pass) => cache.put(key, CachedVerdict::Pass),
+                // 历史内容（工具输出、助手回复）被判官服务商自身风控拒审时按放行处理并记一条判官错误：
+                // 这类拒审多是政治、新闻类调研资料，不代表客户在提违规要求；最新一句话和 system 仍按违规拦。
+                Ok(Verdict::Violation { category, .. })
+                    if scope == StrictScope::History && category == ZHIPU_FILTER_CATEGORY =>
+                {
+                    cache.put(key, CachedVerdict::Pass);
+                    errors.push("判官服务商自身风控拒审历史内容，按放行处理".to_string());
+                }
                 Ok(Verdict::Violation { category, reason }) => {
                     cache.put(
                         key,
@@ -483,7 +494,7 @@ impl PromptGuard {
         // 智谱内容安全拦截：判官服务商自己在入口就把输入判为不安全。
         if status == reqwest::StatusCode::BAD_REQUEST && is_zhipu_content_filter(&raw) {
             return Ok(Verdict::Violation {
-                category: "zhipu_filter".to_string(),
+                category: ZHIPU_FILTER_CATEGORY.to_string(),
                 reason: "判官服务商自身风控判定输入不安全".to_string(),
             });
         }
@@ -1360,6 +1371,34 @@ mod tests {
             GuardDecision::Reject {
                 category: "zhipu_filter".to_string()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn block_mode_allows_history_rejected_by_zhipu_filter() {
+        let base_url = spawn_mock(move || async move {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"1301","message":"内容安全"}}"#,
+            )
+                .into_response()
+        })
+        .await;
+
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        let messages = vec![
+            msg("assistant", json!([
+                {"type": "tool_use", "id": "t1", "name": "WebFetch", "input": {"url": "https://example.com"}}
+            ])),
+            msg("user", json!([
+                {"type": "tool_result", "tool_use_id": "t1", "content": "某国政府机构人员公开资料汇总"}
+            ])),
+        ];
+
+        assert_eq!(
+            guard.check(&cfg, &messages, None, "claude-opus-4-8", "/v1/messages").await,
+            GuardDecision::Allow
         );
     }
 
