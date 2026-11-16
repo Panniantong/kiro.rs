@@ -152,11 +152,21 @@ impl PromptGuard {
         let client = reqwest::Client::builder()
             .build()
             .expect("prompt guard 判官 HTTP 客户端构建失败");
+        let refusal_memory = Arc::new(RefusalMemory::new());
+        // 被拒对话记忆落过盘就装回来：换容器 / 重启后，被拒过的对话照样拦得住。
+        if let Some(store) = events.as_deref() {
+            refusal_memory.restore(store.load_refusals());
+            tracing::info!(
+                target: "prompt_guard",
+                restored = refusal_memory.export_now().len(),
+                "被拒对话记忆已从落盘恢复"
+            );
+        }
         Arc::new(PromptGuard {
             client,
             log_slots: Arc::new(Semaphore::new(LOG_MODE_MAX_INFLIGHT)),
             events,
-            refusal_memory: Arc::new(RefusalMemory::new()),
+            refusal_memory,
             system_verdicts: VerdictCache::new(SYSTEM_VERDICT_MAX_ENTRIES),
             history_verdicts: VerdictCache::new(HISTORY_VERDICT_MAX_ENTRIES),
             user_verdicts: VerdictCache::new(USER_VERDICT_MAX_ENTRIES),
@@ -203,11 +213,18 @@ impl PromptGuard {
             return ConversationMemoryDecision::Continue(None);
         };
         let memory = Arc::clone(&self.refusal_memory);
+        let events = self.events.clone();
         let model = model_name.to_string();
         let message_count = messages.len();
         let hook: RefusalHook = Arc::new(move |message: &str| {
             if is_conversation_refusal(message) {
                 memory.remember(key, ttl);
+                // 落盘（节流：见 RefusalMemory::take_dirty），换容器后这段记忆还在。
+                if let Some(store) = events.as_deref()
+                    && let Some(snapshot) = memory.take_dirty()
+                {
+                    store.save_refusals(snapshot);
+                }
                 tracing::warn!(
                     target: "prompt_guard",
                     verdict = "conversation_remembered",

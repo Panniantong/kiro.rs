@@ -238,6 +238,72 @@ impl PromptGuardEventStore {
         .await
         .map_err(|error| anyhow::anyhow!("拦截记录查询任务失败: {error}"))?
     }
+
+    /// 读回被拒对话记忆（同步读：进程启动时用，免得开局有一段“什么都不知道”的窗口）。
+    pub fn load_refusals(&self) -> Vec<([u8; 32], i64)> {
+        let path = self.path.clone();
+        match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|connection| load_refusals(&connection))
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(target: "prompt_guard", error = %error, "被拒对话记忆读取失败");
+                Vec::new()
+            }
+        }
+    }
+
+    /// 整份覆盖写被拒对话记忆，顺手清掉过期的。`spawn_blocking`，失败只 warn。
+    pub fn save_refusals(&self, entries: Vec<([u8; 32], i64)>) {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = save_refusals(&path, &entries, Utc::now().timestamp_millis()) {
+                tracing::warn!(target: "prompt_guard", error = %error, "被拒对话记忆写入失败");
+            }
+        });
+    }
+}
+
+fn load_refusals(connection: &Connection) -> rusqlite::Result<Vec<([u8; 32], i64)>> {
+    let mut statement =
+        connection.prepare("SELECT key, expires_at FROM refusal_conversations")?;
+    let rows = statement.query_map([], |row| {
+        let key: Vec<u8> = row.get(0)?;
+        let expires_at: i64 = row.get(1)?;
+        Ok((key, expires_at))
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (key, expires_at) = row?;
+        if key.len() == 32 {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&key);
+            entries.push((bytes, expires_at));
+        }
+    }
+    Ok(entries)
+}
+
+fn save_refusals(path: &PathBuf, entries: &[([u8; 32], i64)], now_ms: i64) -> rusqlite::Result<()> {
+    let mut connection = open_connection(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM refusal_conversations WHERE expires_at <= ?1", [now_ms])?;
+    {
+        let mut statement = transaction.prepare(
+            "INSERT INTO refusal_conversations (key, expires_at) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET expires_at = excluded.expires_at",
+        )?;
+        for (key, expires_at) in entries {
+            if *expires_at <= now_ms {
+                continue;
+            }
+            statement.execute(rusqlite::params![key.as_slice(), expires_at])?;
+        }
+    }
+    transaction.commit()
 }
 
 fn open_connection(path: &PathBuf, flags: OpenFlags) -> rusqlite::Result<Connection> {
@@ -268,7 +334,13 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             preview TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_prompt_guard_events_time
-            ON prompt_guard_events (created_at DESC, id DESC);",
+            ON prompt_guard_events (created_at DESC, id DESC);
+        CREATE TABLE IF NOT EXISTS refusal_conversations (
+            key BLOB PRIMARY KEY,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_refusal_conversations_expiry
+            ON refusal_conversations (expires_at);",
     )?;
     Ok(())
 }
@@ -545,6 +617,24 @@ mod tests {
     #[test]
     fn open_returns_none_without_cache_dir() {
         assert!(PromptGuardEventStore::open(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn refusal_memory_round_trips_through_store() {
+        let dir = TempDir::new();
+        let store = open_store(&dir);
+        let now = crate::anthropic::refusal_memory::now_ms();
+        let key = [7u8; 32];
+        let expires = now + 3_600_000;
+
+        save_refusals(&dir.db_path(), &[(key, expires)], now).unwrap();
+        assert_eq!(store.load_refusals(), vec![(key, expires)]);
+
+        // 已经过期的行不落库（顺手把库里过期的清掉），之前那条仍然在。
+        save_refusals(&dir.db_path(), &[([8u8; 32], now - 1)], now).unwrap();
+        let loaded = store.load_refusals();
+        assert!(!loaded.iter().any(|(k, _)| *k == [8u8; 32]), "过期的行不该落库");
+        assert!(loaded.iter().any(|(k, _)| *k == key));
     }
 
     #[test]

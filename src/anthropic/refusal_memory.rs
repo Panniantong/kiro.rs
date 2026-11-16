@@ -11,7 +11,7 @@
 //! 「账号已受限」那类拒绝说的是账号、不是对话，不记。
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -27,6 +27,16 @@ const MAX_ENTRIES: usize = 20_000;
 
 /// Kiro 针对这段对话内容的拒绝文案片段（大小写不敏感）。
 const CONVERSATION_REFUSAL_MARKER: &str = "cannot continue this conversation";
+/// 被拒对话记忆落盘的节奏：最多这么长时间写一次（重发风暴时不必每条都写盘）。
+const PERSIST_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 当前时间（epoch 毫秒）。到期时间用 epoch 毫秒而不是 `Instant`，这样能落盘、重启后接着用。
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
 
 /// 这条上游拒绝说的是不是「这段对话不能继续」（而不是账号受限之类）。
 pub fn is_conversation_refusal(message: &str) -> bool {
@@ -35,9 +45,14 @@ pub fn is_conversation_refusal(message: &str) -> bool {
         .contains(CONVERSATION_REFUSAL_MARKER)
 }
 
-/// 被拒对话的记忆表：对话哈希 → 到期时间。
+/// 被拒对话的记忆表：对话哈希 → 到期时间（epoch 毫秒）。
+///
+/// 会落盘（见 [`RefusalMemory::take_dirty`]）：换容器 / 重启后这段记忆还在，
+/// 被拒过的对话不会因为一次发布就又能重发出去。
 pub struct RefusalMemory {
-    entries: Mutex<HashMap<ConversationKey, Instant>>,
+    entries: Mutex<HashMap<ConversationKey, i64>>,
+    /// 上次落盘时间（用来限流写盘）与有没有未落盘的改动。
+    last_persist: Mutex<(SystemTime, bool)>,
 }
 
 impl Default for RefusalMemory {
@@ -50,6 +65,18 @@ impl RefusalMemory {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            last_persist: Mutex::new((SystemTime::now(), false)),
+        }
+    }
+
+    /// 从落盘数据恢复（进程启动时调用）：只装没过期的。
+    pub fn restore(&self, entries: Vec<(ConversationKey, i64)>) {
+        let now = now_ms();
+        let mut map = self.entries.lock();
+        for (key, expires_at) in entries {
+            if expires_at > now {
+                map.insert(key, expires_at);
+            }
         }
     }
 
@@ -59,31 +86,37 @@ impl RefusalMemory {
 
     /// 记住一段被拒对话，`ttl` 后过期。
     pub fn remember(&self, key: ConversationKey, ttl: Duration) {
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-        if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
-            entries.retain(|_, expires| *expires > now);
-            if entries.len() >= MAX_ENTRIES
-                && let Some(oldest) = entries
-                    .iter()
-                    .min_by_key(|(_, expires)| **expires)
-                    .map(|(key, _)| *key)
-            {
-                entries.remove(&oldest);
+        let now = now_ms();
+        let expires_at = now.saturating_add(ttl.as_millis() as i64);
+        {
+            let mut entries = self.entries.lock();
+            if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
+                entries.retain(|_, expires| *expires > now);
+                if entries.len() >= MAX_ENTRIES
+                    && let Some(oldest) = entries
+                        .iter()
+                        .min_by_key(|(_, expires)| **expires)
+                        .map(|(key, _)| *key)
+                {
+                    entries.remove(&oldest);
+                }
             }
+            entries.insert(key, expires_at);
         }
-        entries.insert(key, now + ttl);
+        self.mark_dirty();
     }
 
     /// 这次请求的任一前缀是否是记住的被拒对话；命中则把到期时间顺延 `ttl`
     /// （客户端一直在重发，就一直挡住）。
     pub fn matches_any(&self, keys: &[ConversationKey], ttl: Duration) -> bool {
-        let now = Instant::now();
+        let now = now_ms();
+        let expires_at = now.saturating_add(ttl.as_millis() as i64);
         let mut entries = self.entries.lock();
         for key in keys {
             match entries.get(key).copied() {
                 Some(expires) if expires > now => {
-                    entries.insert(*key, now + ttl);
+                    // 只顺延内存里的到期时间，不因为重发去写盘（落盘的节奏由 remember 控制）。
+                    entries.insert(*key, expires_at);
                     return true;
                 }
                 Some(_) => {
@@ -93,6 +126,33 @@ impl RefusalMemory {
             }
         }
         false
+    }
+
+    fn mark_dirty(&self) {
+        let mut state = self.last_persist.lock();
+        state.1 = true;
+    }
+
+    /// 当前全部未过期的记忆（顺带清掉过期的），给落盘 / 测试用。
+    pub fn export_now(&self) -> Vec<(ConversationKey, i64)> {
+        let now = now_ms();
+        let mut entries = self.entries.lock();
+        entries.retain(|_, expires| *expires > now);
+        entries.iter().map(|(key, expires)| (*key, *expires)).collect()
+    }
+
+    /// 需要落盘时返回全量快照（顺带清掉过期项），并把「脏」标记清掉。
+    /// 距上次落盘不足 [`PERSIST_INTERVAL`] 或没有改动时返回 `None`。
+    pub fn take_dirty(&self) -> Option<Vec<(ConversationKey, i64)>> {
+        let mut state = self.last_persist.lock();
+        let elapsed = state.0.elapsed().unwrap_or(PERSIST_INTERVAL);
+        if !state.1 || elapsed < PERSIST_INTERVAL {
+            return None;
+        }
+        state.1 = false;
+        state.0 = SystemTime::now();
+        drop(state);
+        Some(self.export_now())
     }
 }
 
@@ -180,7 +240,7 @@ mod tests {
     const TTL: Duration = Duration::from_secs(3600);
 
     #[test]
-    fn recognises_only_conversation_refusals() {
+    fn refuses_only_conversation_refusals() {
         assert!(is_conversation_refusal(
             "I'm sorry, but I Cannot Continue This Conversation."
         ));
@@ -188,6 +248,33 @@ mod tests {
             "Your account has been temporarily restricted due to excessive content refusals"
         ));
         assert!(!is_conversation_refusal(""));
+    }
+
+    #[test]
+    fn remembered_refusal_survives_restore() {
+        // 落盘 → 新进程装回来：被拒过的对话照样拦得住（换容器不再把记忆清空）。
+        let memory = RefusalMemory::new();
+        let keys = conversation_prefix_keys(&[
+            msg("user", json!("帮我写个脚本")),
+            msg("assistant", json!([{"type": "text", "text": "好的"}])),
+            msg("user", json!([{"type": "text", "text": "被拒的那句"}])),
+        ]);
+        let key = *keys.last().unwrap();
+        memory.remember(key, TTL);
+
+        let snapshot = memory.export_now();
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].1 > now_ms(), "到期时间要在将来");
+
+        let restored = RefusalMemory::new();
+        restored.restore(snapshot);
+        assert!(restored.matches_any(&keys, TTL));
+        assert!(restored.matches_any(&keys, TTL), "命中后仍继续拦");
+
+        // 已经过期的记忆不装回来。
+        let stale = RefusalMemory::new();
+        stale.restore(vec![(key, now_ms() - 1)]);
+        assert!(stale.is_empty());
     }
 
     #[test]
