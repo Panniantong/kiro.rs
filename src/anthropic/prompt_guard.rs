@@ -9,17 +9,20 @@
 //! Key 保存后无需重启即生效。
 //!
 //! 审三样东西，并行送判官，任一违规即拦：
-//! 1. 最后一条 user 消息里的 text 块（含 system-reminder 内容），每次实时审；超过 4000 字
-//!    只看头 3000 + 尾 1000。
+//! 1. 最后一条 user 消息里的 text 块（含 system-reminder 内容），每次实时审；内容长于一个块
+//!    时按内容切块、相邻两块拼成窗口逐个送审（见 [`user_review`]）。
 //! 2. system 提示词（客户给 AI 的角色设定），用专门针对 Kiro 的严格问法：Kiro 会拒绝
 //!    渗透测试 / 攻击类 agent，即使声称已授权也拒，拒多了整池号对该模型被上游锁住。
 //! 3. 对话历史里的工具返回内容和 AI 自己的回复 / 工具参数（客户打的字不在此列），用
 //!    历史专用的严格问法：攻击类工作常常只体现在命令和输出里（扫描结果、漏洞利用代码）。
 //!
-//! 2、3 都按内容定边界切块（见 [`content_windows`]）：切点由行内容决定，同一段文字不管
+//! 三样都按内容定边界切块（见 [`content_windows`]）：切点由行内容决定，同一段文字不管
 //! 前面多了或少了几行，切出来的块都一样，于是同一 agent 的不同变体、同一对话的后续轮次
 //! 都能复用已有判定。判定按块内容哈希缓存（通过 6 小时、违规 24 小时）；判官出错的块
-//! 不缓存，下次再审。历史每次请求最多新审 16 块，从最新的往前审，没审到的下一轮接着审。
+//! 不缓存，下次再审。历史每次请求最多新审 16 块，从最新的往前审，没审到的下一轮接着审；
+//! user 每次请求最多审 [`USER_MAX_WINDOWS`] 个窗口：窗口更多时只取开头和末尾（原来只审
+//! 「头 3000 + 尾 1000」，头尾都不能丢）；内容长到连 [`USER_MAX_WINDOW_SCAN`] 个窗口都
+//! 切不满时只审开头，末尾窗口取不到。
 //!
 //! 不审 tools 描述、图片、更早的 user 手打文本（它们在各自那一轮已作为最后一句审过）。
 
@@ -64,13 +67,15 @@ const PASS_VERDICT_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const VIOLATION_VERDICT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const SYSTEM_VERDICT_MAX_ENTRIES: usize = 50_000;
 const HISTORY_VERDICT_MAX_ENTRIES: usize = 200_000;
+const USER_VERDICT_MAX_ENTRIES: usize = 200_000;
 /// Claude Code 每次请求都会变的计费头块，不送审（无内容、且每次都会缓存未命中）。
 const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header";
 
-/// 送审文本的字符上限，超过则头 3000 + 尾 1000 截断。
-const MAX_INPUT_CHARS: usize = 4000;
-const INPUT_HEAD_CHARS: usize = 3000;
-const INPUT_TAIL_CHARS: usize = 1000;
+/// user 范围（客户最后一段文本）每次请求最多送审的窗口数；窗口更多时只审开头和末尾。
+const USER_MAX_WINDOWS: usize = 12;
+/// user 范围切窗口时最多切出多少个窗口（超大请求体的内存上限，约覆盖开头 100 万字），
+/// 再多就只按前段成窗、末尾窗口也取不到。
+const USER_MAX_WINDOW_SCAN: usize = 256;
 
 /// 判官服务商（智谱）自身风控拒审输入时记的违规类别。
 const ZHIPU_FILTER_CATEGORY: &str = "zhipu_filter";
@@ -103,6 +108,8 @@ pub struct PromptGuard {
     system_verdicts: VerdictCache,
     /// 对话历史块的判定缓存（进程内存，重启即清空）。
     history_verdicts: VerdictCache,
+    /// 客户最后一段文本窗口的判定缓存（进程内存，重启即清空）。
+    user_verdicts: VerdictCache,
 }
 
 /// 被拒对话记忆的判定结果。
@@ -128,6 +135,7 @@ impl PromptGuard {
             refusal_memory: Arc::new(RefusalMemory::new()),
             system_verdicts: VerdictCache::new(SYSTEM_VERDICT_MAX_ENTRIES),
             history_verdicts: VerdictCache::new(HISTORY_VERDICT_MAX_ENTRIES),
+            user_verdicts: VerdictCache::new(USER_VERDICT_MAX_ENTRIES),
         })
     }
 
@@ -204,10 +212,10 @@ impl PromptGuard {
             return GuardDecision::Allow;
         }
 
-        let text = extract_latest_user_text(messages);
+        let user = extract_latest_user_text(messages).map(|text| user_review(&text));
         let chunks = system_chunks(system.unwrap_or_default());
         let history = history_chunks(messages);
-        if text.is_none() && chunks.is_empty() && history.is_empty() {
+        if user.is_none() && chunks.is_empty() && history.is_empty() {
             return GuardDecision::Allow;
         }
 
@@ -231,7 +239,7 @@ impl PromptGuard {
                 tokio::spawn(async move {
                     let _permit = permit;
                     tokio::join!(
-                        guard.review_user_text(&cfg, text.as_deref(), &model, path),
+                        guard.review_user_text(&cfg, user.as_ref(), &model, path),
                         guard.review_strict(StrictScope::System, &cfg, &chunks, &model, path),
                         guard.review_strict(StrictScope::History, &cfg, &history, &model, path),
                     );
@@ -239,12 +247,12 @@ impl PromptGuard {
                 GuardDecision::Allow
             }
             PromptGuardMode::Block => {
-                let (user, system, history) = tokio::join!(
-                    self.review_user_text(cfg, text.as_deref(), model_name, path),
+                let (user_verdict, system_verdict, history_verdict) = tokio::join!(
+                    self.review_user_text(cfg, user.as_ref(), model_name, path),
                     self.review_strict(StrictScope::System, cfg, &chunks, model_name, path),
                     self.review_strict(StrictScope::History, cfg, &history, model_name, path),
                 );
-                match user.or(system).or(history) {
+                match user_verdict.or(system_verdict).or(history_verdict) {
                     Some(category) => GuardDecision::Reject { category },
                     None => GuardDecision::Allow,
                 }
@@ -252,33 +260,133 @@ impl PromptGuard {
         }
     }
 
-    /// 审最后一句话：违规返回类别（是否拦截由调用方按模式决定），并落日志 / 记录。
+    /// 审客户最后一段文本（可能切成多个窗口）：违规返回类别（是否拦截由调用方按模式决定），
+    /// 并落日志 / 记录。短文本只有一个窗口，等价于单次送审；长文本并发送审（上限
+    /// [`STRICT_CHUNK_CONCURRENCY`]），任一窗口违规即违规。判定按窗口内容哈希缓存（和
+    /// system / 历史一样）；判官出错的窗口不缓存、按放行处理。
     async fn review_user_text(
         &self,
         cfg: &PromptGuardConfig,
-        text: Option<&str>,
+        user: Option<&UserReview>,
         model_name: &str,
         path: &'static str,
     ) -> Option<String> {
-        let text = text?;
+        let user = user?;
+        if user.windows.is_empty() {
+            return None;
+        }
+        let (chars, truncated, windows) = (user.chars, user.truncated, user.windows.as_slice());
         let mode = mode_label(cfg);
         let started = Instant::now();
-        let result = self
-            .judge(cfg, JUDGE_PROMPT, &prepare_judge_input(text))
-            .await;
-        log_verdict(
+
+        // 待审窗口记下标而不是借用，避免 tokio::spawn 里流组合子的高阶生命周期推断失败。
+        let mut pending: Vec<(ChunkKey, usize)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (index, window) in windows.iter().enumerate() {
+            let key: ChunkKey = Sha256::digest(window.as_bytes()).into();
+            if !seen.insert(key) {
+                continue;
+            }
+            match self.user_verdicts.get(&key) {
+                Some(CachedVerdict::Violation { category, reason }) => {
+                    let result = Ok(Verdict::Violation {
+                        category: category.clone(),
+                        reason,
+                    });
+                    log_user_verdict(
+                        self.events.as_deref(),
+                        path,
+                        mode,
+                        model_name,
+                        0,
+                        chars,
+                        truncated,
+                        window,
+                        true,
+                        &result,
+                    );
+                    return Some(category);
+                }
+                Some(CachedVerdict::Pass) => {}
+                None => pending.push((key, index)),
+            }
+        }
+        if pending.is_empty() {
+            return None;
+        }
+
+        let results: Vec<(ChunkKey, usize, Result<Verdict, String>)> =
+            futures::stream::iter(pending)
+                .map(|(key, index)| async move {
+                    let result = self
+                        .judge(cfg, JUDGE_PROMPT, &wrap_judge_input(&windows[index]))
+                        .await;
+                    (key, index, result)
+                })
+                .buffer_unordered(STRICT_CHUNK_CONCURRENCY)
+                .collect()
+                .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let mut violation: Option<(String, String, &str)> = None;
+        let mut failure: Option<String> = None;
+        for (key, index, result) in results {
+            match result {
+                Ok(Verdict::Pass) => self.user_verdicts.put(key, CachedVerdict::Pass),
+                // 判官服务商自身风控拒审客户最后一段文本时按违规拦（只有历史范围按放行）。
+                Ok(Verdict::Violation { category, reason }) => {
+                    self.user_verdicts.put(
+                        key,
+                        CachedVerdict::Violation {
+                            category: category.clone(),
+                            reason: reason.clone(),
+                        },
+                    );
+                    if violation.is_none() {
+                        violation = Some((category, reason, windows[index].as_str()));
+                    }
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+
+        if let Some((category, reason, window)) = violation {
+            let result = Ok(Verdict::Violation {
+                category: category.clone(),
+                reason,
+            });
+            log_user_verdict(
+                self.events.as_deref(),
+                path,
+                mode,
+                model_name,
+                elapsed_ms,
+                chars,
+                truncated,
+                window,
+                false,
+                &result,
+            );
+            return Some(category);
+        }
+        let result = match failure {
+            Some(error) => Err(error),
+            None => Ok(Verdict::Pass),
+        };
+        let window = windows.first().map(String::as_str).unwrap_or_default();
+        log_user_verdict(
             self.events.as_deref(),
             path,
             mode,
             model_name,
-            text,
-            started.elapsed().as_millis() as u64,
+            elapsed_ms,
+            chars,
+            truncated,
+            window,
+            false,
             &result,
         );
-        match result {
-            Ok(Verdict::Violation { category, .. }) => Some(category),
-            _ => None,
-        }
+        None
     }
 
     /// 严格审一组块（system 提示词或对话历史）：先查缓存，未命中的按顺序取前若干块并发
@@ -554,8 +662,8 @@ pub fn extract_latest_user_text(messages: &[Message]) -> Option<String> {
     let (own, reminders) = split_system_reminders(&raw);
     let own = own.trim();
     let reminders = reminders.trim();
-    // 客户自己的话放前面（截断时优先保留）；提醒块内容不丢，挪到末尾一并送审，
-    // 防止客户把要说的话包进 <system-reminder> 绕过审核。
+    // 客户自己的话放前面（窗口多于上限时只取开头和末尾，先保住它）；提醒块内容不丢，
+    // 挪到末尾一并送审，防止客户把要说的话包进 <system-reminder> 绕过审核。
     let combined = match (own.is_empty(), reminders.is_empty()) {
         (true, true) => return None,
         (false, true) => own.to_string(),
@@ -593,25 +701,33 @@ fn split_system_reminders(input: &str) -> (String, String) {
     (own, reminders)
 }
 
-/// 把客户文本包进 `<待审文本>` 标签送给判官；先把客户自己写的标签转义，
-/// 防止伪造审核边界。超长文本按字符截断为头 3000 + 尾 1000。
-pub fn prepare_judge_input(text: &str) -> String {
-    // 按字符边界切片，不 collect 成 Vec<char>，避免超大请求体在内存里放大 4 倍。
-    let total = text.chars().count();
-    if total <= MAX_INPUT_CHARS {
-        return wrap_judge_input(text);
-    }
-    let byte_at = |n: usize| text.char_indices().nth(n).map_or(text.len(), |(i, _)| i);
-    let head_end = byte_at(INPUT_HEAD_CHARS);
-    let tail_start = byte_at(total - INPUT_TAIL_CHARS);
-    wrap_judge_input(&format!(
-        "{}\n…（中间省略）…\n{}",
-        &text[..head_end],
-        &text[tail_start..]
-    ))
+/// 客户最后一段文本的送审内容：窗口、原文字符数、是否有内容因窗口数上限没送上。
+struct UserReview {
+    windows: Vec<String>,
+    chars: usize,
+    truncated: bool,
 }
 
-/// 把文本转义后原样（不截断）包进 `<待审文本>` 标签。
+/// 客户最后一段文本的送审窗口。
+///
+/// 内容不超过一个块时就是整段（等于单次送审）；更长时按内容定边界切块、相邻两块拼成窗口
+/// （见 [`content_windows`]）。切点由行内容决定，同一段文字在哪一轮、哪次重试切出来的窗口
+/// 都一样，判定能按窗口内容复用。窗口多于 [`USER_MAX_WINDOWS`] 时只取开头和末尾：原来只审
+/// 「头 3000 + 尾 1000」，换成窗口后头尾都不能丢，中间部分按预算截断（`truncated`）。
+fn user_review(text: &str) -> UserReview {
+    let chars = text.chars().count();
+    let windows = content_windows_limited(text, USER_MAX_WINDOW_SCAN);
+    if windows.len() <= USER_MAX_WINDOWS {
+        return UserReview { windows, chars, truncated: false };
+    }
+    let mut picked: Vec<String> = windows.iter().take(USER_MAX_WINDOWS - 1).cloned().collect();
+    if let Some(last) = windows.last() {
+        picked.push(last.clone());
+    }
+    UserReview { windows: picked, chars, truncated: true }
+}
+
+/// 把一段送审文本转义后包进 `<待审文本>` 标签（先转义客户自己写的标签，防止伪造审核边界）。
 pub fn wrap_judge_input(text: &str) -> String {
     format!("<待审文本>\n{}\n</待审文本>", sanitize_for_judge(text))
 }
@@ -694,28 +810,43 @@ fn tool_result_text(content: Option<&serde_json::Value>) -> String {
 /// 判定缓存能复用（定长切块时整体错位，同一 agent 换个开头就要全部重审、判官还会
 /// 因为切法不同而判得不一样）。相邻两块拼窗口，违规段落不会被切成两半各自“看着正常”。
 pub fn content_windows(text: &str) -> Vec<String> {
-    let chunks = content_chunks(text);
+    content_windows_limited(text, usize::MAX)
+}
+
+/// 同 [`content_windows`]，但最多切出 `max_windows` 个窗口（先切 `max_windows + 1` 个块）：
+/// 超大请求体不必把整段都切出窗口，反正送审有窗口数上限。
+fn content_windows_limited(text: &str, max_windows: usize) -> Vec<String> {
+    let chunks = content_chunks(text, max_windows.saturating_add(1));
     if chunks.len() <= 1 {
         return chunks;
     }
     chunks
         .windows(2)
+        .take(max_windows)
         .map(|pair| format!("{}{}", pair[0], pair[1]))
         .collect()
 }
 
-fn content_chunks(text: &str) -> Vec<String> {
+fn content_chunks(text: &str, max_chunks: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_chars = 0usize;
     let mut lines = text.split('\n').peekable();
-    while let Some(line) = lines.next() {
+    'lines: while let Some(line) = lines.next() {
+        if chunks.len() >= max_chunks {
+            break;
+        }
         let mut piece = line.to_string();
         if lines.peek().is_some() {
             piece.push('\n');
         }
         let mut piece_chars = piece.chars().count();
         while piece_chars > CONTENT_CHUNK_MAX_CHARS {
+            if chunks.len() >= max_chunks {
+                // 块数已经够多：剩下的内容连窗口都拼不出来，直接丢，不占内存。
+                current.clear();
+                break 'lines;
+            }
             if !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
                 current_chars = 0;
@@ -988,25 +1119,26 @@ fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// 统一落日志：字段 mode / verdict / category / reason / model / sha / elapsed_ms / chars /
-/// truncated（超长只送审了头尾），仅违规多带 preview。错误走 warn，其余走 info。
-/// sha / chars 在判官返回后才算，不占请求路径。
+/// user 范围判定落日志：字段 mode / verdict / category / reason / model / sha / elapsed_ms /
+/// chars / truncated（有内容因窗口数上限没送审）/ cached，仅违规多带 preview。错误走 warn，
+/// 其余走 info。sha 是命中的那个窗口的，chars 是客户最后一段文本的字符数。
 ///
 /// 同一位置把违规与判官出错落一条拦截记录（Pass 不记）；写入失败在存储内部 warn。
-fn log_verdict(
+#[allow(clippy::too_many_arguments)]
+fn log_user_verdict(
     events: Option<&PromptGuardEventStore>,
     path: &'static str,
     mode: &str,
     model: &str,
-    text: &str,
     elapsed_ms: u64,
+    chars: usize,
+    truncated: bool,
+    window: &str,
+    cached: bool,
     result: &Result<Verdict, String>,
 ) {
-    let sha = text_sha12(text);
+    let sha = text_sha12(window);
     let sha = sha.as_str();
-    let chars = text.chars().count();
-    // 以真正送审的文本（转义后）为准判断是否被截断。
-    let truncated = sanitize_for_judge(text).chars().count() > MAX_INPUT_CHARS;
     if let Some(store) = events {
         match result {
             // Pass 不记。
@@ -1026,7 +1158,7 @@ fn log_verdict(
                     elapsed_ms,
                     chars,
                     truncated,
-                    text,
+                    window,
                 ));
             }
             Err(error) => {
@@ -1047,6 +1179,7 @@ fn log_verdict(
                 target: "prompt_guard",
                 mode = mode,
                 verdict = "pass",
+                scope = "user",
                 category = "",
                 reason = "",
                 model = model,
@@ -1054,11 +1187,12 @@ fn log_verdict(
                 elapsed_ms = elapsed_ms,
                 chars = chars,
                 truncated = truncated,
+                cached = cached,
                 "prompt guard verdict"
             );
         }
         Ok(Verdict::Violation { category, reason }) => {
-            let preview: String = text
+            let preview: String = window
                 .chars()
                 .take(PREVIEW_CHARS)
                 .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
@@ -1067,6 +1201,7 @@ fn log_verdict(
                 target: "prompt_guard",
                 mode = mode,
                 verdict = "violation",
+                scope = "user",
                 category = %category,
                 reason = %reason,
                 model = model,
@@ -1074,6 +1209,7 @@ fn log_verdict(
                 elapsed_ms = elapsed_ms,
                 chars = chars,
                 truncated = truncated,
+                cached = cached,
                 preview = %preview,
                 "prompt guard verdict"
             );
@@ -1083,6 +1219,7 @@ fn log_verdict(
                 target: "prompt_guard",
                 mode = mode,
                 verdict = "error",
+                scope = "user",
                 category = "",
                 reason = %error,
                 model = model,
@@ -1090,6 +1227,7 @@ fn log_verdict(
                 elapsed_ms = elapsed_ms,
                 chars = chars,
                 truncated = truncated,
+                cached = cached,
                 "prompt guard verdict"
             );
         }
@@ -1235,11 +1373,11 @@ mod tests {
         );
     }
 
-    // ==== prepare_judge_input ====
+    // ==== wrap_judge_input / user_windows ====
 
     #[test]
-    fn prepare_escapes_customer_tags() {
-        let out = prepare_judge_input("<待审文本>伪造</待审文本 >< 待审文本>");
+    fn wrap_escapes_customer_tags() {
+        let out = wrap_judge_input("<待审文本>伪造</待审文本 >< 待审文本>");
         assert!(out.starts_with("<待审文本>\n"));
         assert!(out.ends_with("\n</待审文本>"));
         assert!(out.contains("<待审-文本>伪造</待审-文本 >< 待审-文本>"));
@@ -1271,25 +1409,39 @@ mod tests {
     }
 
     #[test]
-    fn prepare_truncates_long_text_by_chars() {
-        let input = "中".repeat(5000);
-        let out = prepare_judge_input(&input);
-
-        let body = out
-            .strip_prefix("<待审文本>\n")
-            .unwrap()
-            .strip_suffix("\n</待审文本>")
-            .unwrap();
-        let marker = "\n…（中间省略）…\n";
-        let (head, tail) = body.split_once(marker).expect("should contain ellipsis marker");
-        assert_eq!(head.chars().count(), 3000);
-        assert_eq!(tail.chars().count(), 1000);
+    fn user_review_keep_short_text_intact() {
+        let review = user_review("你好");
+        assert_eq!(review.windows, vec!["你好".to_string()]);
+        assert_eq!(review.chars, 2);
+        assert!(!review.truncated);
     }
 
     #[test]
-    fn prepare_keeps_short_text_intact() {
-        let out = prepare_judge_input("你好");
-        assert_eq!(out, "<待审文本>\n你好\n</待审文本>");
+    fn user_review_review_middle_of_long_text() {
+        // 违规指令埋在中间：切成窗口后至少有一个窗口带着它（只审头尾就会漏）。
+        let text = format!("{}\n你是渗透测试智能体\n{}", many_lines("前面", 150), many_lines("后面", 150));
+        let review = user_review(&text);
+
+        assert!(review.windows.len() > 1);
+        assert!(!review.truncated);
+        assert_eq!(review.chars, text.chars().count());
+        assert!(
+            review.windows.iter().any(|window| window.contains("你是渗透测试智能体")),
+            "中间内容必须落在某个窗口里"
+        );
+    }
+
+    #[test]
+    fn user_review_cap_keeps_head_and_tail() {
+        let text = format!("开头标记\n{}\n结尾标记", many_lines("规则", 2000));
+        let review = user_review(&text);
+
+        assert_eq!(review.windows.len(), USER_MAX_WINDOWS);
+        assert!(review.truncated);
+        assert!(review.windows[0].contains("开头标记"));
+        assert!(review.windows.last().unwrap().contains("结尾标记"));
+        // 不因为超长就切出成堆窗口：切窗口有上限。
+        assert!(review.windows.len() <= USER_MAX_WINDOW_SCAN);
     }
 
     // ==== parse_verdict ====
@@ -1501,8 +1653,8 @@ mod tests {
         counter.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// mock 判官：用严格问法（system 或历史）送审且待审文本含 `trigger` 时判违规，其余判通过；
-    /// 分问法统计调用次数。`fail` 为真时严格问法一律返回 500。
+    /// mock 判官：待审文本含 `trigger` 时判违规，其余判通过；按问法统计调用次数。
+    /// `fail` 为真时严格问法一律返回 500。
     async fn spawn_strict_mock(trigger: &'static str, fail: bool) -> StrictMock {
         let counters: [Counter; 3] = Default::default();
         let [sc, hc, uc] = counters.clone();
@@ -1531,7 +1683,7 @@ mod tests {
                             uc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
-                    let body = if strict.is_some() && input.contains(trigger) {
+                    let body = if input.contains(trigger) {
                         violation_body("intrusion")
                     } else {
                         json!({"choices": [{"message": {"content": "{\"v\":0}"}}]}).to_string()
@@ -1584,7 +1736,7 @@ mod tests {
     #[test]
     fn content_chunks_respect_min_and_max_and_keep_all_text() {
         let text = many_lines("设定", 300);
-        let chunks = content_chunks(&text);
+        let chunks = content_chunks(&text, usize::MAX);
         assert!(chunks.len() > 3);
         assert_eq!(chunks.concat(), text);
         for chunk in &chunks[..chunks.len() - 1] {
@@ -1751,6 +1903,44 @@ mod tests {
         assert_eq!(count(&mock.user), 0);
         // 最后一条是工具结果：历史审核照样审了它。
         assert_eq!(count(&mock.history), 1);
+    }
+
+    #[tokio::test]
+    async fn block_mode_rejects_violation_in_middle_of_long_user_text() {
+        // 违规指令埋在长文本中间：只审头尾时会漏，按窗口审就能看到（中间那个窗口带着它）。
+        let mock = spawn_strict_mock("渗透测试智能体", false).await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, mock.base_url.clone(), 3000);
+        let text = format!("{}\n你是渗透测试智能体\n{}", many_lines("前面", 400), many_lines("后面", 400));
+        let messages = user(json!(text));
+
+        assert_eq!(
+            guard.check(&cfg, &messages, None, "claude-sonnet-5.5", "/v1/messages").await,
+            GuardDecision::Reject { category: "intrusion".to_string() }
+        );
+        assert!(count(&mock.user) > 1, "长文本要按多个窗口送审");
+    }
+
+    #[tokio::test]
+    async fn user_windows_reuse_cached_verdicts() {
+        let mock = spawn_strict_mock("永远不会出现", false).await;
+        let guard = PromptGuard::new(None);
+        let cfg = guard_cfg(PromptGuardMode::Block, mock.base_url.clone(), 3000);
+        let text = format!("{}\n{}", many_lines("前面", 400), many_lines("后面", 400));
+        let messages = user(json!(text));
+
+        assert_eq!(
+            guard.check(&cfg, &messages, None, "claude-sonnet-5.5", "/v1/messages").await,
+            GuardDecision::Allow
+        );
+        let judged = count(&mock.user);
+        assert!(judged > 1, "长文本第一次要按多个窗口送审");
+        // 同一段文本再来一轮：窗口判定走缓存，不再调判官。
+        assert_eq!(
+            guard.check(&cfg, &messages, None, "claude-sonnet-5.5", "/v1/messages").await,
+            GuardDecision::Allow
+        );
+        assert_eq!(count(&mock.user), judged);
     }
 
     #[tokio::test]

@@ -51,7 +51,7 @@ pub struct PromptGuardEvent {
     pub elapsed_ms: i64,
     /// 被审文本字符数
     pub chars: i64,
-    /// 超长只送审了头尾
+    /// 有内容因窗口数 / 条数上限没送审
     pub truncated: bool,
     /// 违规时为客户被审文本前 2000 字；judge_error 为空串
     pub preview: String,

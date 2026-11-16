@@ -355,7 +355,7 @@ export function PromptGuardEventsDialog({ open, onOpenChange }: PromptGuardEvent
                         <MetaRow label="返回状态" value={item.status === null ? '已放行' : String(item.status)} />
                         <MetaRow label="审核耗时" value={`${item.elapsedMs} ms`} />
                         <MetaRow label="文本字数" value={String(item.chars)} />
-                        <MetaRow label="是否超长截断" value={item.truncated ? '是' : '否'} />
+                        <MetaRow label="是否只审了部分" value={item.truncated ? '是' : '否'} />
                       </dl>
                     )}
                   </div>
