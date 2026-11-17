@@ -75,7 +75,7 @@ pub struct PromptGuardConfig {
     #[serde(default = "default_prompt_guard_model")]
     pub model: String,
 
-    /// 判官请求超时毫秒数（默认 3000）
+    /// 判官请求超时毫秒数（默认 8000）
     #[serde(default = "default_prompt_guard_timeout_ms")]
     pub timeout_ms: u64,
 
@@ -367,7 +367,7 @@ fn default_refusal_memory_minutes() -> u64 {
 }
 
 fn default_prompt_guard_timeout_ms() -> u64 {
-    3000
+    8000
 }
 
 fn default_endpoint() -> String {
@@ -566,7 +566,7 @@ mod tests {
         );
         assert!(config.prompt_guard.api_key.is_empty());
         assert_eq!(config.prompt_guard.model, "glm-4.5-air");
-        assert_eq!(config.prompt_guard.timeout_ms, 3000);
+        assert_eq!(config.prompt_guard.timeout_ms, 8000);
         assert!(!config.prompt_guard.is_active());
         assert_eq!(Config::default().prompt_guard.mode, PromptGuardMode::Block);
         assert!(!Config::default().prompt_guard.is_active());
