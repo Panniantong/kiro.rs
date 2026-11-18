@@ -3216,6 +3216,12 @@ impl AdminService {
             }
             .to_string(),
             model: cfg.model.clone(),
+            engine: match cfg.engine {
+                crate::model::config::PromptGuardEngine::Prompt => "prompt",
+                crate::model::config::PromptGuardEngine::Moderation => "moderation",
+            }
+            .to_string(),
+            moderation_model: cfg.moderation_model.clone(),
             api_key: cfg.api_key.clone(),
         }
     }

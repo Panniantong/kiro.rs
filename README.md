@@ -193,6 +193,12 @@ docker-compose up
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
+`promptGuard.engine` 默认为 `prompt`（现有提示词审核）。设为 `moderation` 后，文字走智谱专用审核，单段最多 2000 字符；图片审核与被拒对话记忆不变。`promptGuard.moderationModel` 默认为 `moderation`。
+
+在 `block` 模式下，`PASS`、`REVIEW` 不拦截，`BLOCK`、`REJECT`、`HIGH` 拦截。专用接口超时、失败或返回无法确认的结果时不放行。专用接口的风险分类不等同于原提示词的策略。
+
+回退：将 `promptGuard.engine` 改回 `prompt`，按正常发布流程重载服务；其余审核配置保留。不需要关闭审核或清空拒绝记忆。
+
 完整配置示例：
 
 ```json

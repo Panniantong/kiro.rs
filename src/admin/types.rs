@@ -766,6 +766,10 @@ pub struct PromptGuardResponse {
     pub mode: String,
     /// 判官模型名
     pub model: String,
+    /// 审核引擎："prompt"（通用模型 + 提示词）| "moderation"（智谱专用内容安全接口）
+    pub engine: String,
+    /// 专用审核接口的模型名（engine = moderation 时生效）
+    pub moderation_model: String,
     /// 判官 api_key（整串返回）
     pub api_key: String,
 }

@@ -47,7 +47,7 @@ use super::prompt_guard_events::{
 use super::refusal_memory::{RefusalMemory, conversation_prefix_keys, is_conversation_refusal};
 use super::types::{Message, SystemMessage, Tool};
 use crate::kiro::provider::RefusalHook;
-use crate::model::config::{PromptGuardConfig, PromptGuardMode};
+use crate::model::config::{PromptGuardConfig, PromptGuardEngine, PromptGuardMode};
 
 const JUDGE_PROMPT: &str = include_str!("prompt_guard_prompt.txt");
 /// system 提示词专用的严格问法（不放过「已授权」的渗透测试 / 攻击 agent）。
@@ -55,6 +55,12 @@ const SYSTEM_JUDGE_PROMPT: &str = include_str!("prompt_guard_system_prompt.txt")
 
 /// 对话历史（工具返回、AI 回复与工具参数）专用的严格问法。
 const HISTORY_JUDGE_PROMPT: &str = include_str!("prompt_guard_history_prompt.txt");
+
+/// 专用内容安全接口（智谱 `/moderations`）单次能审的文本上限：文档写死 2000 字符，
+/// 超过要自己切段，超长内容不切段会直接报错。
+const MODERATION_MAX_CHARS: usize = 2000;
+/// REVIEW 是供应商明确给出的「机审不拦截」；未知等级按审核失败处理。
+const MODERATION_PASS_LEVELS: &[&str] = &["PASS", "REVIEW"];
 
 /// 按内容切块：块至少这么长才允许在「切点行」后切开。
 const CONTENT_CHUNK_MIN_CHARS: usize = 2000;
@@ -129,6 +135,9 @@ const LOG_MODE_MAX_INFLIGHT: usize = 32;
 const KNOWN_CATEGORIES: &[&str] = &[
     "bio", "crack", "intrusion", "bulk_data", "distill", "jailbreak", "sysprompt", "privacy",
     "cot", "reverse", "porn", "violence", "gore", "hate", "politics", "roleplay",
+    // 专用审核（智谱 /moderations）判出来的类别里，映射不到上面这些的归到这里，
+    // 原始 risk_type 留在 reason 里（面板的拦截明细能看到）。
+    "moderation",
 ];
 
 /// 客户提示词审核关口
@@ -427,7 +436,7 @@ impl PromptGuard {
             futures::stream::iter(pending)
                 .map(|(key, index)| async move {
                     let result = self
-                        .judge(cfg, JUDGE_PROMPT, &wrap_judge_input(&windows[index]))
+                        .judge(cfg, JUDGE_PROMPT, &windows[index])
                         .await;
                     (key, index, result)
                 })
@@ -733,7 +742,7 @@ impl PromptGuard {
             futures::stream::iter(pending)
                 .map(|(key, index)| async move {
                     let result = self
-                        .judge(cfg, prompt, &wrap_judge_input(&chunks[index]))
+                        .judge(cfg, prompt, &chunks[index])
                         .await;
                     (key, index, result)
                 })
@@ -858,21 +867,156 @@ impl PromptGuard {
         }
     }
 
-    /// 调用判官模型判定 `input`（已包好 `<待审文本>` 标签），`prompt` 为判官问法。
+    /// 审核原始文本。只有提示词引擎需要在文本外包上审核标签。
+    ///
+    /// `cfg.engine` 决定用哪套能力：默认走通用模型 + 提示词；`moderation` 时改走智谱专用
+    /// 内容安全接口（提示词问法不参与）。审图那条路不走这里（见 [`Self::review_images`]）。
     async fn judge(
         &self,
         cfg: &PromptGuardConfig,
         prompt: &str,
         input: &str,
     ) -> Result<Verdict, String> {
+        if cfg.engine == PromptGuardEngine::Moderation {
+            return self.moderate(cfg, input).await;
+        }
         self.judge_content(
             cfg,
             prompt,
-            serde_json::Value::String(input.to_string()),
+            serde_json::Value::String(wrap_judge_input(input)),
             None,
             None,
         )
         .await
+    }
+
+    /// 取一个审核调用的全进程并发名额（通用判官与专用审核共用同一个闸门）。
+    async fn acquire_judge_slot(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, JudgeFailure> {
+        match tokio::time::timeout(
+            JUDGE_QUEUE_TIMEOUT,
+            Arc::clone(&self.judge_slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(JudgeFailure {
+                message: "判官并发闸门已关闭".to_string(),
+                retryable: false,
+                retry_delay: None,
+            }),
+            Err(_) => Err(JudgeFailure {
+                message: format!(
+                    "判官并发已满（全进程上限 {JUDGE_MAX_CONCURRENCY}），排队 {}ms 没获位置",
+                    JUDGE_QUEUE_TIMEOUT.as_millis()
+                ),
+                retryable: false,
+                retry_delay: None,
+            }),
+        }
+    }
+
+    /// 走智谱专用内容安全接口判定一段文本（engine = moderation）。
+    ///
+    /// 接口单次只吃 2000 字符，所以先按字符上限切段逐段审，任一段违规即违规（不静默放过）。
+    /// 失败语义沿用通用判官：可重试的错再试一次，重试仍失败就按判官出错（调用方按
+    /// `judge_unavailable` 拦）。
+    async fn moderate(&self, cfg: &PromptGuardConfig, text: &str) -> Result<Verdict, String> {
+        for piece in moderation_pieces(text) {
+            if !piece.trim().is_empty() {
+                match self.moderate_with_retry(cfg, piece).await? {
+                    Verdict::Pass => {}
+                    violation => return Ok(violation),
+                }
+            }
+        }
+        Ok(Verdict::Pass)
+    }
+
+    async fn moderate_with_retry(&self, cfg: &PromptGuardConfig, piece: &str) -> Result<Verdict, String> {
+        let failure = match self.moderate_piece(cfg, piece).await {
+            Ok(verdict) => return Ok(verdict),
+            Err(failure) if failure.retryable => failure,
+            Err(failure) => return Err(failure.message),
+        };
+        tracing::warn!(
+            target: "prompt_guard",
+            engine = "moderation",
+            verdict = "judge_retry",
+            reason = %failure.message,
+            "专用审核第一次没给出可用的判定，重试一次"
+        );
+        if let Some(delay) = failure.retry_delay {
+            tokio::time::sleep(delay).await;
+        }
+        match self.moderate_piece(cfg, piece).await {
+            Ok(verdict) => Ok(verdict),
+            Err(retry) => Err(format!(
+                "{}；重试后仍失败：{}",
+                failure.message, retry.message
+            )),
+        }
+    }
+
+    /// 专用审核单次调用：`POST {baseUrl}/moderations {"model":..,"input":..}`。
+    async fn moderate_piece(
+        &self,
+        cfg: &PromptGuardConfig,
+        piece: &str,
+    ) -> Result<Verdict, JudgeFailure> {
+        let url = format!(
+            "{}/moderations",
+            cfg.base_url.trim().trim_end_matches('/')
+        );
+        let body = json!({
+            "model": cfg.moderation_model.trim(),
+            "input": piece,
+        });
+
+        // 和通用判官共用同一个全进程并发闸门：智谱按「同一时刻处理中的请求数」限流。
+        let _permit = self.acquire_judge_slot().await?;
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", cfg.api_key.trim()))
+            .timeout(Duration::from_millis(cfg.timeout_ms))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| JudgeFailure {
+                message: format!("专用审核请求失败: {}", error),
+                retryable: true,
+                retry_delay: None,
+            })?;
+
+        let status = response.status();
+        let raw = response.text().await.map_err(|error| JudgeFailure {
+            message: format!("专用审核响应读取失败: {}", error),
+            retryable: true,
+            retry_delay: None,
+        })?;
+
+        if status == reqwest::StatusCode::OK {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|error| JudgeFailure {
+                    message: format!("专用审核响应不是 JSON: {}", error),
+                    retryable: true,
+                    retry_delay: None,
+                })?;
+            return parse_moderation_verdict(&parsed);
+        }
+
+        let retryable = status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+        let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        Err(JudgeFailure {
+            message: format!("专用审核请求失败: HTTP {}", status.as_u16()),
+            retryable,
+            retry_delay: rate_limited.then_some(JUDGE_RATE_LIMIT_BACKOFF),
+        })
     }
 
     /// 调用判官模型判定一条 user 内容（纯文本，或「图片 + 说明」数组）。
@@ -942,31 +1086,7 @@ impl PromptGuard {
 
         // 全进程并发闸门：智谱按「同一时刻处理中的请求数」限流（1302），排队等不到位置就按
         // 「审核服务忙」拒，不无限等、也不放过没审的内容。
-        let _permit = match tokio::time::timeout(
-            JUDGE_QUEUE_TIMEOUT,
-            Arc::clone(&self.judge_slots).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                return Err(JudgeFailure {
-                    message: "判官并发闸门已关闭".to_string(),
-                    retryable: false,
-                    retry_delay: None,
-                });
-            }
-            Err(_) => {
-                return Err(JudgeFailure {
-                    message: format!(
-                        "判官并发已满（全进程上限 {JUDGE_MAX_CONCURRENCY}），排队 {}ms 没获位置",
-                        JUDGE_QUEUE_TIMEOUT.as_millis()
-                    ),
-                    retryable: false,
-                    retry_delay: None,
-                });
-            }
-        };
+        let _permit = self.acquire_judge_slot().await?;
 
         let response = self
             .client
@@ -1716,6 +1836,82 @@ pub fn parse_verdict(content: &str) -> Result<Verdict, String> {
     }
 }
 
+/// 按字符上限把文本切成若干段（完整保留内容，按字符边界切，不切坏 UTF-8）。
+fn moderation_pieces(mut text: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if text.is_empty() {
+            return None;
+        }
+        let end = text.char_indices().nth(MODERATION_MAX_CHARS)
+            .map_or(text.len(), |(offset, _)| offset);
+        let (piece, rest) = text.split_at(end);
+        text = rest;
+        Some(piece)
+    })
+}
+
+/// 把专用审核的 `risk_type` 映射成我们面板 / 事件里用的类别。
+///
+/// 只映射我们原有词表里确实对应的那些；映射不到的归 `moderation`，原始 `risk_type`
+/// 留在 reason 里，不影响追查。
+fn moderation_category(risk_types: &[String]) -> String {
+    let joined = risk_types.join(":");
+    let hit = |keys: &[&str]| keys.iter().any(|key| joined.contains(key));
+    let category = if hit(&["色情", "成人", "低俗", "porn"]) {
+        "porn"
+    } else if hit(&["涉政", "政治", "时政"]) {
+        "politics"
+    } else if hit(&["暴恐", "暴力", "恐怖", "凶杀"]) {
+        "violence"
+    } else if hit(&["血腥", "尸体", "虐待"]) {
+        "gore"
+    } else if hit(&["谩骂", "侮辱", "仇恨", "歧视"]) {
+        "hate"
+    } else if hit(&["隐私", "个人信息"]) {
+        "privacy"
+    } else if hit(&["越狱", "绕过限制"]) {
+        "jailbreak"
+    } else {
+        "moderation"
+    };
+    category.to_string()
+}
+
+/// 单段纯文本应返回一条文本判定；缺失、多条或未知等级都不是有效判定。
+fn parse_moderation_verdict(parsed: &serde_json::Value) -> Result<Verdict, JudgeFailure> {
+    let invalid = || JudgeFailure {
+        message: "专用审核返回了无效的文本判定".to_string(),
+        retryable: true,
+        retry_delay: None,
+    };
+    let [result] = parsed.get("result_list").and_then(|v| v.as_array()).ok_or_else(invalid)?.as_slice() else {
+        return Err(invalid());
+    };
+    if result.get("content_type").and_then(|v| v.as_str()) != Some("text") {
+        return Err(invalid());
+    }
+    let level = result.get("risk_level").and_then(|v| v.as_str()).ok_or_else(invalid)?;
+    let risk_types = result.get("risk_type").and_then(|v| v.as_array()).ok_or_else(invalid)?;
+    if !risk_types.iter().all(|v| v.is_string()) {
+        return Err(invalid());
+    }
+    if MODERATION_PASS_LEVELS.contains(&level) {
+        if level == "REVIEW" {
+            tracing::info!(target: "prompt_guard", engine = "moderation", risk_level = level,
+                "专用审核判为可疑（按接口建议不拦截）");
+        }
+        return Ok(Verdict::Pass);
+    }
+    if !matches!(level, "BLOCK" | "REJECT" | "HIGH") {
+        return Err(invalid());
+    }
+    let risk_types: Vec<String> = risk_types.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+    Ok(Verdict::Violation {
+        category: moderation_category(&risk_types),
+        reason: format!("risk_level={level} risk_type={}", truncate_chars(&risk_types.join(":"), 200)),
+    })
+}
+
 /// 智谱内容安全拦截：HTTP 400 且 `error.code` 为 1301（字符串或数字均可）。
 fn is_zhipu_content_filter(raw: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
@@ -1958,11 +2154,57 @@ mod tests {
             base_url,
             api_key: "test-key".to_string(),
             model: "glm-4.5-air".to_string(),
+            engine: PromptGuardEngine::Prompt,
+            moderation_model: "moderation".to_string(),
             timeout_ms,
             refusal_memory_minutes: 60,
             vision_model: String::new(),
             vision_fallback_model: String::new(),
         }
+    }
+
+    /// 起一个本机 axum mock 专用审核接口（`/moderations`），handler 收到请求体，
+    /// 返回 (base_url, 调用计数)。
+    async fn spawn_moderation_mock<F, Fut>(handler: F) -> (String, Counter)
+    where
+        F: Fn(serde_json::Value) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = axum::response::Response> + Send + 'static,
+    {
+        let calls: Counter = Default::default();
+        let counter = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/moderations",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let counter = Arc::clone(&counter);
+                let handler = handler.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    handler(body).await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), calls)
+    }
+
+    /// 专用审核响应体。
+    fn moderation_body(level: &str, risk_types: &[&str]) -> axum::response::Response {
+        let body = json!({
+            "created": 1,
+            "request_id": "test",
+            "result_list": [{"content_type": "text", "risk_level": level, "risk_type": risk_types}],
+        });
+        axum::Json(body).into_response()
+    }
+
+    fn moderation_cfg(base_url: String) -> PromptGuardConfig {
+        let mut cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        cfg.engine = PromptGuardEngine::Moderation;
+        cfg
     }
 
     /// 起一个本机 axum mock 判官服务，返回 base_url。
@@ -3261,5 +3503,170 @@ mod tests {
         }
         assert!(cache.entries.lock().len() <= 20);
         assert_eq!(cache.get(&[39u8; 32]), Some(CachedVerdict::Pass));
+    }
+
+    // ==== 专用审核引擎（engine = moderation）====
+
+    #[test]
+    fn moderation_pieces_keep_all_text_and_respect_the_limit() {
+        let text = "字".repeat(4500);
+        let pieces: Vec<_> = moderation_pieces(&text).collect();
+        assert_eq!(pieces.len(), 3);
+        assert!(pieces.iter().all(|piece| piece.chars().count() <= 2000));
+        assert_eq!(pieces.concat(), text);
+
+        // 不超过上限就一段，原样返回。
+        assert_eq!(moderation_pieces("短文本").collect::<Vec<_>>(), vec!["短文本"]);
+    }
+
+    #[tokio::test]
+    async fn moderation_passes_pass_and_review_levels() {
+        let (base_url, calls) = spawn_moderation_mock(|_body| async { moderation_body("PASS", &[]) }).await;
+        let cfg = moderation_cfg(base_url);
+        let guard = PromptGuard::new(None);
+
+        assert_eq!(
+            guard
+                .check(&cfg, &user(json!("帮我写个快排")), None, None, "claude-opus-4-8", "/v1/messages")
+                .await,
+            GuardDecision::Allow
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // REVIEW = 可疑、接口建议人工后审：我们没有人工队列，按接口建议放行（只记日志）。
+        let (base_url, _) = spawn_moderation_mock(|_body| async { moderation_body("REVIEW", &["其他"]) }).await;
+        let cfg = moderation_cfg(base_url);
+        let guard = PromptGuard::new(None);
+        assert_eq!(
+            guard
+                .check(&cfg, &user(json!("有点可疑的内容")), None, None, "claude-opus-4-8", "/v1/messages")
+                .await,
+            GuardDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_blocks_block_reject_and_high_with_mapped_category() {
+        let cases = [
+            ("BLOCK", vec!["色情:色情资源:成人色情资源"], "porn"),
+            ("REJECT", vec!["涉政"], "politics"),
+            ("HIGH", vec!["某种新风险"], "moderation"),
+        ];
+        for (level, risk_types, expected) in cases {
+            let (base_url, _) = spawn_moderation_mock(move |_body| {
+                let risk_types = risk_types.clone();
+                async move { moderation_body(level, &risk_types) }
+            })
+            .await;
+            let cfg = moderation_cfg(base_url);
+            let guard = PromptGuard::new(None);
+            assert_eq!(
+                guard
+                    .check(&cfg, &user(json!("触发内容")), None, None, "claude-opus-4-8", "/v1/messages")
+                    .await,
+                GuardDecision::Reject { category: expected.to_string() },
+                "level={level}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn moderation_splits_long_text_into_2000_char_calls() {
+        let lens: Arc<parking_lot::Mutex<Vec<usize>>> = Default::default();
+        let recorder = Arc::clone(&lens);
+        let (base_url, calls) = spawn_moderation_mock(move |body| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let input = body.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                recorder.lock().push(input.chars().count());
+                moderation_body("PASS", &[])
+            }
+        })
+        .await;
+        let cfg = moderation_cfg(base_url);
+        let guard = PromptGuard::new(None);
+
+        // 6000 字的客户文本 → 应该切成 3 段、每段 ≤2000 字符，逐段送审。
+        let messages = user(json!("字".repeat(6000)));
+        assert_eq!(
+            guard.check(&cfg, &messages, None, None, "claude-opus-4-8", "/v1/messages").await,
+            GuardDecision::Allow
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let recorded = lens.lock().clone();
+        assert_eq!(recorded, vec![2000, 2000, 2000]);
+    }
+
+    #[tokio::test]
+    async fn moderation_violation_in_a_later_piece_is_caught() {
+        let (base_url, _) = spawn_moderation_mock(|body| async move {
+            let input = body.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // 第二段（含「第二段」标记）才违规：前面放行，后面的段也要审到。
+            if input.contains("违规标记") {
+                moderation_body("BLOCK", &["色情"])
+            } else {
+                moderation_body("PASS", &[])
+            }
+        })
+        .await;
+        let cfg = moderation_cfg(base_url);
+        let guard = PromptGuard::new(None);
+        let mut text = "字".repeat(2500);
+        text.push_str("违规标记");
+        assert_eq!(
+            guard
+                .check(&cfg, &user(json!(text)), None, None, "claude-opus-4-8", "/v1/messages")
+                .await,
+            GuardDecision::Reject { category: "porn".to_string() }
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_http_error_retries_then_blocks_as_unavailable() {
+        let (base_url, calls) = spawn_moderation_mock(|_body| async {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+        })
+        .await;
+        let cfg = moderation_cfg(base_url);
+        let guard = PromptGuard::new(None);
+        assert_eq!(
+            guard
+                .check(&cfg, &user(json!("随便一句")), None, None, "claude-opus-4-8", "/v1/messages")
+                .await,
+            GuardDecision::Reject { category: JUDGE_UNAVAILABLE_CATEGORY.to_string() }
+        );
+        // 可重试的错：第一次 + 重试一次。
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn moderation_malformed_response_is_unavailable() {
+        let (base_url, calls) = spawn_moderation_mock(|_body| async {
+            axum::Json(json!({"created": 1})).into_response()
+        })
+        .await;
+        let cfg = moderation_cfg(base_url);
+        let guard = PromptGuard::new(None);
+        assert_eq!(
+            guard
+                .check(&cfg, &user(json!("随便一句")), None, None, "claude-opus-4-8", "/v1/messages")
+                .await,
+            GuardDecision::Reject { category: JUDGE_UNAVAILABLE_CATEGORY.to_string() }
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn moderation_engine_log_mode_never_blocks() {
+        let (base_url, _) = spawn_moderation_mock(|_body| async { moderation_body("REJECT", &["涉政"]) }).await;
+        let mut cfg = moderation_cfg(base_url);
+        cfg.mode = PromptGuardMode::Log;
+        let guard = PromptGuard::new(None);
+        assert_eq!(
+            guard
+                .check(&cfg, &user(json!("触发内容")), None, None, "claude-opus-4-8", "/v1/messages")
+                .await,
+            GuardDecision::Allow
+        );
     }
 }

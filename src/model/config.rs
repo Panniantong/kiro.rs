@@ -51,6 +51,17 @@ pub enum PromptGuardMode {
     Block,
 }
 
+/// 审核引擎：用哪套判定能力
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptGuardEngine {
+    /// 通用模型 + 三套提示词（旧路径，默认，回退用）
+    #[default]
+    Prompt,
+    /// 智谱专用内容安全接口 `/moderations`（按它的 risk_level / risk_type 判定）
+    Moderation,
+}
+
 /// 客户提示词审核关口配置
 ///
 /// 默认模式为 `block`：填好 `api_key` 后审核立即生效（见 `is_active`）。
@@ -74,6 +85,15 @@ pub struct PromptGuardConfig {
     /// 判官模型名（默认 "glm-4.5-air"）
     #[serde(default = "default_prompt_guard_model")]
     pub model: String,
+
+    /// 审核引擎（默认 prompt）。moderation = 走智谱专用内容安全接口 `/moderations`，
+    /// 用它的 risk_level/risk_type 判定，不再需要提示词问法；`model` 这时不参与。
+    #[serde(default)]
+    pub engine: PromptGuardEngine,
+
+    /// 专用审核接口的模型名（默认 "moderation"），engine = moderation 时生效。
+    #[serde(default = "default_prompt_guard_moderation_model")]
+    pub moderation_model: String,
 
     /// 判官请求超时毫秒数（默认 3000）
     #[serde(default = "default_prompt_guard_timeout_ms")]
@@ -112,6 +132,8 @@ impl Default for PromptGuardConfig {
             base_url: default_prompt_guard_base_url(),
             api_key: String::new(),
             model: default_prompt_guard_model(),
+            engine: PromptGuardEngine::default(),
+            moderation_model: default_prompt_guard_moderation_model(),
             timeout_ms: default_prompt_guard_timeout_ms(),
             refusal_memory_minutes: default_refusal_memory_minutes(),
             vision_model: String::new(),
@@ -362,6 +384,10 @@ fn default_prompt_guard_model() -> String {
     "glm-4.5-air".to_string()
 }
 
+fn default_prompt_guard_moderation_model() -> String {
+    "moderation".to_string()
+}
+
 fn default_refusal_memory_minutes() -> u64 {
     60
 }
@@ -482,6 +508,14 @@ impl Config {
                 .all(|c| c.is_ascii_graphic())
         {
             anyhow::bail!("promptGuard.apiKey 只能包含可见 ASCII 字符（不能有空白、换行或中文）");
+        }
+        if config.prompt_guard.engine == PromptGuardEngine::Moderation {
+            let model = config.prompt_guard.moderation_model.trim();
+            if model.is_empty() || !model.chars().all(|c| c.is_ascii_graphic()) {
+                anyhow::bail!(
+                    "promptGuard.moderationModel 不能为空、只能包含可见 ASCII 字符（engine = moderation 时必填）"
+                );
+            }
         }
         if config.prompt_guard.mode != PromptGuardMode::Off
             && !(1..=10_000).contains(&config.prompt_guard.timeout_ms)
