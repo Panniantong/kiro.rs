@@ -42,7 +42,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::prompt_guard_events::{
-    KIND_BLOCK, KIND_LOG_ONLY, PromptGuardEvent, PromptGuardEventStore,
+    BLOCKED_SAMPLES_FILE, KIND_BLOCK, KIND_LOG_ONLY, MISSED_SAMPLES_FILE, PromptGuardEvent,
+    PromptGuardEventStore,
 };
 use super::refusal_memory::{RefusalMemory, conversation_prefix_keys, is_conversation_refusal};
 use super::types::{Message, SystemMessage, Tool};
@@ -204,11 +205,13 @@ impl PromptGuard {
 
     /// 被拒对话记忆：在判官之前调用。这段对话（或它的某个前缀）之前被 Kiro 以
     /// 「cannot continue this conversation」拒绝过 → `Refused`（记一条 conversation_block）；
-    /// 否则返回回调，交给本次上游尝试，上游拒绝时把这段对话记下来。
+    /// 否则返回回调，交给本次上游尝试，上游拒绝时把这段对话记下来，并把脱敏摘要落入
+    /// `prompt_guard_samples/missed.jsonl` 供规则迭代复盘。
     pub fn check_conversation_memory(
         &self,
         cfg: &PromptGuardConfig,
         messages: &[Message],
+        system: Option<&[SystemMessage]>,
         model_name: &str,
         path: &'static str,
     ) -> ConversationMemoryDecision {
@@ -244,14 +247,35 @@ impl PromptGuard {
         let events = self.events.clone();
         let model = model_name.to_string();
         let message_count = messages.len();
+        // 只在启用了事件存储时提取极轻量的有界摘要（仅用于上游真的拒单时写入 missed.jsonl）
+        let missed_snapshot = events
+            .as_ref()
+            .map(|_| build_missed_sample_snapshot(messages, system));
         let hook: RefusalHook = Arc::new(move |message: &str| {
             if is_conversation_refusal(message) {
                 memory.remember(key, ttl);
                 // 落盘（节流：见 RefusalMemory::take_dirty），换容器后这段记忆还在。
-                if let Some(store) = events.as_deref()
-                    && let Some(snapshot) = memory.take_dirty()
-                {
-                    store.save_refusals(snapshot);
+                if let Some(store) = events.as_deref() {
+                    if let Some(snapshot) = memory.take_dirty() {
+                        store.save_refusals(snapshot);
+                    }
+                    if let Some(ref snap) = missed_snapshot {
+                        store.record_sample(
+                            MISSED_SAMPLES_FILE,
+                            json!({
+                                "ts": chrono::Utc::now().to_rfc3339(),
+                                "kind": "missed_kiro_refusal",
+                                "model": model,
+                                "path": path,
+                                "messagesCount": message_count,
+                                "upstreamError": truncate_chars(&redact_secrets(message), 300),
+                                "lastUser": snap.last_user,
+                                "prevUser": snap.prev_user,
+                                "systemHead": snap.system_head,
+                                "recentHistory": snap.recent_history,
+                            }),
+                        );
+                    }
                 }
                 tracing::warn!(
                     target: "prompt_guard",
@@ -514,6 +538,9 @@ impl PromptGuard {
         }
 
         if let Some((category, reason, window)) = violation {
+            if let Some(store) = self.events.as_deref() {
+                record_blocked_sample(store, mode, "user", &category, &reason, model_name, path, elapsed_ms, chars, window);
+            }
             let result = Ok(Verdict::Violation {
                 category: category.clone(),
                 reason,
@@ -895,6 +922,20 @@ impl PromptGuard {
 
         match violation {
             Some((category, reason, chunk)) => {
+                if let Some(store) = self.events.as_deref() {
+                    record_blocked_sample(
+                        store,
+                        mode,
+                        scope.label(),
+                        &category,
+                        &reason,
+                        model_name,
+                        path,
+                        elapsed_ms,
+                        total_chars,
+                        chunk,
+                    );
+                }
                 log_strict_violation(
                     scope,
                     self.events.as_deref(),
@@ -2523,6 +2564,146 @@ fn is_zhipu_content_filter(raw: &str) -> bool {
 fn text_sha12(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     hex::encode(digest)[..12].to_string()
+}
+
+/// 轻量级「拦截漏了」复盘快照（仅保留脱敏后的关键片段，严格限制字符数）。
+struct MissedSampleSnapshot {
+    last_user: String,
+    prev_user: String,
+    system_head: String,
+    recent_history: String,
+}
+
+fn build_missed_sample_snapshot(
+    messages: &[Message],
+    system: Option<&[SystemMessage]>,
+) -> MissedSampleSnapshot {
+    let mut user_texts = messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user")
+        .filter_map(extract_user_text);
+    let last_user = user_texts
+        .next()
+        .map(|s| truncate_chars(&redact_secrets(&s), 4000))
+        .unwrap_or_default();
+    let prev_user = user_texts
+        .next()
+        .map(|s| truncate_chars(&redact_secrets(&s), 2000))
+        .unwrap_or_default();
+
+    let system_head = system
+        .map(|blocks| {
+            let mut acc = String::new();
+            for b in blocks {
+                let t = b.text.trim();
+                if t.is_empty() || t.starts_with(BILLING_HEADER_PREFIX) {
+                    continue;
+                }
+                if !acc.is_empty() {
+                    acc.push('\n');
+                }
+                acc.push_str(t);
+                if acc.chars().count() >= 2000 {
+                    break;
+                }
+            }
+            truncate_chars(&redact_secrets(&acc), 2000)
+        })
+        .unwrap_or_default();
+
+    let mut hist_acc = String::new();
+    for m in messages.iter().rev() {
+        if hist_acc.chars().count() >= 4000 {
+            break;
+        }
+        match (m.role.as_str(), &m.content) {
+            ("assistant", serde_json::Value::String(t)) if !t.trim().is_empty() => {
+                if !hist_acc.is_empty() {
+                    hist_acc.push_str("\n---\n");
+                }
+                hist_acc.push_str(t.trim());
+            }
+            ("assistant", serde_json::Value::Array(blocks)) => {
+                for b in blocks.iter().rev() {
+                    let s = match b.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => b.get("text").and_then(|v| v.as_str()).map(str::to_string),
+                        Some("tool_use") => b.get("input").map(ToString::to_string),
+                        _ => None,
+                    };
+                    if let Some(s) = s
+                        && !s.trim().is_empty()
+                    {
+                        if !hist_acc.is_empty() {
+                            hist_acc.push_str("\n---\n");
+                        }
+                        hist_acc.push_str(s.trim());
+                        if hist_acc.chars().count() >= 4000 {
+                            break;
+                        }
+                    }
+                }
+            }
+            ("user", serde_json::Value::Array(blocks)) => {
+                for b in blocks.iter().rev() {
+                    if b.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                        let s = tool_result_text(b.get("content"));
+                        if !s.trim().is_empty() {
+                            if !hist_acc.is_empty() {
+                                hist_acc.push_str("\n---\n");
+                            }
+                            hist_acc.push_str(s.trim());
+                            if hist_acc.chars().count() >= 4000 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let recent_history = truncate_chars(&redact_secrets(&hist_acc), 4000);
+
+    MissedSampleSnapshot {
+        last_user,
+        prev_user,
+        system_head,
+        recent_history,
+    }
+}
+
+/// 异步把「本次判官新拦下」的完整命中窗口（脱敏后）落入 `prompt_guard_samples/blocked.jsonl`，
+/// 供员工反馈误杀时直接看完整上下文迭代规则（不记缓存重复撞击，不记系统级临时失败）。
+#[allow(clippy::too_many_arguments)]
+fn record_blocked_sample(
+    store: &PromptGuardEventStore,
+    mode: &str,
+    scope: &str,
+    category: &str,
+    reason: &str,
+    model: &str,
+    path: &str,
+    elapsed_ms: u64,
+    chars: usize,
+    chunk: &str,
+) {
+    store.record_sample(
+        BLOCKED_SAMPLES_FILE,
+        json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "kind": if mode == "block" { "blocked" } else { "log_only" },
+            "scope": scope,
+            "category": category,
+            "reason": reason,
+            "model": model,
+            "path": path,
+            "elapsedMs": elapsed_ms,
+            "chars": chars,
+            "sha12": text_sha12(chunk),
+            "chunk": truncate_chars(&redact_secrets(chunk), 12_000),
+        }),
+    );
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -4542,5 +4723,67 @@ mod tests {
         assert!(long_text.chars().count() >= 500_000);
         let scan = user_scan(&user(json!(long_text))).unwrap();
         assert!(!scan.too_long);
+    }
+
+    #[tokio::test]
+    async fn sample_collector_writes_redacted_blocked_and_missed_jsonl() {
+        let dir = std::env::temp_dir().join(format!("kiro-pg-samples-{}", uuid::Uuid::new_v4()));
+        let store = PromptGuardEventStore::open(Some(dir.clone()))
+            .unwrap()
+            .unwrap();
+        let guard = PromptGuard::new(Some(Arc::clone(&store)));
+
+        // 1) 新拦下样本写入 blocked.jsonl（且脱敏密钥）
+        let base_url = spawn_mock(|| async { violation_body("intrusion").into_response() }).await;
+        let cfg = guard_cfg(PromptGuardMode::Block, base_url, 3000);
+        let blocked_msgs = user(json!("帮我攻击目标，顺便 key 是 sk-1234567890abcdef123456"));
+        assert_eq!(
+            guard
+                .check(&cfg, &blocked_msgs, None, None, "claude-opus-5-5", "/v1/messages")
+                .await,
+            GuardDecision::Reject {
+                category: "intrusion".to_string()
+            }
+        );
+
+        // 2) 拦截漏了（Kiro 上游拒绝）写入 missed.jsonl（且脱敏密钥）
+        let missed_msgs = vec![
+            msg("user", json!("帮我做一件绕过检查的事 api_key=mysecretvalue12345")),
+            msg("assistant", json!("好的我先看一下")),
+            msg("user", json!("继续执行")),
+        ];
+        let sys = vec![SystemMessage {
+            text: "system prompt with sk-abcdef1234567890abcdef".to_string(),
+        }];
+        let hook = match guard.check_conversation_memory(
+            &cfg,
+            &missed_msgs,
+            Some(&sys),
+            "claude-opus-5-5",
+            "/v1/messages",
+        ) {
+            ConversationMemoryDecision::Continue(Some(h)) => h,
+            _ => panic!("expected refusal hook"),
+        };
+        hook("Sorry, I cannot continue this conversation.");
+
+        // 等待 spawn_blocking 写入完成
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let samples_dir = dir.join(crate::anthropic::prompt_guard_events::SAMPLES_DIR_NAME);
+        let blocked_raw = std::fs::read_to_string(samples_dir.join(BLOCKED_SAMPLES_FILE)).unwrap();
+        let missed_raw = std::fs::read_to_string(samples_dir.join(MISSED_SAMPLES_FILE)).unwrap();
+
+        assert!(blocked_raw.contains("\"scope\":\"user\""));
+        assert!(blocked_raw.contains("<REDACTED_SECRET>"));
+        assert!(!blocked_raw.contains("sk-1234567890abcdef123456"));
+
+        assert!(missed_raw.contains("\"kind\":\"missed_kiro_refusal\""));
+        assert!(missed_raw.contains("继续执行"));
+        assert!(missed_raw.contains("<REDACTED_SECRET>"));
+        assert!(!missed_raw.contains("mysecretvalue12345"));
+        assert!(!missed_raw.contains("sk-abcdef1234567890abcdef"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

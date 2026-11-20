@@ -575,6 +575,7 @@ pub async fn post_messages(
     let refusal_hook = match state.prompt_guard.check_conversation_memory(
         &guard_cfg,
         &payload.messages,
+        payload.system.as_deref(),
         &payload.model,
         "/v1/messages",
     ) {
@@ -2243,6 +2244,7 @@ pub async fn post_messages_cc(
     let refusal_hook = match state.prompt_guard.check_conversation_memory(
         &guard_cfg,
         &payload.messages,
+        payload.system.as_deref(),
         &payload.model,
         "/cc/v1/messages",
     ) {

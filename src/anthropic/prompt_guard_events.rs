@@ -34,6 +34,14 @@ const PREVIEW_CHARS: usize = 2000;
 const REASON_CHARS: usize = 300;
 /// 单页最大条数。
 const MAX_PAGE_SIZE: u64 = 100;
+/// 样本文件单文件轮转上限（50 MiB），防止长期运行撑爆磁盘。
+const SAMPLE_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+/// 拦截漏放/误杀复盘样本子目录名（位于 config 目录下）。
+pub const SAMPLES_DIR_NAME: &str = "prompt_guard_samples";
+/// 拦截漏了（Kiro 上游拒单）样本文件名。
+pub const MISSED_SAMPLES_FILE: &str = "missed.jsonl";
+/// 本次新拦下（供排查误杀/迭代口径）样本文件名。
+pub const BLOCKED_SAMPLES_FILE: &str = "blocked.jsonl";
 
 /// 一条待写入的拦截记录。
 #[derive(Debug, Clone)]
@@ -213,7 +221,28 @@ impl PromptGuardEventStore {
         )?;
         initialize_schema(&connection)?;
         cleanup_old_events(&connection, Utc::now().timestamp_millis())?;
+        let _ = fs::create_dir_all(cache_dir.join(SAMPLES_DIR_NAME));
         Ok(Some(Arc::new(Self { path })))
+    }
+
+    /// 异步追加一条复盘样本到 `prompt_guard_samples/{file_name}`（JSONL，超 50MiB 自动轮转 1 份）。
+    /// 失败只 warn，绝不阻塞或影响请求链路。
+    pub fn record_sample(&self, file_name: &'static str, record: serde_json::Value) {
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let dir = parent.join(SAMPLES_DIR_NAME);
+        let file_path = dir.join(file_name);
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = append_sample_jsonl(&dir, &file_path, &record) {
+                tracing::warn!(
+                    target: "prompt_guard",
+                    file = file_name,
+                    error = %error,
+                    "复盘样本写入失败"
+                );
+            }
+        });
     }
 
     /// 追加一条记录。写入很少，直接 `spawn_blocking` 建连插入；失败只 warn，不影响请求。
@@ -537,6 +566,29 @@ fn query_from_path(
 
 fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
+}
+
+fn append_sample_jsonl(
+    dir: &std::path::Path,
+    file_path: &std::path::Path,
+    record: &serde_json::Value,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    fs::create_dir_all(dir)?;
+    if let Ok(meta) = fs::metadata(file_path)
+        && meta.len() >= SAMPLE_ROTATE_BYTES
+    {
+        let backup = file_path.with_extension("jsonl.1");
+        let _ = fs::rename(file_path, backup);
+    }
+    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+    line.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file_path)?;
+    file.write_all(line.as_bytes())
 }
 
 #[cfg(test)]
