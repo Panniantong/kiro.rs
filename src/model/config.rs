@@ -62,6 +62,15 @@ pub enum PromptGuardEngine {
     Moderation,
 }
 
+/// 备用判官端点（主判官超时 / 429 / 5xx / 格式异常时按顺序故障转移）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptGuardFallback {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
 /// 客户提示词审核关口配置
 ///
 /// 默认模式为 `block`：填好 `api_key` 后审核立即生效（见 `is_active`）。
@@ -85,6 +94,15 @@ pub struct PromptGuardConfig {
     /// 判官模型名（默认 "glm-4.5-air"）
     #[serde(default = "default_prompt_guard_model")]
     pub model: String,
+
+    /// 备用判官列表（主判官出错/限流/超时时按顺序自动故障转移，彻底消除单点 R4023）
+    #[serde(default)]
+    pub fallbacks: Vec<PromptGuardFallback>,
+
+    /// 是否对 history 范围启用本机宽词网预筛（默认 true）：
+    /// 仅作用于对话历史/工具返回块；user 与 system+tools 仍 100% 送审。
+    #[serde(default = "default_prompt_guard_history_prefilter")]
+    pub history_prefilter: bool,
 
     /// 审核引擎（默认 prompt）。moderation = 走智谱专用内容安全接口 `/moderations`，
     /// 用它的 risk_level/risk_type 判定，不再需要提示词问法；`model` 这时不参与。
@@ -114,6 +132,14 @@ pub struct PromptGuardConfig {
     /// 免费视觉模型偶尔限流，配一个便宜付费模型兜底就不必因此拒客户。
     #[serde(default)]
     pub vision_fallback_model: String,
+
+    /// 审图独立 base_url（留空 = 沿用主判官 base_url；主判官切换为 DeepSeek 等纯文本厂商时用于指回视觉厂商）
+    #[serde(default)]
+    pub vision_base_url: String,
+
+    /// 审图独立 api_key（留空 = 沿用主判官 api_key）
+    #[serde(default)]
+    pub vision_api_key: String,
 }
 
 impl PromptGuardConfig {
@@ -132,12 +158,16 @@ impl Default for PromptGuardConfig {
             base_url: default_prompt_guard_base_url(),
             api_key: String::new(),
             model: default_prompt_guard_model(),
+            fallbacks: Vec::new(),
+            history_prefilter: default_prompt_guard_history_prefilter(),
             engine: PromptGuardEngine::default(),
             moderation_model: default_prompt_guard_moderation_model(),
             timeout_ms: default_prompt_guard_timeout_ms(),
             refusal_memory_minutes: default_refusal_memory_minutes(),
             vision_model: String::new(),
             vision_fallback_model: String::new(),
+            vision_base_url: String::new(),
+            vision_api_key: String::new(),
         }
     }
 }
@@ -388,6 +418,10 @@ fn default_prompt_guard_moderation_model() -> String {
     "moderation".to_string()
 }
 
+fn default_prompt_guard_history_prefilter() -> bool {
+    true
+}
+
 fn default_refusal_memory_minutes() -> u64 {
     60
 }
@@ -509,6 +543,27 @@ impl Config {
         {
             anyhow::bail!("promptGuard.apiKey 只能包含可见 ASCII 字符（不能有空白、换行或中文）");
         }
+        if !config.prompt_guard.vision_api_key.trim().is_empty()
+            && !config
+                .prompt_guard
+                .vision_api_key
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_graphic())
+        {
+            anyhow::bail!(
+                "promptGuard.visionApiKey 只能包含可见 ASCII 字符（不能有空白、换行或中文）"
+            );
+        }
+        for (idx, fb) in config.prompt_guard.fallbacks.iter().enumerate() {
+            if !fb.api_key.trim().is_empty()
+                && !fb.api_key.trim().chars().all(|c| c.is_ascii_graphic())
+            {
+                anyhow::bail!(
+                    "promptGuard.fallbacks[{idx}].apiKey 只能包含可见 ASCII 字符（不能有空白、换行或中文）"
+                );
+            }
+        }
         if config.prompt_guard.engine == PromptGuardEngine::Moderation {
             let model = config.prompt_guard.moderation_model.trim();
             if model.is_empty() || !model.chars().all(|c| c.is_ascii_graphic()) {
@@ -518,10 +573,10 @@ impl Config {
             }
         }
         if config.prompt_guard.mode != PromptGuardMode::Off
-            && !(1..=10_000).contains(&config.prompt_guard.timeout_ms)
+            && !(1..=30_000).contains(&config.prompt_guard.timeout_ms)
         {
             // block 模式下这个超时直接叠加到客户请求延迟上，不允许配得过大。
-            anyhow::bail!("promptGuard.timeoutMs 必须在 1 到 10000 之间");
+            anyhow::bail!("promptGuard.timeoutMs 必须在 1 到 30000 之间");
         }
         config.config_path = Some(path.to_path_buf());
         Ok(config)
