@@ -131,6 +131,70 @@ const PREVIEW_CHARS: usize = 300;
 /// log 模式后台判官的最大并发；占满时跳过本次审核（只记日志），不排队、不阻塞。
 const LOG_MODE_MAX_INFLIGHT: usize = 32;
 
+/// 单个判官端点连续失败这么多次后触发熔断，避免故障厂商（如断网 / 402 欠费）拖慢每个请求。
+const JUDGE_CIRCUIT_FAIL_THRESHOLD: u32 = 2;
+
+/// 触发熔断后的冷却时长：冷却期间多端点请求直接优先走健康备用判官，期满自动探活恢复。
+const JUDGE_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// 多判官端点轻量熔断器（进程内存态）：连续失败达到阈值后冷却一段时间，
+/// 多端点时优先把非冷却端点排在前面；若全部端点均在冷却则仍按原顺序尝试，不死锁。
+struct EndpointCircuitBreaker {
+    cooldown: Duration,
+    state: Mutex<HashMap<String, (u32, Option<Instant>)>>,
+}
+
+impl EndpointCircuitBreaker {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn key(ep: &JudgeEndpoint<'_>) -> String {
+        format!("{}|{}", ep.base_url, ep.model)
+    }
+
+    fn mark_ok(&self, ep: &JudgeEndpoint<'_>) {
+        self.state.lock().remove(&Self::key(ep));
+    }
+
+    fn mark_fail(&self, ep: &JudgeEndpoint<'_>) {
+        let now = Instant::now();
+        let mut guard = self.state.lock();
+        let entry = guard.entry(Self::key(ep)).or_insert((0, None));
+        entry.0 = entry.0.saturating_add(1);
+        if entry.0 >= JUDGE_CIRCUIT_FAIL_THRESHOLD {
+            entry.1 = Some(now + self.cooldown);
+        }
+    }
+
+    /// 返回按健康状态重排后的端点下标：未冷却的在前，冷却中的排后兜底。
+    fn ordered_indices(&self, endpoints: &[JudgeEndpoint<'_>]) -> Vec<usize> {
+        if endpoints.len() <= 1 {
+            return (0..endpoints.len()).collect();
+        }
+        let now = Instant::now();
+        let guard = self.state.lock();
+        let mut active = Vec::with_capacity(endpoints.len());
+        let mut cooling = Vec::new();
+        for (idx, ep) in endpoints.iter().enumerate() {
+            let is_cooling = guard
+                .get(&Self::key(ep))
+                .and_then(|(_, until)| *until)
+                .is_some_and(|until| until > now);
+            if is_cooling {
+                cooling.push(idx);
+            } else {
+                active.push(idx);
+            }
+        }
+        active.extend(cooling);
+        active
+    }
+}
+
 /// 判官问法里定义的类别；判官返回名单外的类别一律记为 unknown，
 /// 避免把模型自由输出的字符串带进客户可见的错误消息（可能撞上网关停渠道关键词）。
 const KNOWN_CATEGORIES: &[&str] = &[
@@ -162,6 +226,8 @@ pub struct PromptGuard {
     user_verdicts: VerdictCache,
     /// 客户图片的判定缓存（进程内存，重启即清空）。
     image_verdicts: VerdictCache,
+    /// 多判官端点 30 秒熔断冷却器（避免故障主判官每个请求都白等超时再切备）。
+    circuit_breaker: EndpointCircuitBreaker,
 }
 
 /// 被拒对话记忆的判定结果。
@@ -200,6 +266,7 @@ impl PromptGuard {
             history_verdicts: VerdictCache::new(HISTORY_VERDICT_MAX_ENTRIES),
             user_verdicts: VerdictCache::new(USER_VERDICT_MAX_ENTRIES),
             image_verdicts: VerdictCache::new(IMAGE_VERDICT_MAX_ENTRIES),
+            circuit_breaker: EndpointCircuitBreaker::new(JUDGE_CIRCUIT_COOLDOWN),
         })
     }
 
@@ -475,7 +542,7 @@ impl PromptGuard {
             return None;
         }
 
-        let results: Vec<(ChunkKey, usize, Result<Verdict, String>)> =
+        let results: Vec<(ChunkKey, usize, Result<(Verdict, String), String>)> =
             futures::stream::iter(pending)
                 .map(|(key, index)| async move {
                     let result = self
@@ -488,14 +555,14 @@ impl PromptGuard {
                 .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        let mut violation: Option<(String, String, &str)> = None;
+        let mut violation: Option<(String, String, String, &str)> = None;
         let mut failure: Option<String> = None;
         for (key, index, result) in results {
             match result {
-                Ok(Verdict::Pass) => self.user_verdicts.put(key, CachedVerdict::Pass),
+                Ok((Verdict::Pass, _)) => self.user_verdicts.put(key, CachedVerdict::Pass),
                 // 智谱国内敏感词风控（1301）常因公开人物、宗教、外媒历史资料拒审，不代表违反
                 // Kiro 上游安全策略：记一条 log_only 留痕供后台排查，请求本身按放行缓存。
-                Ok(Verdict::Violation { category, reason })
+                Ok((Verdict::Violation { category, reason }, _))
                     if category == ZHIPU_FILTER_CATEGORY =>
                 {
                     self.user_verdicts.put(key, CachedVerdict::Pass);
@@ -521,7 +588,7 @@ impl PromptGuard {
                         "判官服务商自身风控拒审客户文本，记 log_only 并按放行处理"
                     );
                 }
-                Ok(Verdict::Violation { category, reason }) => {
+                Ok((Verdict::Violation { category, reason }, judge_model)) => {
                     self.user_verdicts.put(
                         key,
                         CachedVerdict::Violation {
@@ -530,16 +597,16 @@ impl PromptGuard {
                         },
                     );
                     if violation.is_none() {
-                        violation = Some((category, reason, windows[index].as_str()));
+                        violation = Some((category, reason, judge_model, windows[index].as_str()));
                     }
                 }
                 Err(error) => failure = Some(error),
             }
         }
 
-        if let Some((category, reason, window)) = violation {
+        if let Some((category, reason, judge_model, window)) = violation {
             if let Some(store) = self.events.as_deref() {
-                record_blocked_sample(store, mode, "user", &category, &reason, model_name, path, elapsed_ms, chars, window);
+                record_blocked_sample(store, mode, "user", &category, &reason, &judge_model, model_name, path, elapsed_ms, chars, window);
             }
             let result = Ok(Verdict::Violation {
                 category: category.clone(),
@@ -671,7 +738,7 @@ impl PromptGuard {
             });
         }
 
-        let results: Vec<(ChunkKey, Result<Verdict, String>)> =
+        let results: Vec<(ChunkKey, Result<(Verdict, String), String>)> =
             futures::stream::iter(pending)
                 .map(|(key, index)| {
                     let endpoints = &vision_endpoints;
@@ -695,8 +762,8 @@ impl PromptGuard {
         let mut failure: Option<String> = None;
         for (key, result) in results {
             match result {
-                Ok(Verdict::Pass) => self.image_verdicts.put(key, CachedVerdict::Pass),
-                Ok(Verdict::Violation { category, reason }) => {
+                Ok((Verdict::Pass, _)) => self.image_verdicts.put(key, CachedVerdict::Pass),
+                Ok((Verdict::Violation { category, reason }, _)) => {
                     self.image_verdicts.put(
                         key,
                         CachedVerdict::Violation {
@@ -844,7 +911,7 @@ impl PromptGuard {
 
         let judged = pending.len();
         let prompt = scope.judge_prompt();
-        let results: Vec<(ChunkKey, usize, Result<Verdict, String>)> =
+        let results: Vec<(ChunkKey, usize, Result<(Verdict, String), String>)> =
             futures::stream::iter(pending)
                 .map(|(key, index)| async move {
                     let result = self
@@ -857,14 +924,14 @@ impl PromptGuard {
                 .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        let mut violation: Option<(String, String, &str)> = None;
+        let mut violation: Option<(String, String, String, &str)> = None;
         let mut errors: Vec<String> = Vec::new();
         for (key, index, result) in results {
             match result {
-                Ok(Verdict::Pass) => cache.put(key, CachedVerdict::Pass),
+                Ok((Verdict::Pass, _)) => cache.put(key, CachedVerdict::Pass),
                 // 判官服务商自身风控（1301）拒审输入时按放行处理并记一条 log_only 留痕：
                 // 这类拒审多为国内政治/宗教/公开人物词表命中，不代表违反 Kiro 安全策略。
-                Ok(Verdict::Violation { category, reason })
+                Ok((Verdict::Violation { category, reason }, _))
                     if category == ZHIPU_FILTER_CATEGORY =>
                 {
                     cache.put(key, CachedVerdict::Pass);
@@ -890,7 +957,7 @@ impl PromptGuard {
                         "判官服务商自身风控拒审内容，记 log_only 并按放行处理"
                     );
                 }
-                Ok(Verdict::Violation { category, reason }) => {
+                Ok((Verdict::Violation { category, reason }, judge_model)) => {
                     cache.put(
                         key,
                         CachedVerdict::Violation {
@@ -899,7 +966,7 @@ impl PromptGuard {
                         },
                     );
                     if violation.is_none() {
-                        violation = Some((category, reason, chunks[index].as_str()));
+                        violation = Some((category, reason, judge_model, chunks[index].as_str()));
                     }
                 }
                 Err(error) => errors.push(error),
@@ -921,7 +988,7 @@ impl PromptGuard {
         }
 
         match violation {
-            Some((category, reason, chunk)) => {
+            Some((category, reason, judge_model, chunk)) => {
                 if let Some(store) = self.events.as_deref() {
                     record_blocked_sample(
                         store,
@@ -929,6 +996,7 @@ impl PromptGuard {
                         scope.label(),
                         &category,
                         &reason,
+                        &judge_model,
                         model_name,
                         path,
                         elapsed_ms,
@@ -1001,9 +1069,10 @@ impl PromptGuard {
         cfg: &PromptGuardConfig,
         prompt: &str,
         input: &str,
-    ) -> Result<Verdict, String> {
+    ) -> Result<(Verdict, String), String> {
         if cfg.engine == PromptGuardEngine::Moderation {
-            return self.moderate(cfg, input).await;
+            let v = self.moderate(cfg, input).await?;
+            return Ok((v, cfg.moderation_model.trim().to_string()));
         }
         let mut endpoints = vec![JudgeEndpoint {
             base_url: cfg.base_url.trim(),
@@ -1179,22 +1248,27 @@ impl PromptGuard {
         endpoints: &[JudgeEndpoint<'_>],
         prompt: &str,
         content: serde_json::Value,
-    ) -> Result<Verdict, String> {
+    ) -> Result<(Verdict, String), String> {
         if endpoints.is_empty() {
             return Err("未配置可用的判官端点".to_string());
         }
+        let order = self.circuit_breaker.ordered_indices(endpoints);
         let mut errors: Vec<String> = Vec::new();
-        let last_index = endpoints.len() - 1;
+        let last_pos = order.len() - 1;
 
-        for (idx, ep) in endpoints.iter().enumerate() {
-            let has_next = idx < last_index;
+        for (pos, &idx) in order.iter().enumerate() {
+            let ep = &endpoints[idx];
+            let has_next = pos < last_pos;
             let failure = match self.judge_once(ep, timeout_ms, prompt, &content).await {
-                Ok(verdict) => return Ok(verdict),
+                Ok(verdict) => {
+                    self.circuit_breaker.mark_ok(ep);
+                    return Ok((verdict, ep.model.to_string()));
+                }
                 Err(failure) => failure,
             };
 
             let should_retry_same =
-                failure.parse_error || (!has_next && failure.retryable && idx == 0);
+                failure.parse_error || (!has_next && failure.retryable && pos == 0);
             if should_retry_same {
                 tracing::warn!(
                     target: "prompt_guard",
@@ -1212,8 +1286,12 @@ impl PromptGuard {
                     .judge_once(ep, timeout_ms, &retry_prompt, &content)
                     .await
                 {
-                    Ok(verdict) => return Ok(verdict),
+                    Ok(verdict) => {
+                        self.circuit_breaker.mark_ok(ep);
+                        return Ok((verdict, ep.model.to_string()));
+                    }
                     Err(retry) => {
+                        self.circuit_breaker.mark_fail(ep);
                         let combined =
                             format!("{}；重试后仍失败：{}", failure.message, retry.message);
                         if !has_next && errors.is_empty() {
@@ -1221,11 +1299,12 @@ impl PromptGuard {
                         }
                         errors.push(format!("[{}] {}", ep.model, combined));
                         if has_next {
+                            let next_ep = &endpoints[order[pos + 1]];
                             tracing::warn!(
                                 target: "prompt_guard",
                                 verdict = "judge_failover",
                                 from_model = ep.model,
-                                to_model = endpoints[idx + 1].model,
+                                to_model = next_ep.model,
                                 reason = %combined,
                                 "当前判官重试失败，切换备用判官"
                             );
@@ -1235,6 +1314,7 @@ impl PromptGuard {
                 }
             }
 
+            self.circuit_breaker.mark_fail(ep);
             if !has_next {
                 if errors.is_empty() {
                     return Err(failure.message);
@@ -1243,11 +1323,12 @@ impl PromptGuard {
                 return Err(errors.join("；"));
             }
 
+            let next_ep = &endpoints[order[pos + 1]];
             tracing::warn!(
                 target: "prompt_guard",
                 verdict = "judge_failover",
                 from_model = ep.model,
-                to_model = endpoints[idx + 1].model,
+                to_model = next_ep.model,
                 reason = %failure.message,
                 "主判官调用失败，切换备用判官"
             );
@@ -2682,6 +2763,7 @@ fn record_blocked_sample(
     scope: &str,
     category: &str,
     reason: &str,
+    judge_model: &str,
     model: &str,
     path: &str,
     elapsed_ms: u64,
@@ -2696,6 +2778,7 @@ fn record_blocked_sample(
             "scope": scope,
             "category": category,
             "reason": reason,
+            "judgeModel": judge_model,
             "model": model,
             "path": path,
             "elapsedMs": elapsed_ms,
@@ -4775,6 +4858,7 @@ mod tests {
         let missed_raw = std::fs::read_to_string(samples_dir.join(MISSED_SAMPLES_FILE)).unwrap();
 
         assert!(blocked_raw.contains("\"scope\":\"user\""));
+        assert!(blocked_raw.contains("\"judgeModel\":\"glm-4.5-air\""));
         assert!(blocked_raw.contains("<REDACTED_SECRET>"));
         assert!(!blocked_raw.contains("sk-1234567890abcdef123456"));
 
@@ -4783,6 +4867,83 @@ mod tests {
         assert!(missed_raw.contains("<REDACTED_SECRET>"));
         assert!(!missed_raw.contains("mysecretvalue12345"));
         assert!(!missed_raw.contains("sk-abcdef1234567890abcdef"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn judge_circuit_breaker_skips_failing_primary_for_cooldown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("kiro-pg-cb-{}", uuid::Uuid::new_v4()));
+        let store = PromptGuardEventStore::open(Some(dir.clone()))
+            .unwrap()
+            .unwrap();
+        let guard = PromptGuard::new(Some(Arc::clone(&store)));
+
+        let primary_hits = Arc::new(AtomicUsize::new(0));
+        let backup_hits = Arc::new(AtomicUsize::new(0));
+
+        let p_hits = Arc::clone(&primary_hits);
+        let primary_url = spawn_mock(move || {
+            let p_hits = Arc::clone(&p_hits);
+            async move {
+                p_hits.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::PAYMENT_REQUIRED, "insufficient balance").into_response()
+            }
+        })
+        .await;
+
+        let b_hits = Arc::clone(&backup_hits);
+        let backup_url = spawn_mock(move || {
+            let b_hits = Arc::clone(&b_hits);
+            async move {
+                b_hits.fetch_add(1, Ordering::SeqCst);
+                violation_body("intrusion").into_response()
+            }
+        })
+        .await;
+
+        let mut cfg = guard_cfg(PromptGuardMode::Block, primary_url, 3000);
+        cfg.model = "primary-dead-model".to_string();
+        cfg.fallbacks = vec![crate::model::config::PromptGuardFallback {
+            base_url: backup_url,
+            api_key: "backup-key".to_string(),
+            model: "backup-healthy-model".to_string(),
+        }];
+
+        // 前 2 次各打一次死主判官并切备成功 -> 触发 30s 熔断
+        for i in 1..=2 {
+            let msgs = user(json!(format!("触发故障转移测试请求 #{i}")));
+            assert_eq!(
+                guard
+                    .check(&cfg, &msgs, None, None, "claude-opus-5-5", "/v1/messages")
+                    .await,
+                GuardDecision::Reject {
+                    category: "intrusion".to_string()
+                }
+            );
+        }
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 2);
+
+        // 第 3 次必须直接跳过主判官直走健康备用（primary_hits 保持 2 不再增加）
+        let msgs3 = user(json!("触发熔断后直接走健康备用判官 #3"));
+        assert_eq!(
+            guard
+                .check(&cfg, &msgs3, None, None, "claude-opus-5-5", "/v1/messages")
+                .await,
+            GuardDecision::Reject {
+                category: "intrusion".to_string()
+            }
+        );
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 3);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let samples_dir = dir.join(crate::anthropic::prompt_guard_events::SAMPLES_DIR_NAME);
+        let blocked_raw = std::fs::read_to_string(samples_dir.join(BLOCKED_SAMPLES_FILE)).unwrap();
+        assert!(blocked_raw.contains("\"judgeModel\":\"backup-healthy-model\""));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
