@@ -16,7 +16,7 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, ContextEditKeep, MessagesRequest};
+use super::types::{ContentBlock, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的兼容问题。
 ///
@@ -2579,7 +2579,6 @@ fn build_history(
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
-    let thinking_retention = thinking_retention_for_request(req);
 
     // 1. 处理系统消息。Kiro 没有 Anthropic system role；用已确认的
     // history contract 表达公网 Claude API 身份与用户 system 已生效。
@@ -2691,22 +2690,13 @@ Complete all chunked operations without commentary.";
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
-    let history_thinking_keep_indices =
-        assistant_thinking_keep_indices(messages, history_end_index, thinking_retention);
-    let mut assistant_buffer: Vec<(usize, &super::types::Message)> = Vec::new();
+    let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in &messages[..history_end_index] {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages_with_context_management(
-                    &assistant_buffer,
-                    tool_name_map,
-                    thinking_retention,
-                    &history_thinking_keep_indices,
-                )?;
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -2719,18 +2709,13 @@ Complete all chunked operations without commentary.";
                 user_buffer.clear();
             }
             // 累积 assistant 消息（支持连续多条）
-            assistant_buffer.push((i, msg));
+            assistant_buffer.push(msg);
         }
     }
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages_with_context_management(
-            &assistant_buffer,
-            tool_name_map,
-            thinking_retention,
-            &history_thinking_keep_indices,
-        )?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -2745,88 +2730,6 @@ Complete all chunked operations without commentary.";
     }
 
     Ok(history)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinkingRetention {
-    All,
-    RecentTurns(usize),
-}
-
-fn thinking_retention_for_request(req: &MessagesRequest) -> ThinkingRetention {
-    let Some(edit) = req.context_management.as_ref().and_then(|management| {
-        management
-            .edits
-            .iter()
-            .find(|edit| edit.edit_type == "clear_thinking_20251015")
-    }) else {
-        return ThinkingRetention::All;
-    };
-
-    match edit.keep.as_ref() {
-        Some(ContextEditKeep::String(value)) if value == "all" => ThinkingRetention::All,
-        Some(ContextEditKeep::Object { keep_type, value })
-            if keep_type == "thinking_turns" && value.is_some_and(|v| v > 0) =>
-        {
-            ThinkingRetention::RecentTurns(value.unwrap() as usize)
-        }
-        Some(_) => ThinkingRetention::All,
-        None => default_thinking_retention_for_model(&req.model),
-    }
-}
-
-fn default_thinking_retention_for_model(model: &str) -> ThinkingRetention {
-    if claude_4_minor_at_least(model, "opus", 5) || claude_4_minor_at_least(model, "sonnet", 5) {
-        ThinkingRetention::All
-    } else {
-        ThinkingRetention::RecentTurns(1)
-    }
-}
-
-fn claude_4_minor_at_least(model: &str, family: &str, min_minor: i32) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    for marker in [format!("{family}-4-"), format!("{family}-4.")] {
-        if let Some(idx) = normalized.find(&marker) {
-            let tail = &normalized[idx + marker.len()..];
-            let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-            if digits.parse::<i32>().is_ok_and(|minor| minor >= min_minor) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn assistant_thinking_keep_indices(
-    messages: &[super::types::Message],
-    history_end_index: usize,
-    retention: ThinkingRetention,
-) -> HashSet<usize> {
-    let ThinkingRetention::RecentTurns(turns) = retention else {
-        return HashSet::new();
-    };
-
-    messages
-        .iter()
-        .take(history_end_index)
-        .enumerate()
-        .filter(|(_, msg)| msg.role == "assistant" && message_has_thinking(msg))
-        .map(|(idx, _)| idx)
-        .rev()
-        .take(turns)
-        .collect()
-}
-
-fn message_has_thinking(msg: &super::types::Message) -> bool {
-    let serde_json::Value::Array(blocks) = &msg.content else {
-        return false;
-    };
-    blocks.iter().any(|block| {
-        block
-            .get("type")
-            .and_then(|value| value.as_str())
-            .is_some_and(|block_type| block_type == "thinking")
-    })
 }
 
 /// 合并多个 user 消息
@@ -2866,20 +2769,12 @@ fn merge_user_messages(
     })
 }
 
-/// 转换 assistant 消息
+/// Kiro 没有结构化的历史思考字段。只转换可见正文和工具调用，
+/// 不将 thinking 或 redacted_thinking 当成普通文本转发。
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
-    convert_assistant_message_with_thinking(msg, tool_name_map, true)
-}
-
-fn convert_assistant_message_with_thinking(
-    msg: &super::types::Message,
-    tool_name_map: &mut HashMap<String, String>,
-    keep_thinking: bool,
-) -> Result<HistoryAssistantMessage, ConversionError> {
-    let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -2889,51 +2784,37 @@ fn convert_assistant_message_with_thinking(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    match block.block_type.as_str() {
-                        "thinking" => {
-                            if keep_thinking {
-                                if let Some(thinking) = block.thinking {
-                                    thinking_content.push_str(&thinking);
-                                }
-                            }
+                match item.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                            text_content.push_str(text);
                         }
-                        "text" => {
-                            if let Some(text) = block.text {
-                                text_content.push_str(&text);
-                            }
-                        }
-                        "tool_use" => {
-                            if let (Some(id), Some(name)) = (block.id, block.name) {
-                                let input = block.input.unwrap_or(serde_json::json!({}));
-                                let mapped_name = map_tool_name(&name, tool_name_map);
-                                let mapped_id = map_tool_use_id(&id);
-                                tool_uses.push(
-                                    ToolUseEntry::new(mapped_id, mapped_name).with_input(input),
-                                );
-                            }
-                        }
-                        _ => {}
                     }
+                    Some("tool_use") => {
+                        let id = item.get("id").and_then(serde_json::Value::as_str);
+                        let name = item.get("name").and_then(serde_json::Value::as_str);
+                        if let (Some(id), Some(name)) = (id, name) {
+                            let input = item
+                                .get("input")
+                                .filter(|input| !input.is_null())
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            let mapped_name = map_tool_name(name, tool_name_map);
+                            let mapped_id = map_tool_use_id(id);
+                            tool_uses.push(
+                                ToolUseEntry::new(mapped_id, mapped_name).with_input(input),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    // Kiro 历史要求非空 content；没有可见正文时用空格保留消息配对。
+    let final_content = if text_content.is_empty() {
         " ".to_string()
     } else {
         text_content
@@ -2955,40 +2836,16 @@ fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
-    let indexed = messages
-        .iter()
-        .enumerate()
-        .map(|(idx, msg)| (idx, *msg))
-        .collect::<Vec<_>>();
-    merge_assistant_messages_with_context_management(
-        &indexed,
-        tool_name_map,
-        ThinkingRetention::All,
-        &HashSet::new(),
-    )
-}
-
-fn merge_assistant_messages_with_context_management(
-    messages: &[(usize, &super::types::Message)],
-    tool_name_map: &mut HashMap<String, String>,
-    thinking_retention: ThinkingRetention,
-    keep_thinking_indices: &HashSet<usize>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        let (idx, msg) = messages[0];
-        let keep_thinking =
-            thinking_retention == ThinkingRetention::All || keep_thinking_indices.contains(&idx);
-        return convert_assistant_message_with_thinking(msg, tool_name_map, keep_thinking);
+        return convert_assistant_message(messages[0], tool_name_map);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
 
-    for (idx, msg) in messages {
-        let keep_thinking =
-            thinking_retention == ThinkingRetention::All || keep_thinking_indices.contains(idx);
-        let converted = convert_assistant_message_with_thinking(msg, tool_name_map, keep_thinking)?;
+    for msg in messages {
+        let converted = convert_assistant_message(msg, tool_name_map)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -2998,7 +2855,7 @@ fn merge_assistant_messages_with_context_management(
         }
     }
 
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
+    let content = if content_parts.is_empty() {
         " ".to_string()
     } else {
         content_parts.join("\n\n")
@@ -5945,7 +5802,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_management_clear_thinking_keeps_recent_turns() {
+    fn test_context_management_drops_thinking_from_kiro_history() {
         use super::super::types::{
             ContextEdit, ContextEditKeep, ContextManagement, Message as AnthropicMessage,
         };
@@ -6018,12 +5875,15 @@ mod tests {
             "older thinking turn should be cleared"
         );
         assert!(history.contains("old visible answer"));
-        assert!(history.contains("recent hidden thinking"));
+        assert!(
+            !history.contains("recent hidden thinking"),
+            "Kiro history must not replay thinking as ordinary assistant text"
+        );
         assert!(history.contains("recent visible answer"));
     }
 
     #[test]
-    fn test_context_management_clear_thinking_keep_all_preserves_thinking() {
+    fn test_context_management_keep_all_still_drops_thinking_from_kiro_history() {
         use super::super::types::{
             ContextEdit, ContextEditKeep, ContextManagement, Message as AnthropicMessage,
         };
@@ -6077,7 +5937,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(history.contains("old hidden thinking"));
+        assert!(
+            !history.contains("old hidden thinking"),
+            "client keep=all cannot make Kiro replay hidden thinking as plain text"
+        );
         assert!(history.contains("old visible answer"));
     }
 
@@ -6179,11 +6042,9 @@ mod tests {
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
         let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
 
-        let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(
-            content.contains("Let me read that file"),
-            "应包含第二条消息的 text 内容"
+        assert_eq!(
+            result.assistant_response_message.content,
+            "Let me read that file."
         );
 
         let tool_uses = result
@@ -6247,6 +6108,13 @@ mod tests {
         );
 
         let state = result.unwrap().conversation_state;
+        let wire_history = serde_json::to_string(&state.history).unwrap();
+        assert!(!wire_history.contains("I need to read the file"));
+        assert!(!wire_history.contains("Let me read the config"));
+        assert!(wire_history.contains("I'll read the config file for you."));
+        assert!(state.history.iter().any(|msg| matches!(msg, Message::User(user)
+            if user.user_input_message.user_input_message_context.tool_results.iter()
+                .any(|tool_result| tool_result.tool_use_id == "toolu_01XYZ"))));
         let mut found_tool_use = false;
         for msg in &state.history {
             if let Message::Assistant(assistant_msg) = msg {
@@ -6259,5 +6127,33 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_reasoning_only_history_keeps_a_blank_assistant_turn() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "synthetic private reasoning"},
+                    {"type": "redacted_thinking", "data": "synthetic opaque data"}
+                ]},
+                {"role": "user", "content": "Follow-up question"}
+            ]
+        }))
+        .unwrap();
+
+        for armor in [false, true] {
+            let result = convert_request_with_armor(&req, armor).unwrap();
+            let history = result.conversation_state.history;
+            let [Message::User(user), Message::Assistant(assistant)] = &history[history.len() - 2..]
+            else {
+                panic!("the historical user and assistant messages must stay paired");
+            };
+            assert_eq!(user.user_input_message.content, "First question");
+            assert_eq!(assistant.assistant_response_message.content, " ");
+        }
     }
 }

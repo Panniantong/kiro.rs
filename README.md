@@ -414,6 +414,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 }
 ```
 
+当前轮的 Thinking 设置保持不变。转换成 Kiro 请求时，历史 assistant 消息只传可见正文和工具调用；Kiro 历史不支持结构化 `thinking` 或 `redacted_thinking`，这两类块不会转成正文，`context_management` 的 `keep` 设置也不能让它们进入 Kiro 历史。
+
 ### 工具调用
 
 完整支持 Anthropic 的 tool use 功能：
